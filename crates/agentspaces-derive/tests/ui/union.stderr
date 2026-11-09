@@ -1,0 +1,5 @@
+error: Entry cannot be derived for a union; serde cannot serialize one
+  --> tests/ui/union.rs:20:1
+   |
+20 | union Bits {
+   | ^^^^^

@@ -1,0 +1,63 @@
+# Copyright 2026 Bad Monkey, Inc.
+# Author: Al Baker
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The dependency policy of the workspace, checked by `cargo deny check`
+# locally and by the cargo-deny job of the build workflow.
+
+[graph]
+# Judge every optional feature too, on every target (the daemon has a Windows
+# half), so nothing a user can turn on escapes the check.
+all-features = true
+
+[advisories]
+version = 2
+# Any RustSec advisory against a crate in the tree (a vulnerability, an unsound
+# API, an unmaintained crate) fails the check, and so does a yanked version.
+# Add an id to `ignore` only with a comment that says why it does not apply.
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# Exactly the licences the tree uses today, all permissive. A dependency under
+# any other licence fails the check until this list is changed in review.
+#   BSD-3-Clause         the dalek crates, subtle, aws-lc-sys, matchit, encoding_rs
+#   CDLA-Permissive-2.0  webpki-root-certs (reqwest's platform verifier)
+#   ISC                  rustls, rustls-webpki, aws-lc-rs, untrusted
+#   Unicode-3.0          the ICU crates under url, and unicode-ident
+#   Zlib                 foldhash (under hashbrown)
+allow = [
+  "Apache-2.0",
+  "BSD-3-Clause",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+  "Zlib",
+]
+confidence-threshold = 0.93
+
+[bans]
+# Two versions of one crate are reported, never refused: base64, getrandom,
+# signature, and untrusted come twice through jsonwebtoken and aws-lc-rs, and
+# syn and synstructure through proc-macro crates.
+multiple-versions = "warn"
+
+[sources]
+# crates.io only: no other registry and no git dependency.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -1,0 +1,5 @@
+error: `schema` takes a string literal; write #[entry(schema = "shop.Order#v1")]
+  --> tests/ui/schema_not_a_string.rs:19:18
+   |
+19 | #[entry(schema = shop::Order)]
+   |                  ^^^^^^^^^^^

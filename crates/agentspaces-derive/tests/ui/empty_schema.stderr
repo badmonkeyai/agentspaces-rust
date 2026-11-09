@@ -1,0 +1,5 @@
+error: the schema name is empty; write #[entry(schema = "shop.Order#v1")]
+  --> tests/ui/empty_schema.rs:19:18
+   |
+19 | #[entry(schema = "")]
+   |                  ^^

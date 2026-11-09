@@ -1,0 +1,5 @@
+error: `schema` takes a string literal; write #[entry(schema = "shop.Order#v1")]
+  --> tests/ui/schema_without_value.rs:19:9
+   |
+19 | #[entry(schema)]
+   |         ^^^^^^

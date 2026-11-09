@@ -1,0 +1,7 @@
+error: #[derive(Entry)] needs the schema name the fleet knows `Order` by; write #[entry(schema = "shop.Order#v1")]
+  --> tests/ui/missing_attribute.rs:18:10
+   |
+18 | #[derive(Entry)]
+   |          ^^^^^
+   |
+   = note: this error originates in the derive macro `Entry` (in Nightly builds, run with -Z macro-backtrace for more info)

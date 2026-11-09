@@ -1,0 +1,5 @@
+error: #[entry] takes its keys in parentheses; write #[entry(schema = "shop.Order#v1")]
+  --> tests/ui/bare_attribute.rs:19:1
+   |
+19 | #[entry]
+   | ^^^^^^^^

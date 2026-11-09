@@ -1,0 +1,5 @@
+error: the schema name "shop Order#v1" contains ' '; a schema name has no whitespace or control characters
+  --> tests/ui/whitespace_schema.rs:19:18
+   |
+19 | #[entry(schema = "shop Order#v1")]
+   |                  ^^^^^^^^^^^^^^^

@@ -1,0 +1,27 @@
+# Build output: Cargo's target directory for the workspace and the standalone quick start, and
+# Maven's for the Java interop programs and example 32's classpath helper.
+target/
+
+# The quick start is its own Cargo workspace; its lock file is generated when it is built.
+/quickstart/Cargo.lock
+
+# rustfmt backups, coverage and profiling data, cargo-mutants and cargo-fuzz output.
+**/*.rs.bk
+*.profraw
+*.profdata
+mutants.out*/
+fuzz/artifacts/
+fuzz/corpus/
+fuzz/coverage/
+
+# Keys, tokens, and logs a local run may leave behind. Never commit an identity or a token.
+peer.key
+*.pem
+*-tokens.yaml
+*.log
+
+# Editors and operating systems.
+.idea/
+.vscode/
+*.swp
+.DS_Store

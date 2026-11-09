@@ -1,0 +1,11 @@
+error: `schema` is given twice
+  --> tests/ui/repeated.rs:19:35
+   |
+19 | #[entry(schema = "shop.Order#v1", schema = "shop.Order#v2")]
+   |                                   ^^^^^^
+
+error: more than one #[entry] attribute; write #[entry(schema = "shop.Order#v1")] once
+  --> tests/ui/repeated.rs:26:1
+   |
+26 | #[entry(schema = "shop.Refund#v2")]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

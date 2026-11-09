@@ -1,0 +1,5 @@
+error: unknown #[entry] key; the keys are `schema` and `crate`: write #[entry(schema = "shop.Order#v1")]
+  --> tests/ui/unknown_key.rs:19:35
+   |
+19 | #[entry(schema = "shop.Order#v1", version = 2)]
+   |                                   ^^^^^^^

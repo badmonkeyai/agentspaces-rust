@@ -1,0 +1,5 @@
+error: #[entry] is missing the schema name; write #[entry(schema = "shop.Order#v1")]
+  --> tests/ui/missing_schema.rs:19:1
+   |
+19 | #[entry(crate = "agentspaces")]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

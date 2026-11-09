@@ -1,0 +1,63 @@
+# Copyright 2026 Bad Monkey, Inc.
+# Author: Al Baker
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[package]
+name = "agentspaces-mcp"
+description = "The fleet catalogue as Model Context Protocol tools, over rmcp (AgentSpaces for Rust)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+homepage.workspace = true
+keywords = ["mcp", "agents", "ai", "p2p", "tools"]
+categories = ["network-programming", "development-tools"]
+
+[dependencies]
+agentspaces = { version = "0.5.0", path = "../agentspaces" }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "tracing"] }
+http = "1"
+http-body = "1"
+jsonwebtoken = { version = "11.1", default-features = false, features = ["aws_lc_rs"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+rmcp = { version = "3.9", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server", "base64"] }
+schemars = { version = "1", optional = true }
+serde-saphyr = { version = "1.1.0", default-features = false, features = ["deserialize"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+subtle = "2.6.1"
+thiserror = "2"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "io-std", "io-util", "time", "sync", "macros"] }
+tokio-util = "0.7"
+tracing = "0.1.44"
+
+[lints]
+workspace = true
+
+[features]
+# Tool schemas derived from registered Rust types (SchemaRegistry::register). On by default;
+# rmcp's server already builds schemars.
+default = ["schemars"]
+schemars = ["dep:schemars"]
+
+[dev-dependencies]
+base64 = "0.23.1"
+hex = "0.4.3"
+rmcp = { version = "3.9", default-features = false, features = ["server", "client", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "reqwest"] }
+schemars = "1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "test-util"] }
