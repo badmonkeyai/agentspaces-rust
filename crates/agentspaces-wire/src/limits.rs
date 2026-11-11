@@ -79,6 +79,72 @@ pub const FRAME_FILTER_CAPACITY: usize = 4096;
 /// Python `identity.MAX_DRIFT_MILLIS`; Java `HybridLogicalClock.MAX_DRIFT_MILLIS`.
 pub const MAX_DRIFT_MILLIS: i64 = 10 * 60 * 1000;
 
+/// The largest logical counter a remote stamp may carry, 2^16 (SPEC §9, v0.1.30): every merge,
+/// order, and deduplication point refuses a remote stamp above it, and a local clock carries
+/// into the next millisecond instead of passing it ([`crate::hlc::Hlc`]).
+///
+/// Python `wire.LOGICAL_LIMIT`; Java `HybridLogicalClock.LOGICAL_LIMIT`.
+pub const LOGICAL_LIMIT: i32 = 1 << 16;
+
+/// How far past `wall + MAX_DRIFT` a frame's stamp may run before the receiver treats it as an
+/// attack rather than skew, in milliseconds (5 seconds, SPEC §9, v0.1.30). A frame at most this
+/// far past the ceiling is dropped and counted as skewed; a state or claim within the ceiling plus
+/// this margin merges (SPEC §7.3).
+///
+/// Python `wire.FAR_FUTURE_SKEW_MARGIN_MILLIS`; Java `PeerNode.FAR_FUTURE_SKEW_MARGIN_MILLIS`.
+pub const SKEW_MARGIN_MILLIS: i64 = 5_000;
+
+/// How far past `wall + MAX_DRIFT + SKEW_MARGIN` a verified state or claim may be stamped and
+/// still be deferred rather than refused as hostile, in milliseconds (one hour, SPEC §7.3,
+/// v0.1.30).
+///
+/// Python `wire.FAR_FUTURE_HOSTILE_MILLIS`; Java `ReplicatedSpace.FAR_FUTURE_HOSTILE_MILLIS`.
+pub const FAR_FUTURE_HOSTILE_MILLIS: i64 = 60 * 60 * 1000;
+
+/// The longest stamp text, in UTF-16 code units (SPEC §9, v0.1.31): a stamp travels as one
+/// definite CBOR text, and a longer text travels only in Jackson's chunks, which no stamp uses.
+///
+/// Python `wire.MAX_STAMP_UNITS`; Java `HlcTimestamp.MAX_STAMP_UNITS`.
+pub const MAX_STAMP_UNITS: usize = 3996;
+
+/// The longest node a clock stamps with, in UTF-16 code units (SPEC §9, v0.1.31):
+/// [`MAX_STAMP_UNITS`] less the longest physical part (19 digits), the longest logical part (10
+/// digits), and the two colons, so every stamp a clock issues fits one definite text.
+///
+/// Python `wire.MAX_NODE_UNITS`; Java `HlcTimestamp.MAX_NODE_UNITS`.
+pub const MAX_NODE_UNITS: usize = MAX_STAMP_UNITS - 31;
+
+/// How many distinct refused states and claims, and as many deferred ones, a replica remembers so
+/// a re-offer counts once (SPEC §7.3, v0.1.30); past the bound the least recently offered key is
+/// forgotten first.
+///
+/// Python `peer.REFUSED_STAMPS_CAPACITY`; Java `ReplicatedSpace`'s refused-offer cache.
+pub const REFUSED_OFFERS_CAPACITY: usize = 4096;
+
+/// A card whose canonical encoding is more than this many bytes travels as a stub whose large
+/// parts sit in a content-swarm document (SPEC §6.1a.5, v0.1.32): the inline limit of a payload.
+///
+/// Java `CardSpill.SPILL_THRESHOLD_BYTES`; golden `card_spill_threshold_bytes`.
+pub const CARD_SPILL_THRESHOLD_BYTES: usize = 65_536;
+
+/// A publisher warns once a card's encoding passes this many bytes, 56 KiB (SPEC §6.1a.5).
+///
+/// Java `CardSpill.WARN_THRESHOLD_BYTES`; golden `card_spill_warn_bytes`.
+pub const CARD_SPILL_WARN_BYTES: usize = 57_344;
+
+/// The default bound on the advertisements one cache holds (SPEC §6.3), multiplied by four on a
+/// peer with the RENDEZVOUS role.
+///
+/// Java `AdCache.DEFAULT_MAX_ENTRIES`.
+pub const AD_CACHE_MAX_ENTRIES: usize = 8_192;
+
+/// The default byte budget of one advertisement cache, 32 MiB: the sum of the lengths of the
+/// cached advertisements' canonical encodings (SPEC §6.3, v0.1.32), multiplied by four on a peer
+/// with the RENDEZVOUS role.
+///
+/// Java `AdCache.DEFAULT_MAX_BYTES`.
+pub const AD_CACHE_MAX_BYTES: usize = 33_554_432;
+
 /// The deepest container nesting the CBOR decoder accepts: at most 64 arrays or maps
 /// nested inside one another. Hostile deep nesting would otherwise overflow the stack; honest
 /// wire structures stay far below it. The `adv_deep_nesting_cbor` golden vector exceeds it.
@@ -100,5 +166,15 @@ mod tests {
         assert_eq!(MAX_CLAIM_EPOCH_JUMP, 1_048_576);
         assert_eq!(MAX_FRAME_BYTES, 8_388_608);
         assert_eq!(INLINE_PAYLOAD_LIMIT, 65_536);
+        assert_eq!(LOGICAL_LIMIT, 65_536);
+        assert_eq!(SKEW_MARGIN_MILLIS, 5_000);
+        assert_eq!(FAR_FUTURE_HOSTILE_MILLIS, 3_600_000);
+        assert_eq!(MAX_STAMP_UNITS, 3_996);
+        assert_eq!(MAX_NODE_UNITS, 3_965);
+        assert_eq!(REFUSED_OFFERS_CAPACITY, 4_096);
+        assert_eq!(CARD_SPILL_THRESHOLD_BYTES, 65_536);
+        assert_eq!(CARD_SPILL_WARN_BYTES, 57_344);
+        assert_eq!(AD_CACHE_MAX_ENTRIES, 8_192);
+        assert_eq!(AD_CACHE_MAX_BYTES, 33_554_432);
     }
 }

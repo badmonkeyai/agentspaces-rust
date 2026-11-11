@@ -75,7 +75,7 @@ use std::cmp::Ordering;
 use crate::cbor::{self, Map, Value};
 use crate::crypto::KEY_LENGTH;
 use crate::hlc::Stamp;
-use crate::identity::{AgentIdentity, Identity, verify_agent_certificate_at};
+use crate::identity::{AgentIdentity, Identity, verify_agent_certificate_covering};
 use crate::ids;
 use crate::limits::{
     INLINE_PAYLOAD_LIMIT, MAX_CLAIM_EPOCH_JUMP, MAX_CLAIM_HOLD_MILLIS, MAX_DRIFT_MILLIS,
@@ -326,9 +326,11 @@ pub fn record_is_well_formed(record: &Map) -> bool {
 /// `issuer` must be an agent of the PeerID that key hashes to. Without a certificate (`None` or
 /// null) the signature `sig` must verify over [`sign_view_of`] under that peer key. With one, the
 /// certificate must verify under the peer key for exactly this issuer, judged at the record's own
-/// issue stamp (v0.1.13: signing time, not receipt; `now_ms` only bounds how far that stamp may
-/// lead, by [`MAX_DRIFT_MILLIS`]), and the signature must then verify under the certificate's
-/// agent key: a record that arrives with a certificate but a peer-key signature is refused.
+/// issue stamp (v0.1.13: signing time, not receipt) with no bound of its own on how far that
+/// stamp leads the receiver (v0.1.30: the fold's far-future rule judges it,
+/// [`verify_agent_certificate_covering`]), and the signature must then verify under the
+/// certificate's agent key: a record that arrives with a certificate but a peer-key signature is
+/// refused. `_now_ms`, the receiver's time, bounds nothing here since v0.1.30.
 ///
 /// The record must be one Java decodes ([`record_is_well_formed`]) and whose view Java re-encodes
 /// to the bytes this function verifies ([`sign_view_of`]): Java verifies over its own typed
@@ -338,7 +340,7 @@ pub fn verify_record(
     record: &Map,
     issuer_public: &[u8],
     certificate: Option<&Value>,
-    now_ms: i64,
+    _now_ms: i64,
 ) -> bool {
     if issuer_public.len() != KEY_LENGTH || !record_is_well_formed(record) {
         return false;
@@ -362,7 +364,7 @@ pub fn verify_record(
             let Some(issued) = Stamp::of(record.get("issued")) else {
                 return false;
             };
-            verify_agent_certificate_at(certificate, issuer_public, issuer, issued.physical, now_ms)
+            verify_agent_certificate_covering(certificate, issuer_public, issuer, issued.physical)
                 && agent_key(certificate).is_some_and(|key| Identity::verify(key, &view, signature))
         }
     }
@@ -609,8 +611,9 @@ pub fn sign_state(
 /// `agentCertificate`. The record itself is [`verify_record`]'s.
 ///
 /// - An agent-signed state (`signer` present) must name exactly `party`, carry a
-///   `stateCertificate` that `party_key` verifies for `party` at `signedAt` (leading `now_ms` by
-///   at most [`MAX_DRIFT_MILLIS`]), and verify under that certificate's agent key.
+///   `stateCertificate` that `party_key` verifies for `party` at `signedAt`, by the certificate's
+///   window alone (SPEC §9.2 F4: the fold's far-future rule judges how far `signedAt` leads, and
+///   `_now_ms` bounds nothing here), and verify under that certificate's agent key.
 /// - A peer-signed state verifies under `party_key`, unless the party is agent-attested: an
 ///   attested party's transitions must be agent-signed (v0.1.13), so its peer or a sibling
 ///   agent cannot act in its name.
@@ -623,7 +626,7 @@ pub fn verify_state_signature(
     party: &str,
     party_key: &[u8],
     party_attested: bool,
-    now_ms: i64,
+    _now_ms: i64,
 ) -> bool {
     let lists = ["adds", "removes"]
         .iter()
@@ -651,7 +654,7 @@ pub fn verify_state_signature(
         return false;
     };
     signer.as_str() == Some(party)
-        && verify_agent_certificate_at(certificate, party_key, party, signed_at.physical, now_ms)
+        && verify_agent_certificate_covering(certificate, party_key, party, signed_at.physical)
         && agent_key(certificate).is_some_and(|key| Identity::verify(key, &view, state_sig))
 }
 
@@ -782,6 +785,69 @@ pub fn entry_delta(
 ) -> Result<Vec<u8>, RecordError> {
     let state = entry_state(write, peer, agent_name, agent)?;
     Ok(delta(Some(&state), None))
+}
+
+/// A received space delta ([`decode_delta`]): the state it carries and the claim, with the entry
+/// id it travels under.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Delta {
+    /// The `EntryStateDto`, when not null.
+    pub state: Option<Map>,
+    /// `(claimEntry, claim)`, when both are not null.
+    pub claim: Option<(String, Map)>,
+}
+
+/// A received space `SyncDelta` ([`decode_sync_delta`]), one stream of a `PULL_RESP`: its claims
+/// under the entry ids they travel under, then its states.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SyncDelta {
+    /// `claims`, in the order they arrived (canonical key order).
+    pub claims: Vec<(String, Map)>,
+    /// `states`, in the order they arrived.
+    pub states: Vec<Map>,
+}
+
+/// The space delta a `space:` rumor carries (`SpaceWire.Delta`), decoded by the receiver's
+/// procedure of SPEC §9.1 ([`crate::schema::decode`]): the item rules, the record rules of the
+/// delta and every record it nests (the state, its record, lease, dots, and certificates, the
+/// signed claim and its `TakeClaim` in declared order), and the canonical-bytes check. `None`
+/// when any of them fails: the delta is undecodable, the receiver counts it
+/// (`deltasUndecodable`), and strikes nobody. A stamp outside the canonical grammar, or in any
+/// other CBOR form than one definite text, is one such failure; a counter above the logical limit
+/// decodes, and the fold refuses it after verification.
+pub fn decode_delta(bytes: &[u8]) -> Option<Delta> {
+    let mut delta = crate::schema::decode_map(bytes, "SpaceWire.Delta")?;
+    let state = delta.remove("state").and_then(Value::into_map);
+    let claim_entry = delta.remove("claimEntry").and_then(Value::into_text);
+    let claim = delta.remove("claim").and_then(Value::into_map);
+    Some(Delta {
+        state,
+        claim: claim_entry.zip(claim),
+    })
+}
+
+/// A space's `SyncDelta` (`{states, claims}`, one stream of a `PULL_RESP`), decoded by the
+/// receiver's procedure as [`decode_delta`] decodes a delta: one state or claim that does not
+/// decode makes the whole `SyncDelta` undecodable, as Java's codec refuses it. A null `states` or
+/// `claims` reads as empty.
+pub fn decode_sync_delta(bytes: &[u8]) -> Option<SyncDelta> {
+    let mut sync = crate::schema::decode_map(bytes, "SpaceWire.SyncDelta")?;
+    let claims = sync
+        .remove("claims")
+        .and_then(Value::into_map)
+        .map(|claims| {
+            claims
+                .into_iter()
+                .filter_map(|(entry, signed)| Some((entry.into_text()?, signed.into_map()?)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let states = sync
+        .remove("states")
+        .and_then(Value::into_array)
+        .map(|states| states.into_iter().filter_map(Value::into_map).collect())
+        .unwrap_or_default();
+    Some(SyncDelta { claims, states })
 }
 
 /// A Java `SpaceWire.Delta`: `{state, claimEntry, claim}`, each null when absent. A completion
@@ -1000,7 +1066,8 @@ fn hold_within_bound(claim: &Map, now_ms: i64) -> bool {
 }
 
 /// TECH-SPEC §7.6's proof rule for a received `SignedClaim` (Java `ReplicatedSpace.verifyClaim`,
-/// `wire.py`'s `verify_claim_proof`), with every check that needs no replica state.
+/// `wire.py`'s `verify_claim_proof`), with every check that needs no replica state: the
+/// signature of [`verify_claim_signature`] and the hold bound.
 ///
 /// True only when the claim is well-formed ([`claim_is_well_formed`]: epoch from 1, finite bid,
 /// a parseable stamp) and in the canonical form Java writes it back as ([`claim_is_canonical`]:
@@ -1010,13 +1077,27 @@ fn hold_within_bound(claim: &Map, now_ms: i64) -> bool {
 /// whose PeerID the `holder` is an agent of (a non-empty local name free of `/`), and the
 /// `signature` over the claim's CBOR verifies: under `holderKey` without a certificate (absent
 /// or null), or, with one, under the certificate's agent key once the certificate verifies under
-/// `holderKey` for exactly the holder at the claim's own stamp (not at `now_ms`, which only
-/// bounds how far ahead that stamp may run). A claim with a certificate but a peer-key signature
-/// is refused.
+/// `holderKey` for exactly the holder at the claim's own stamp, by its window alone (SPEC §4.2,
+/// v0.1.30: the fold's far-future rule judges how far the stamp leads). A claim with a
+/// certificate but a peer-key signature is refused.
 ///
 /// The entry and space bindings, the epoch jump ([`claim_within_bounds`]), the issue bound
-/// ([`claim_not_before_issue`]), and revocation are the fold's, which knows the entry.
+/// ([`claim_not_before_issue`]), the stamp rules, and revocation are the fold's, which knows the
+/// entry.
 pub fn verify_claim_proof(signed: &Value, now_ms: i64) -> bool {
+    verify_claim_signature(signed)
+        && signed
+            .get("claim")
+            .and_then(Value::as_map)
+            .is_some_and(|claim| hold_within_bound(claim, now_ms))
+}
+
+/// [`verify_claim_proof`] without the hold bound: the claim is well formed and canonical, its
+/// holder an agent of the peer `holderKey` hashes to, and its signature verifies (with its
+/// certificate, if any, covering the claim's stamp). Java's `verifyClaim` checks exactly this;
+/// the fold then judges the claim's stamp (the logical limit and the far-future rule) before the
+/// epoch and hold bounds, as Java's `mergeClaim` does.
+pub fn verify_claim_signature(signed: &Value) -> bool {
     let Some(claim_value) = signed.get("claim") else {
         return false;
     };
@@ -1029,10 +1110,7 @@ pub fn verify_claim_proof(signed: &Value, now_ms: i64) -> bool {
     let Some(signature) = signed.get("signature").and_then(Value::as_bytes) else {
         return false;
     };
-    if holder_key.len() != KEY_LENGTH
-        || !claim_is_well_formed(claim)
-        || !claim_is_canonical(claim)
-        || !hold_within_bound(claim, now_ms)
+    if holder_key.len() != KEY_LENGTH || !claim_is_well_formed(claim) || !claim_is_canonical(claim)
     {
         return false;
     }
@@ -1049,7 +1127,7 @@ pub fn verify_claim_proof(signed: &Value, now_ms: i64) -> bool {
     match non_null(signed.get("holderCertificate")) {
         None => Identity::verify(holder_key, &bytes, signature),
         Some(certificate) => {
-            verify_agent_certificate_at(certificate, holder_key, holder, stamp.physical, now_ms)
+            verify_agent_certificate_covering(certificate, holder_key, holder, stamp.physical)
                 && agent_key(certificate)
                     .is_some_and(|key| Identity::verify(key, &bytes, signature))
         }

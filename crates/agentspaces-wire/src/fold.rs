@@ -62,10 +62,34 @@
 //! `liveRecords` does, where `peer.py` reads the record's original lease of any kind and ignores
 //! withdrawal.
 //!
+//! # Stamps (SPEC §7.3, §7.4, §9; v0.1.30 and v0.1.31)
+//!
+//! After a state's or claim's signatures verify and its actor passes the revocation check, the
+//! fold judges its stamps against the receiver's wall time ([`FoldContext::now_ms`]), as Java's
+//! `ReplicatedSpace` does:
+//!
+//! - a counter above [`crate::limits::LOGICAL_LIMIT`] in the record's `issued`, the state's
+//!   `leaseStamp`, an agent-signed state's `signedAt`, or a claim's `stamp` refuses the carrier
+//!   ([`Refusal::StampLogical`], counted in [`SpaceStore::stamps_logical_refused`]);
+//! - a stamp more than [`FAR_FUTURE_HOSTILE_MILLIS`] past `wall + MAX_DRIFT + SKEW_MARGIN` is
+//!   hostile and refuses it ([`Refusal::StampFarFuture`], counted in
+//!   [`SpaceStore::stamps_far_future_refused`]), judged after the logical limit;
+//! - a stamp past `wall + MAX_DRIFT + SKEW_MARGIN` by less defers it ([`FoldOutcome::Deferred`],
+//!   counted in [`SpaceStore::stamps_far_future_deferred`]): nothing merges and nobody is struck,
+//!   and the carrier merges once the wall catches up and a partner offers it again.
+//!
+//! Each count is once per distinct signed content, keyed on the entry, the issue stamp, and the
+//! digest of the state's signed view, or on the entry and the digest of the signed claim, under
+//! a cache of the [`REFUSED_OFFERS_CAPACITY`] most recently offered keys, so a re-offer by gossip
+//! or anti-entropy counts once. The cache decides nothing: every offer is judged afresh. A claim
+//! the ordered log commits meets the logical limit alone ([`SpaceStore::judge_committed_claim`]).
+//! A certificate bounds a record's, claim's, or `signedAt`'s stamp by its validity window alone
+//! (SPEC §4.2); the far-future rule bounds how far the stamp leads.
+//!
 //! Left to the layers above: admission (SPEC §7.5), tag shards, tombstone collection, the
 //! ordered log's decided epochs, misbehavior reports, and feeding the caller's HLC with the
 //! stamps of what folded (Java calls `hlc.update` on the record's `issued`, the `leaseStamp`, and
-//! the claim's `stamp`).
+//! the claim's `stamp`; [`crate::hlc::Hlc::observe`] clamps each).
 //!
 //! The module is sans-IO and has no clock: [`FoldContext::now_ms`] is the receiver's time. Every
 //! judgment of untrusted input returns a [`FoldOutcome`] and never panics.
@@ -75,16 +99,18 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use crate::cbor::{Map, Value};
+use crate::cbor::{self, Map, Value};
 use crate::crypto::KEY_LENGTH;
-use crate::limits::MAX_DRIFT_MILLIS;
-// `Stamp` is the crate's one strict HLC stamp parser, shared with the record and claim verifiers
-// so the fold admits exactly the stamps they accept; `physical_lenient` reads a `signedAt`'s
-// signing time as `wire.hlc_physical` does.
-use crate::hlc::{Stamp, physical_lenient};
+use crate::limits::{
+    FAR_FUTURE_HOSTILE_MILLIS, MAX_DRIFT_MILLIS, REFUSED_OFFERS_CAPACITY, SKEW_MARGIN_MILLIS,
+};
+// `Stamp` is the crate's one HLC stamp parser, shared with the record and claim verifiers so the
+// fold admits exactly the stamps they accept.
+use crate::hlc::Stamp;
 use crate::records::{
     WRITE_LEASE_KIND, claim_is_well_formed, claim_not_before_issue, claim_within_bounds,
-    merge_claims, verify_claim_proof, verify_record, verify_state_signature,
+    merge_claims, state_sign_view_of, verify_claim_proof, verify_claim_signature, verify_record,
+    verify_state_signature,
 };
 use crate::revocation::Registry;
 use crate::util::{field, java_order, present, text};
@@ -98,9 +124,10 @@ pub const DEFAULT_MAX_ENTRIES: usize = 1 << 16;
 pub const MAX_DOTS_PER_STATE: usize = 1_024;
 
 /// The default settle window of a take, in milliseconds: the race allowance of the far-past
-/// contest rule ([`Refusal::LateContest`]). `peer.py` and the Ruby peer settle for 600 ms; a Java
-/// space defaults to 200 ms, which only refuses more.
-pub const DEFAULT_SETTLE_MILLIS: i64 = 600;
+/// contest rule ([`Refusal::LateContest`]). SPEC §9.2 R6 has every implementation judge the rule
+/// as Java's `mergeClaim` does, with a Java space's default window of 200 ms (`peer.py` moved
+/// from 600 ms to 200 ms with it).
+pub const DEFAULT_SETTLE_MILLIS: i64 = 200;
 
 // ---------------------------------------------------------------------------------------------
 // Outcomes
@@ -157,6 +184,12 @@ pub enum Refusal {
     /// A recordless state (SPEC §7.3, v0.1.29) names an entry whose record this
     /// store does not hold; Java keeps such a state pending, bounded, until the record arrives.
     RecordPending,
+    /// A verified state or claim carries a stamp whose logical counter is above
+    /// [`crate::limits::LOGICAL_LIMIT`] (SPEC §7.3, §7.4, v0.1.30): `logical counter above 65536`.
+    StampLogical,
+    /// A verified state or claim carries a stamp more than [`FAR_FUTURE_HOSTILE_MILLIS`] past
+    /// `wall + MAX_DRIFT + SKEW_MARGIN` (SPEC §7.3, v0.1.30): `far-future stamp`.
+    StampFarFuture,
 }
 
 impl Refusal {
@@ -179,6 +212,8 @@ impl Refusal {
             Refusal::LateContest => "late-contest",
             Refusal::Full => "full",
             Refusal::RecordPending => "record-pending",
+            Refusal::StampLogical => "stamp-logical",
+            Refusal::StampFarFuture => "stamp-far-future",
         }
     }
 }
@@ -200,6 +235,10 @@ pub enum FoldOutcome {
     Unchanged,
     /// Refused for the given reason; the store is as it was.
     Refused(Refusal),
+    /// Authentic, but stamped past `wall + MAX_DRIFT + SKEW_MARGIN` by at most
+    /// [`FAR_FUTURE_HOSTILE_MILLIS`] (SPEC §7.3, v0.1.30): nothing merged, nobody struck, and the
+    /// store merges it when a partner offers it again after the receiver's wall caught up.
+    Deferred,
 }
 
 impl FoldOutcome {
@@ -229,9 +268,8 @@ impl FoldOutcome {
 /// and optionally the one space this store replicates.
 #[derive(Debug, Clone, Copy)]
 pub struct FoldContext<'a> {
-    /// The receiver's time, epoch milliseconds: certificates are judged at their signing stamps
-    /// but may lead this by at most [`MAX_DRIFT_MILLIS`], and claim holds and epochs are bounded
-    /// from it.
+    /// The receiver's time, epoch milliseconds: the far-future rule judges every stamp against it
+    /// (SPEC §7.3), and claim holds and epochs are bounded from it.
     pub now_ms: i64,
     /// The group's accepted revocations (SPEC §5.6), applied at merge.
     pub revocations: &'a Registry,
@@ -275,13 +313,130 @@ impl<'a> FoldContext<'a> {
 // ---------------------------------------------------------------------------------------------
 // Stamps, dots, small helpers
 
-/// `peer.py`'s `_signing_ms`: the physical time of a non-empty `signedAt`, else `fallback` (also
-/// when `signedAt` does not parse).
+/// `peer.py`'s `_signing_ms`: the physical time of a `signedAt` stamp, else `fallback` (also when
+/// `signedAt` is no stamp).
 fn signing_ms(dto: &Map, fallback: Option<i64>) -> Option<i64> {
-    match dto.get("signedAt").and_then(Value::as_str) {
-        Some(text) if !text.is_empty() => physical_lenient(text).or(fallback),
-        _ => fallback,
+    Stamp::of(dto.get("signedAt"))
+        .map(|stamp| stamp.physical)
+        .or(fallback)
+}
+
+/// How a stamp stands against the receiver's far-future margin (Java `ReplicatedSpace.Lead`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Lead {
+    /// At or inside `wall + MAX_DRIFT + SKEW_MARGIN`: merges, clamped by the clock.
+    Within,
+    /// Past it by at most [`FAR_FUTURE_HOSTILE_MILLIS`]: deferred.
+    Deferred,
+    /// Further past it: hostile.
+    Hostile,
+}
+
+/// Java `ReplicatedSpace.lead`: a stamp's physical part against `now_ms + MAX_DRIFT +
+/// SKEW_MARGIN`, exactly.
+fn lead(physical: i64, now_ms: i64) -> Lead {
+    let margin = i128::from(now_ms) + i128::from(MAX_DRIFT_MILLIS) + i128::from(SKEW_MARGIN_MILLIS);
+    let ahead = i128::from(physical) - margin;
+    if ahead <= 0 {
+        Lead::Within
+    } else if ahead <= i128::from(FAR_FUTURE_HOSTILE_MILLIS) {
+        Lead::Deferred
+    } else {
+        Lead::Hostile
     }
+}
+
+/// The verdict on a verified carrier's stamps (SPEC §7.3): a logical refusal first, then the
+/// furthest lead. Absent stamps pass; a present one that does not parse cannot reach here (the
+/// verifiers refuse it).
+fn stamp_verdict<'a>(
+    stamps: impl IntoIterator<Item = Option<&'a Value>>,
+    now_ms: i64,
+) -> StampVerdict {
+    let stamps: Vec<Stamp<'_>> = stamps.into_iter().flat_map(Stamp::of).collect();
+    if stamps.iter().any(|stamp| !stamp.is_acceptable()) {
+        return StampVerdict::Refuse(Refusal::StampLogical);
+    }
+    match stamps
+        .iter()
+        .map(|stamp| lead(stamp.physical, now_ms))
+        .max()
+        .unwrap_or(Lead::Within)
+    {
+        Lead::Within => StampVerdict::Merge,
+        Lead::Deferred => StampVerdict::Defer,
+        Lead::Hostile => StampVerdict::Refuse(Refusal::StampFarFuture),
+    }
+}
+
+/// What the fold does with a verified carrier for its stamps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StampVerdict {
+    Merge,
+    Defer,
+    Refuse(Refusal),
+}
+
+/// A bounded memory of keys that evicts the least recently offered first (SPEC §7.3, v0.1.30:
+/// the cache of refused offers holds 4096 keys in every implementation).
+#[derive(Debug, Clone, Default)]
+struct RecentKeys {
+    ticks: BTreeMap<Vec<u8>, u64>,
+    order: BTreeMap<u64, Vec<u8>>,
+    next: u64,
+}
+
+impl RecentKeys {
+    /// Marks `key` most recently offered and answers whether it was new.
+    fn offer(&mut self, key: Vec<u8>) -> bool {
+        let tick = self.next;
+        self.next = self.next.wrapping_add(1);
+        let new = match self.ticks.insert(key.clone(), tick) {
+            Some(old) => {
+                self.order.remove(&old);
+                false
+            }
+            None => true,
+        };
+        self.order.insert(tick, key);
+        while self.order.len() > REFUSED_OFFERS_CAPACITY {
+            if let Some((_, oldest)) = self.order.pop_first() {
+                self.ticks.remove(&oldest);
+            }
+        }
+        new
+    }
+
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+}
+
+/// The key a state offer is counted under, its signed content alone (Java `stateOfferKey`): the
+/// entry, the issue stamp, and the SHA-256 of the state's signed view.
+fn state_offer_key(entry_id: &str, dto: &Map) -> Vec<u8> {
+    let issued = dto
+        .get("record")
+        .and_then(|record| record.get("issued"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let view = state_sign_view_of(dto)
+        .map(|view| cbor::encode(&Value::Map(view)))
+        .unwrap_or_default();
+    let mut key = format!("state:{entry_id}={issued}/").into_bytes();
+    key.extend_from_slice(&crate::crypto::port().sha256(&view));
+    key
+}
+
+/// The key a claim offer is counted under (Java `claimOfferKey`): the SHA-256 of the signed claim
+/// map and the entry it travels under.
+fn claim_offer_key(entry_id: &str, claim: &Map) -> Vec<u8> {
+    let digest = crate::crypto::port().sha256(&cbor::encode(&Value::Map(claim.clone())));
+    let mut key = b"claim:".to_vec();
+    key.extend_from_slice(&digest);
+    key.extend_from_slice(b"@");
+    key.extend_from_slice(entry_id.as_bytes());
+    key
 }
 
 /// The agent key of a certificate field, when it carries one as bytes.
@@ -517,6 +672,11 @@ pub struct SpaceStore {
     claims: Ordered<Map>,
     max_entries: usize,
     refused_inserts: u64,
+    refused_offers: RecentKeys,
+    deferred_offers: RecentKeys,
+    stamps_logical_refused: u64,
+    stamps_far_future_refused: u64,
+    stamps_far_future_deferred: u64,
 }
 
 impl fmt::Debug for SpaceStore {
@@ -526,6 +686,8 @@ impl fmt::Debug for SpaceStore {
             .field("claims", &self.claims.len())
             .field("max_entries", &self.max_entries)
             .field("refused_inserts", &self.refused_inserts)
+            .field("refused_offers", &self.refused_offers.len())
+            .field("deferred_offers", &self.deferred_offers.len())
             .finish()
     }
 }
@@ -549,7 +711,63 @@ impl SpaceStore {
             claims: Ordered::default(),
             max_entries,
             refused_inserts: 0,
+            refused_offers: RecentKeys::default(),
+            deferred_offers: RecentKeys::default(),
+            stamps_logical_refused: 0,
+            stamps_far_future_refused: 0,
+            stamps_far_future_deferred: 0,
         }
+    }
+
+    /// Distinct verified states and claims refused for a stamp whose logical counter is above
+    /// [`crate::limits::LOGICAL_LIMIT`] (`stampsLogicalRefused`, SPEC §9).
+    pub fn stamps_logical_refused(&self) -> u64 {
+        self.stamps_logical_refused
+    }
+
+    /// Distinct verified states and claims refused for a stamp more than
+    /// [`FAR_FUTURE_HOSTILE_MILLIS`] past the far-future margin (`stampsFarFutureRefused`).
+    pub fn stamps_far_future_refused(&self) -> u64 {
+        self.stamps_far_future_refused
+    }
+
+    /// Distinct verified states and claims deferred for a stamp past the far-future margin
+    /// (`stampsFarFutureDeferred`), a count of no misbehavior.
+    pub fn stamps_far_future_deferred(&self) -> u64 {
+        self.stamps_far_future_deferred
+    }
+
+    /// Counts a refusal of `refusal` once per distinct `key` (the stamp refusals alone count).
+    fn count_refusal(&mut self, key: Vec<u8>, refusal: Refusal) {
+        let counter = match refusal {
+            Refusal::StampLogical => &mut self.stamps_logical_refused,
+            Refusal::StampFarFuture => &mut self.stamps_far_future_refused,
+            _ => return,
+        };
+        if self.refused_offers.offer(key) {
+            *counter = counter.saturating_add(1);
+        }
+    }
+
+    /// Counts a deferral once per distinct `key`.
+    fn count_deferral(&mut self, key: Vec<u8>) {
+        if self.deferred_offers.offer(key) {
+            self.stamps_far_future_deferred = self.stamps_far_future_deferred.saturating_add(1);
+        }
+    }
+
+    /// The logical limit a claim the ordered log committed meets before it is installed (SPEC
+    /// §7.4, v0.1.30): the log's arbitration must stay identical on every member, so a committed
+    /// claim meets no far-future rule. `Err` ([`Refusal::StampLogical`], counted once per
+    /// distinct claim) when its stamp is not acceptable, or [`Refusal::Malformed`] when it holds
+    /// no stamp.
+    pub fn judge_committed_claim(&mut self, entry_id: &str, claim: &Map) -> Result<(), Refusal> {
+        let stamp = Stamp::of(claim.get("stamp")).ok_or(Refusal::Malformed)?;
+        if stamp.is_acceptable() {
+            return Ok(());
+        }
+        self.count_refusal(claim_offer_key(entry_id, claim), Refusal::StampLogical);
+        Err(Refusal::StampLogical)
     }
 
     /// The bound on held states (and, separately, on held claims).
@@ -663,12 +881,16 @@ impl SpaceStore {
     ///    issuer;
     /// 9. the state signature authenticates the transition for that party
     ///    ([`crate::records::verify_state_signature`]: an agent-attested party's transitions must
-    ///    be agent-signed, judged at `signedAt` under the drift ceiling);
+    ///    be agent-signed, its certificate covering `signedAt`);
     /// 10. the freeze rule (SPEC §5.6): the holder of a completion is judged at `signedAt` (an
     ///     unknown time when absent, refused under any revocation of it); the issuer of any
     ///     other transition at `signedAt`, else at the `leaseStamp` of the last write or renewal,
     ///     with the record's agent key and, for an agent-signed state, the state's agent key too;
-    /// 11. room for a new entry.
+    /// 11. the stamps (SPEC §7.3): `issued`, `leaseStamp`, and `signedAt` acceptable
+    ///     ([`Refusal::StampLogical`]), none more than an hour past the far-future margin
+    ///     ([`Refusal::StampFarFuture`]), each refusal counted once per distinct signed state;
+    ///     one past the margin by less defers the state ([`FoldOutcome::Deferred`]);
+    /// 12. room for a new entry.
     ///
     /// A recordless state (SPEC §7.3, [`crate::records::without_record`])
     /// is first put over the record this store holds for the entry it names
@@ -694,6 +916,19 @@ impl SpaceStore {
             Ok(entry_id) => entry_id,
             Err(refusal) => return FoldOutcome::Refused(refusal),
         };
+        let issued = dto.get("record").and_then(|record| record.get("issued"));
+        let stamps = [issued, dto.get("leaseStamp"), dto.get("signedAt")];
+        match stamp_verdict(stamps, ctx.now_ms) {
+            StampVerdict::Merge => {}
+            StampVerdict::Defer => {
+                self.count_deferral(state_offer_key(entry_id, dto));
+                return FoldOutcome::Deferred;
+            }
+            StampVerdict::Refuse(refusal) => {
+                self.count_refusal(state_offer_key(entry_id, dto), refusal);
+                return FoldOutcome::Refused(refusal);
+            }
+        }
         if let Some(held) = self.states.get_mut(entry_id) {
             let joined = join(&held.joined, dto);
             let joined_changed = joined != held.joined;
@@ -733,16 +968,22 @@ impl SpaceStore {
     /// 3. its `spaceId` is [`FoldContext::space_id`], when set;
     /// 4. it is well formed ([`crate::records::claim_is_well_formed`]: a NaN bid cannot make the
     ///    total order lie, and epoch 0 is no take);
-    /// 5. its proof verifies ([`crate::records::verify_claim_proof`], including the hold bound);
+    /// 5. its signature verifies ([`crate::records::verify_claim_signature`], a certificate
+    ///    covering the claim's stamp);
     /// 6. its holder is not revoked, judged at an unknown time (a revoked holder takes nothing,
     ///    whatever the claim's stamp);
-    /// 7. its epoch is within [`crate::limits::MAX_CLAIM_EPOCH_JUMP`] of the held claim's (0
-    ///    when none);
-    /// 8. when the entry's state is held, the claim does not predate its issue stamp by more
+    /// 7. its stamp is acceptable ([`Refusal::StampLogical`]) and not more than an hour past the
+    ///    far-future margin ([`Refusal::StampFarFuture`]), each refusal counted once per distinct
+    ///    signed claim (SPEC §7.4);
+    /// 8. its epoch is within [`crate::limits::MAX_CLAIM_EPOCH_JUMP`] of the held claim's (0
+    ///    when none), and its hold ends within [`crate::limits::MAX_CLAIM_HOLD_MILLIS`];
+    /// 9. when the entry's state is held, the claim does not predate its issue stamp by more
     ///    than [`crate::records::MAX_CLAIM_PREDATES_ISSUE_MILLIS`];
-    /// 9. when another holder's claim is held, the claim's stamp is not older than
-    ///    `now_ms - MAX_DRIFT_MILLIS - settle_millis`;
-    /// 10. room for a new claim.
+    /// 10. when another holder's claim is held, the claim's stamp is not older than
+    ///     `now_ms - MAX_DRIFT_MILLIS - settle_millis`;
+    /// 11. a stamp past the far-future margin by less than an hour defers the claim
+    ///     ([`FoldOutcome::Deferred`], counted once per distinct claim);
+    /// 12. room for a new claim.
     pub fn fold_claim(
         &mut self,
         entry_id: &str,
@@ -750,8 +991,19 @@ impl SpaceStore {
         ctx: &FoldContext<'_>,
     ) -> FoldOutcome {
         match self.judge_claim(entry_id, signed, ctx) {
-            Ok(()) => self.merge_own_claim(entry_id, signed),
-            Err(refusal) => FoldOutcome::Refused(refusal),
+            Ok(StampVerdict::Merge) => self.merge_own_claim(entry_id, signed),
+            Ok(StampVerdict::Defer) => {
+                if let Some(claim) = signed.get("claim").and_then(Value::as_map) {
+                    self.count_deferral(claim_offer_key(entry_id, claim));
+                }
+                FoldOutcome::Deferred
+            }
+            Ok(StampVerdict::Refuse(refusal)) | Err(refusal) => {
+                if let Some(claim) = signed.get("claim").and_then(Value::as_map) {
+                    self.count_refusal(claim_offer_key(entry_id, claim), refusal);
+                }
+                FoldOutcome::Refused(refusal)
+            }
         }
     }
 
@@ -926,10 +1178,7 @@ impl SpaceStore {
                 signing_ms(dto, None),
             );
         }
-        let lease_ms = dto
-            .get("leaseStamp")
-            .and_then(Value::as_str)
-            .and_then(physical_lenient);
+        let lease_ms = Stamp::of(dto.get("leaseStamp")).map(|stamp| stamp.physical);
         registry.refuses(
             issuer,
             certificate_key(dto.get("agentCertificate")),
@@ -948,7 +1197,7 @@ impl SpaceStore {
         entry_id: &str,
         signed: &Map,
         ctx: &FoldContext<'_>,
-    ) -> Result<(), Refusal> {
+    ) -> Result<StampVerdict, Refusal> {
         let claim = signed
             .get("claim")
             .and_then(Value::as_map)
@@ -967,7 +1216,7 @@ impl SpaceStore {
         if !claim_is_well_formed(claim) {
             return Err(Refusal::Malformed);
         }
-        if !verify_claim_proof(&Value::Map(signed.clone()), ctx.now_ms) {
+        if !verify_claim_signature(&Value::Map(signed.clone())) {
             return Err(Refusal::UnverifiedClaim);
         }
         // Well formed, so the holder is text and the stamp parses.
@@ -979,6 +1228,12 @@ impl SpaceStore {
             None,
         ) {
             return Err(Refusal::Revoked);
+        }
+        // SPEC §7.4's third rule and the far-future rule of §7.3, judged after verification and
+        // revocation and before the epoch, hold, and contest bounds, as Java's mergeClaim does.
+        let verdict = stamp_verdict([claim.get("stamp")], ctx.now_ms);
+        if let StampVerdict::Refuse(refusal) = verdict {
+            return Err(refusal);
         }
         let current = self.claim_of(entry_id);
         let observed = current
@@ -1008,7 +1263,7 @@ impl SpaceStore {
                 return Err(Refusal::LateContest);
             }
         }
-        Ok(())
+        Ok(verdict)
     }
 }
 
@@ -1049,8 +1304,76 @@ mod tests {
         assert!(Some(a) > None);
         // Java order: a supplementary character sorts before U+FFFD, unlike code point order.
         assert_eq!(java_order("\u{1F600}", "\u{FFFD}"), Ordering::Less);
-        assert_eq!(physical_lenient("+12:0:n"), Some(12));
-        assert_eq!(physical_lenient("x"), None);
+        assert_eq!(crate::hlc::physical_lenient("+12:0:n"), Some(12));
+        assert_eq!(crate::hlc::physical_lenient("x"), None);
+        // Since v0.1.30 a stamp has one text, and the fold reads no other.
+        assert!(Stamp::parse("+12:0:n").is_none());
+    }
+
+    #[test]
+    fn a_stamp_leads_within_defers_or_is_hostile() {
+        let now = 1_000_000;
+        let margin = now + MAX_DRIFT_MILLIS + SKEW_MARGIN_MILLIS;
+        assert_eq!(lead(margin, now), Lead::Within);
+        assert_eq!(lead(margin + 1, now), Lead::Deferred);
+        assert_eq!(
+            lead(margin + FAR_FUTURE_HOSTILE_MILLIS, now),
+            Lead::Deferred
+        );
+        assert_eq!(
+            lead(margin + FAR_FUTURE_HOSTILE_MILLIS + 1, now),
+            Lead::Hostile
+        );
+        assert_eq!(lead(i64::MAX, i64::MAX), Lead::Within);
+        assert_eq!(lead(i64::MAX, i64::MIN), Lead::Hostile);
+        let at = |physical: i64, logical: i32| Value::from(format!("{physical}:{logical}:n"));
+        let (merge, defer, hostile) = (at(now, 0), at(margin + 1, 0), at(i64::MAX, 0));
+        let logical = at(now, crate::limits::LOGICAL_LIMIT + 1);
+        assert_eq!(
+            stamp_verdict([Some(&merge), None], now),
+            StampVerdict::Merge
+        );
+        assert_eq!(
+            stamp_verdict([Some(&merge), Some(&defer)], now),
+            StampVerdict::Defer
+        );
+        assert_eq!(
+            stamp_verdict([Some(&defer), Some(&hostile)], now),
+            StampVerdict::Refuse(Refusal::StampFarFuture)
+        );
+        // The logical limit is judged first, so a stamp that fails both is a logical refusal.
+        let both = at(i64::MAX, crate::limits::LOGICAL_LIMIT + 1);
+        assert_eq!(
+            stamp_verdict([Some(&both)], now),
+            StampVerdict::Refuse(Refusal::StampLogical)
+        );
+        assert_eq!(
+            stamp_verdict([Some(&merge), Some(&logical)], now),
+            StampVerdict::Refuse(Refusal::StampLogical)
+        );
+    }
+
+    #[test]
+    fn the_refused_offer_cache_forgets_the_least_recently_offered_key() {
+        let mut keys = RecentKeys::default();
+        assert!(keys.offer(b"first".to_vec()));
+        assert!(!keys.offer(b"first".to_vec()));
+        for index in 0..REFUSED_OFFERS_CAPACITY - 1 {
+            assert!(keys.offer(index.to_be_bytes().to_vec()));
+        }
+        assert_eq!(keys.len(), REFUSED_OFFERS_CAPACITY);
+        // "first" is offered again, so it is the most recent, and key 0 is now the oldest.
+        assert!(!keys.offer(b"first".to_vec()));
+        assert!(keys.offer(b"newcomer".to_vec()));
+        assert_eq!(keys.len(), REFUSED_OFFERS_CAPACITY);
+        assert!(
+            !keys.offer(b"first".to_vec()),
+            "kept: it was offered recently"
+        );
+        assert!(
+            keys.offer(0usize.to_be_bytes().to_vec()),
+            "forgotten: the oldest offer"
+        );
     }
 
     #[test]

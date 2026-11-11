@@ -42,9 +42,9 @@ use agentspaces_wire::identity::{
     Identity, agent_certificate, sign_agent_certificate, verify_agent_certificate,
 };
 use agentspaces_wire::records::{
-    EntryWrite, claim_delta, claim_is_canonical, claim_is_well_formed, delta, entry_state,
-    record_is_well_formed, sign_state, sign_view_of, signed_claim, state_sign_view_of, take_claim,
-    verify_claim_proof, verify_record, verify_state_signature,
+    EntryWrite, RecordError, claim_delta, claim_is_canonical, claim_is_well_formed, delta,
+    entry_state, record_is_well_formed, sign_state, sign_view_of, signed_claim, state_sign_view_of,
+    take_claim, verify_claim_proof, verify_record, verify_state_signature,
 };
 use agentspaces_wire::revocation::Registry;
 use agentspaces_wire::time::parse_instant_millis;
@@ -256,19 +256,22 @@ fn a_record_java_would_re_encode_or_refuse_never_verifies() {
     assert!(issuer_accepts(&canonical));
     assert_eq!(fold_state(&canonical), FoldOutcome::Applied);
 
-    // Built (and so signed) by the writer exactly as they arrive.
+    // A stamp outside the canonical grammar is no stamp since v0.1.30 (SPEC §9): the writer
+    // refuses to build such a record at all, so no signature over one exists.
     let plus = format!("+{}", s("hlc_encoded"));
     let zero = format!("0{}", s("hlc_encoded"));
+    for odd in [&plus, &zero] {
+        assert!(
+            matches!(
+                entry_state(&write(&payload, odd, None), &identity, "python", None),
+                Err(RecordError::MalformedStamp { field: "issued" })
+            ),
+            "{odd}"
+        );
+    }
+    // Built (and so signed) by the writer exactly as they arrive.
     let numeric_tags = map(cbor_map! { "k" => 5 });
     let built = [
-        (
-            "a + issue stamp",
-            entry_state(&write(&payload, &plus, None), &identity, "python", None),
-        ),
-        (
-            "a zero-led issue stamp",
-            entry_state(&write(&payload, &zero, None), &identity, "python", None),
-        ),
         (
             "an empty local name",
             entry_state(
@@ -480,7 +483,17 @@ fn a_state_java_would_re_encode_never_verifies() {
     let honest = sign_state(&canonical, &identity, Some((&agent, &signed_at))).unwrap();
     assert!(state_sign_view_of(&honest).is_some());
     for odd in [format!("+{signed_at}"), format!("0{signed_at}")] {
-        let state = sign_state(&canonical, &identity, Some((&agent, &odd))).unwrap();
+        // The signer refuses a stamp outside the canonical grammar (SPEC §9, v0.1.30) ...
+        assert!(
+            matches!(
+                sign_state(&canonical, &identity, Some((&agent, &odd))),
+                Err(RecordError::MalformedStamp { field: "signedAt" })
+            ),
+            "{odd}"
+        );
+        // ... and a state that carries one has no view to verify.
+        let mut state = honest.clone();
+        state.insert("signedAt", odd.as_str());
         assert!(state_sign_view_of(&state).is_none(), "{odd}");
     }
 }

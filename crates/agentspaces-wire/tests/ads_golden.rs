@@ -15,17 +15,21 @@
 
 //! Advertisements against the golden vectors Java produced (`test_golden.py`'s membership intro,
 //! agent cards, stored ads, and space advertisement; `test_content.py`'s via hint;
-//! `test_ui_declaration.py`; `test_app_card_host.py`), plus the receiver checks of
-//! `Peer.accept_ad` and `Peer._accept_peer_ad`.
+//! `test_ui_declaration.py`; `test_app_card_host.py`), the AppCard revision of SPEC v0.1.32
+//! (origin and formats, the card spill and its parts documents, the AppCard level, the content
+//! store's asset card), plus the receiver checks of `Peer.accept_ad` and `Peer._accept_peer_ad`.
 
 mod common;
 
 use agentspaces_wire::ads::{
-    ACTION_TAKE, AD_TYPE_AGENT_CARD, AD_TYPE_SPACE, AdError, AppCard, MAX_AD_ISSUED_SKEW_MILLIS,
-    MAX_AD_TTL_MILLIS, PEER_AD_TTL, UI_PROTOCOL, UI_VERSION, ad_expires_at_millis, agent_card,
-    app_card_host, app_card_ui, card_action, endpoint, peer_advertisement,
-    peer_advertisement_with_ttl, signed_peer_ad, space_advertisement, space_id_of, stored_ad,
-    ui_component, ui_declaration, verify_signed_peer_ad, verify_stored_ad,
+    ACTION_TAKE, AD_TYPE_AGENT_CARD, AD_TYPE_APP_CARD, AD_TYPE_ASSET_CARD, AD_TYPE_SPACE, AdError,
+    AppCard, HINT_APP_CARD, MAX_AD_ISSUED_SKEW_MILLIS, MAX_AD_TTL_MILLIS, PEER_AD_TTL,
+    SPILL_MAX_FETCH_BYTES, SpillError, UI_PROTOCOL, UI_VERSION, ad_expires_at_millis, agent_card,
+    app_card_at_level, app_card_host, app_card_level, app_card_origin, app_card_ui, card_action,
+    card_parts, card_spill, content_root, content_store_of, endpoint, peer_advertisement,
+    peer_advertisement_with_ttl, resolve_spill, signed_peer_ad, space_advertisement, space_id_of,
+    spill_card, spill_of, stored_ad, ui_component, ui_declaration, verify_signed_peer_ad,
+    verify_stored_ad,
 };
 use agentspaces_wire::bodies::{STREAM_PEERS, parse_rumor, rumor_body};
 use agentspaces_wire::cbor::{self, Map, Value};
@@ -33,14 +37,17 @@ use agentspaces_wire::cbor_map;
 use agentspaces_wire::founding::group_id_from_founding_document;
 use agentspaces_wire::identity::Identity;
 use agentspaces_wire::ids::derive_id;
+use agentspaces_wire::limits::{CARD_SPILL_THRESHOLD_BYTES, CARD_SPILL_WARN_BYTES};
+use agentspaces_wire::schema;
 use agentspaces_wire::time::parse_instant_millis;
 use common::{hex, s};
 
 const TASK: &str = "GoldenVectors$ResearchTask#v1";
 const FINDING: &str = "GoldenVectors$Finding#v1";
 const DESCRIPTION: &str = "Researches a topic and writes a finding";
-const SHARED_OBJECT: &str = "https://badmonkey.ai/ns/apps/v1/SharedObject";
-const CHAT_MESSAGE: &str = "https://badmonkey.ai/ns/apps/v1/ChatMessage";
+// The neutral values of the regenerated vectors (SPEC annex I.3, v0.1.32).
+const SHARED_ITEM: &str = "https://example.org/ns/demo/v1/SharedItem";
+const MESSAGE: &str = "https://example.org/ns/demo/v1/Message";
 
 fn identity() -> Identity {
     Identity::from_pkcs8(&hex("private_key_pkcs8")).unwrap()
@@ -307,19 +314,19 @@ fn a_card_whose_certificate_certifies_another_key_or_agent_is_refused() {
 fn golden_ui() -> Map {
     let components = [
         ui_component(
-            "ObjectShare",
-            "bma-widgets",
-            "ObjectShare",
-            SHARED_OBJECT,
+            "share",
+            "example-widgets",
+            "ItemPanel",
+            SHARED_ITEM,
             &["research"],
             "panel",
         )
         .unwrap(),
         ui_component(
             "ask",
-            "bma-widgets",
-            "ChatInput",
-            CHAT_MESSAGE,
+            "example-widgets",
+            "MessageInput",
+            MESSAGE,
             &[],
             "control",
         )
@@ -327,8 +334,8 @@ fn golden_ui() -> Map {
     ];
     ui_declaration(
         &components,
-        &[SHARED_OBJECT],
-        &[CHAT_MESSAGE],
+        &[SHARED_ITEM],
+        &[MESSAGE],
         UI_PROTOCOL,
         UI_VERSION,
     )
@@ -344,7 +351,7 @@ fn the_card_with_a_ui_declaration_matches_java() {
     );
     assert_eq!(
         ui.get("catalogIds"),
-        Some(&Value::Array(vec![Value::from("bma-widgets")]))
+        Some(&Value::Array(vec![Value::from("example-widgets")]))
     );
     let card = golden_card(
         s("certificate_verify_at"),
@@ -398,7 +405,7 @@ fn the_app_card_with_a_host_matches_java() {
     let ui = app_card_ui(
         "a2ui",
         "v0.9.1",
-        &["bma-widgets", "bma-viz"],
+        &["example-widgets", "agentspaces-viz"],
         "summariser",
         "views",
         &["chat-1"],
@@ -406,26 +413,26 @@ fn the_app_card_with_a_host_matches_java() {
     )
     .unwrap();
     let host = app_card_host(
-        "https://chat.acme.example",
+        "https://chat.example.org",
         7801,
         "zHostPeer",
         "/",
-        "tenant",
+        "idp",
         "summariser",
         "2026-11-06T09:00:00Z",
         "serving",
     )
     .unwrap();
     let card = AppCard {
-        id: "aspace://zApps/app/zPeerA/claims-chat",
+        id: "aspace://zApps/app/zPeerA/support-chat",
         issuer: "zPeerA",
         group: "zApps",
         issued: "2026-11-06T09:00:00Z",
         ttl: "PT15M",
-        name: "Claims chat",
+        name: "Support chat",
         kind: "fed",
         shape: "a2ui",
-        owner: "claims",
+        owner: "support",
         reads: &["zApps/conversations"],
         actions: &["ask"],
         version: "1",
@@ -469,14 +476,25 @@ fn the_host_builder_refuses_what_the_record_refuses() {
     let host = |url, sign_on, status| {
         app_card_host(url, 0, "", "", sign_on, "", "2026-11-06T09:00:00Z", status)
     };
-    assert_eq!(host("", "tenant", "serving"), Err(AdError::EmptyUrl));
+    assert_eq!(host("", "idp", "serving"), Err(AdError::EmptyUrl));
     assert_eq!(
         host("http://x", "password", "serving"),
         Err(AdError::InvalidSignOn("password".into()))
     );
+    // v0.1.28 to v0.1.31 wrote `tenant`; v0.1.32 refuses it (SPEC §6.1a.4).
     assert_eq!(
-        host("http://x", "tenant", "gone"),
+        host("http://x", "tenant", "serving"),
+        Err(AdError::InvalidSignOn("tenant".into()))
+    );
+    assert_eq!(
+        host("http://x", "idp", "gone"),
         Err(AdError::InvalidStatus("gone".into()))
+    );
+    // An empty sign-on reads as the default, `idp`, as Java's Host does.
+    let default_sign_on = host("http://x", "", "serving").unwrap();
+    assert_eq!(
+        default_sign_on.get("signOn").and_then(Value::as_str),
+        Some("idp")
     );
     let defaulted = host("http://127.0.0.1:7801", "none", "stopped").unwrap();
     assert_eq!(defaulted.get("path").and_then(Value::as_str), Some("/"));
@@ -710,12 +728,19 @@ fn a_card_carrying_a_certificate_must_prove_it_at_its_issue_time() {
     let forged_stored = Value::Map(stored_ad(AD_TYPE_AGENT_CARD, &forged_card, &identity));
     assert_eq!(verify_stored_ad(&forged_stored, verify_at + 60_000), None);
 
-    // A null certificate is no certificate.
+    // A certificate written as null is no certificate, and since v0.1.31 no card either: the
+    // field is omitted when null, so an F6 in its place makes the card undecodable (SPEC §9.1,
+    // P1). Without the field the same card verifies.
     let mut null_card =
         golden_card("2026-01-01T00:00:00Z", Some(&agent_key()), &[], None, None).unwrap();
+    let plain_stored = Value::Map(stored_ad(AD_TYPE_AGENT_CARD, &null_card, &identity));
+    assert!(verify_stored_ad(&plain_stored, millis("2026-01-01T00:01:00Z")).is_some());
     null_card.insert("agentCertificate", Value::Null);
     let null_stored = Value::Map(stored_ad(AD_TYPE_AGENT_CARD, &null_card, &identity));
-    assert!(verify_stored_ad(&null_stored, millis("2026-01-01T00:01:00Z")).is_some());
+    assert_eq!(
+        verify_stored_ad(&null_stored, millis("2026-01-01T00:01:00Z")),
+        None
+    );
 }
 
 /// Java's `AgentCard` constructor refuses a card whose `agentCertificate` does not certify exactly
@@ -917,5 +942,315 @@ fn a_card_naming_another_peers_agent_is_refused() {
     );
     assert!(
         verify_stored_ad(&Value::Map(stored_ad(AD_TYPE_SPACE, &space, &honest)), now).is_some()
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The AppCard revision (SPEC v0.1.32, §6.1a.2 to §6.1a.6)
+
+/// The text list a card field holds.
+fn texts_of(card: &Map, field: &str) -> Vec<String> {
+    card.get(field)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn the_app_card_with_an_origin_and_formats_matches_java() {
+    let golden = map_of(&hex("app_card_origin_formats_cbor"));
+    let java_origin = golden.get("origin").and_then(Value::as_map).unwrap();
+    let attrs = java_origin.get("attrs").and_then(Value::as_map).unwrap();
+    // Built in another order, the attributes are written in canonical order.
+    let mut shuffled = Map::new();
+    for (key, value) in attrs.iter().rev() {
+        shuffled.insert(key.clone(), value.clone());
+    }
+    let origin = app_card_origin(
+        "realm",
+        "example-realm/example-app",
+        "1.0.0",
+        Some(&shuffled),
+    )
+    .unwrap();
+    assert_eq!(&origin, java_origin);
+    let card = AppCard {
+        id: "aspace://zApps/app/zPeerA/example-app",
+        issuer: "zPeerA",
+        group: "zApps",
+        issued: "2026-11-09T09:00:00Z",
+        ttl: "PT15M",
+        name: "example-app",
+        kind: "fed",
+        shape: "static",
+        owner: "example-realm",
+        url: "app://example-realm/example-app",
+        origin: Some(&origin),
+        // A media type is lower-cased and a repeat dropped, as Java's withFormats does.
+        formats: &[
+            "text/html",
+            "Application/Geo+JSON",
+            "urn:realm:example-realm#",
+            "text/html",
+        ],
+        ..AppCard::default()
+    }
+    .to_map()
+    .unwrap();
+    assert_eq!(bytes_of(&card), hex("app_card_origin_formats_cbor"));
+    assert!(schema::decode(&hex("app_card_origin_formats_cbor"), AD_TYPE_APP_CARD).is_some());
+    // An origin without attributes omits them, and an empty map is no attributes.
+    let bare = app_card_origin("console", "c/b", "", Some(&Map::new())).unwrap();
+    assert!(!bare.contains_key("attrs"));
+    // The grammar and the bounds of SPEC §6.1a.2.
+    for (system, reference, version) in [
+        ("Realm", "r", ""),
+        ("realm.", "r", ""),
+        ("realm", "", ""),
+        ("realm", "a\u{1}b", ""),
+        ("realm", &"r".repeat(257), ""),
+        ("realm", "r", &"v".repeat(65)),
+    ] {
+        assert!(
+            matches!(
+                app_card_origin(system, reference, version, None),
+                Err(AdError::InvalidOrigin(_))
+            ),
+            "{system} {reference:?} {version:?}"
+        );
+    }
+    let mut foreign = Map::new();
+    foreign.insert("console.x", "y");
+    assert!(app_card_origin("realm", "r", "", Some(&foreign)).is_err());
+    // Formats outside their grammar are refused when the card is built.
+    for bad in [&["text/html;charset=utf-8"][..], &["x y:z"], &["1x:y"]] {
+        let built = AppCard {
+            name: "x",
+            formats: bad,
+            ..AppCard::default()
+        }
+        .to_map();
+        assert!(matches!(built, Err(AdError::InvalidFormats(_))), "{bad:?}");
+    }
+}
+
+#[test]
+fn the_app_card_kind_is_closed_to_four_values() {
+    for kind in ["peer", "fed", "gateway", "assembled"] {
+        let card = AppCard {
+            name: "x",
+            kind,
+            ..AppCard::default()
+        };
+        assert!(card.to_map().is_ok(), "{kind}");
+    }
+    let realm = AppCard {
+        name: "x",
+        kind: "realm",
+        ..AppCard::default()
+    };
+    assert_eq!(realm.to_map(), Err(AdError::InvalidAppKind("realm".into())));
+}
+
+/// The stub and its parts document of a card kind, decoded.
+fn stub_and_parts(stub: &str, parts: &str) -> (Map, Vec<u8>) {
+    (map_of(&hex(stub)), hex(parts))
+}
+
+#[test]
+fn the_spilled_cards_and_their_parts_documents_match_java() {
+    assert_eq!(
+        common::golden()["card_spill_threshold_bytes"].as_u64(),
+        u64::try_from(CARD_SPILL_THRESHOLD_BYTES).ok()
+    );
+    assert_eq!(
+        common::golden()["card_spill_warn_bytes"].as_u64(),
+        u64::try_from(CARD_SPILL_WARN_BYTES).ok()
+    );
+    for (ad_type, stub_name, parts_name, parts_record) in [
+        (
+            AD_TYPE_APP_CARD,
+            "app_card_spill_cbor",
+            "app_card_parts_cbor",
+            "AppCard.Parts",
+        ),
+        (
+            AD_TYPE_AGENT_CARD,
+            "agent_card_spill_cbor",
+            "agent_card_parts_cbor",
+            "AgentCard.Parts",
+        ),
+    ] {
+        let (stub, document) = stub_and_parts(stub_name, parts_name);
+        assert!(
+            schema::decode(&hex(stub_name), ad_type).is_some(),
+            "{stub_name}"
+        );
+        assert!(
+            schema::decode(&document, parts_record).is_some(),
+            "{parts_name}"
+        );
+        // The reference names exactly the document: its content root over 65,536-byte pieces
+        // and its length.
+        let (root, size, parts) = spill_of(ad_type, &stub).unwrap();
+        assert_eq!(content_root(&document), root, "{stub_name}");
+        assert_eq!(size, u64::try_from(document.len()).unwrap());
+        let spill = card_spill(root, size, &parts).unwrap();
+        assert_eq!(stub.get("spill"), Some(&Value::Map(spill)));
+        // The reader completes the stub; spilling the full card gives back both vectors.
+        let full = resolve_spill(ad_type, &stub, &document, SPILL_MAX_FETCH_BYTES).unwrap();
+        assert!(!full.contains_key("spill"));
+        assert!(schema::conforms(&Value::Map(full.clone()), ad_type));
+        let (parts_map, names) = card_parts(ad_type, &full).unwrap();
+        assert_eq!(names, parts);
+        assert_eq!(bytes_of(&parts_map), document);
+        let (respilled, redocument) = spill_card(ad_type, &full).unwrap();
+        assert_eq!(bytes_of(&respilled), hex(stub_name), "{stub_name}");
+        assert_eq!(redocument, document);
+        // A document that fails a check fails the resolution, and the stub stays as it is.
+        let mut longer = document.clone();
+        longer.push(0);
+        assert!(matches!(
+            resolve_spill(ad_type, &stub, &longer, SPILL_MAX_FETCH_BYTES),
+            Err(SpillError::Size { .. })
+        ));
+        let mut flipped = document.clone();
+        let last = flipped.len() - 2;
+        flipped[last] ^= 1;
+        assert_eq!(
+            resolve_spill(ad_type, &stub, &flipped, SPILL_MAX_FETCH_BYTES),
+            Err(SpillError::Root)
+        );
+        assert!(matches!(
+            resolve_spill(ad_type, &stub, &document, size - 1),
+            Err(SpillError::OverLimit { .. })
+        ));
+        assert_eq!(
+            resolve_spill(ad_type, &full, &document, SPILL_MAX_FETCH_BYTES),
+            Err(SpillError::NotAStub)
+        );
+    }
+    // The app card's parts: its lists and its ui, its actions empty and so not named.
+    let parts = map_of(&hex("app_card_parts_cbor"));
+    assert_eq!(texts_of(&parts, "views"), ["board", "items", "orders"]);
+    let stub = map_of(&hex("app_card_spill_cbor"));
+    assert_eq!(texts_of(&stub, "reads"), Vec::<String>::new());
+    assert!(!stub.contains_key("ui"));
+    // The agent card's stub keeps every field but its actions and ui.
+    let agent_stub = map_of(&hex("agent_card_spill_cbor"));
+    assert!(!agent_stub.contains_key("actions") && !agent_stub.contains_key("ui"));
+    assert!(schema::decode(&hex("agent_card_parts_cbor"), "AgentCard.Parts").is_some());
+}
+
+#[test]
+fn a_content_root_is_the_cid_of_its_piece_table() {
+    // Java's GoldenVectors: three pieces, 65,536 bytes of 0x01, 65,536 of 0x02, 100 of 0x03.
+    let mut artifact = vec![1u8; 65_536];
+    artifact.extend(vec![2u8; 65_536]);
+    artifact.extend(vec![3u8; 100]);
+    assert_eq!(content_root(&artifact), s("content_root_cidv1"));
+    assert!(schema::is_content_root(s("content_root_cidv1")));
+    assert!(!schema::is_content_root(&s("content_root_cidv1")[..58]));
+    // A dag-cbor root is no content root of a card spill.
+    assert!(!schema::is_content_root(
+        "bafyreibhxghlalnhvgu4tpiiqpiwfew7jddr5jr6rtfqga6cp6772wnzsm"
+    ));
+}
+
+#[test]
+fn the_app_card_level_gates_the_new_fields() {
+    assert_eq!(HINT_APP_CARD, "wire.appcard");
+    for (hint, level) in [
+        (None, 1),
+        (Some(""), 1),
+        (Some("0"), 1),
+        (Some("1"), 1),
+        (Some("2"), 2),
+        (Some("02"), 1),
+        (Some("10"), 10),
+        (Some("2.0"), 1),
+        (Some("+2"), 1),
+        (Some("99999999999"), i32::MAX),
+    ] {
+        assert_eq!(app_card_level(hint), level, "{hint:?}");
+    }
+    // Below the level, an issuer drops origin, formats, an idp host, and spill.
+    let full = map_of(&hex("app_card_origin_formats_cbor"));
+    let (plain, downgraded) = app_card_at_level(AD_TYPE_APP_CARD, &full);
+    assert!(downgraded);
+    assert!(!plain.contains_key("origin") && !plain.contains_key("formats"));
+    assert!(schema::conforms(&Value::Map(plain), AD_TYPE_APP_CARD));
+    let hosted = map_of(&hex("app_card_host_cbor"));
+    let (unhosted, downgraded) = app_card_at_level(AD_TYPE_APP_CARD, &hosted);
+    assert!(downgraded && !unhosted.contains_key("host"));
+    let mut open_host = hosted.clone();
+    open_host
+        .get_mut("host")
+        .and_then(Value::as_map_mut)
+        .unwrap()
+        .insert("signOn", "none");
+    let (kept, downgraded) = app_card_at_level(AD_TYPE_APP_CARD, &open_host);
+    assert!(
+        !downgraded && kept == open_host,
+        "a host with no sign-on passes the gate"
+    );
+    let card = map_of(&hex("agent_card_cbor"));
+    assert_eq!(app_card_at_level(AD_TYPE_AGENT_CARD, &card), (card, false));
+}
+
+#[test]
+fn a_content_store_advertises_itself_by_an_asset_card() {
+    let bytes = hex("asset_card_content_store_cbor");
+    let card = schema::decode_map(&bytes, AD_TYPE_ASSET_CARD).expect("an AssetCard");
+    let store = content_store_of(&card).expect("a content store");
+    assert_eq!(store.name, "site-a");
+    assert_eq!(store.uri, "aspace://zGolden/store/site-a");
+    assert_eq!(store.holding_interval, "PT10S");
+    assert_eq!(store.capacity, Some(2_199_023_255_552));
+    assert_eq!(store.free, Some(2_145_336_164_352));
+    assert_eq!(store.max_object, Some(68_719_476_736));
+    assert_eq!(store.codecs, ["dag-cbor", "raw"]);
+    assert_eq!(store.sealing, ["none", "sealed-nodes"]);
+    assert!(!store.blind && store.challenge);
+    assert_eq!(
+        (store.policy.as_str(), store.tier.as_str()),
+        ("grant", "hot")
+    );
+    assert_eq!(store.waiting, None);
+    assert_eq!(store.price_per_gib_month.as_deref(), Some("2"));
+    // Any other asset card is no content store.
+    let mut other = card.clone();
+    other
+        .get_mut("access")
+        .and_then(Value::as_map_mut)
+        .unwrap()
+        .insert("kind", "content-collection");
+    assert_eq!(content_store_of(&other), None);
+}
+
+#[test]
+fn a_stored_card_meets_its_value_rules_at_the_cache() {
+    // A peer-signed AppCard is held only when it decodes under SPEC §6.1a.2 to §6.1a.5.
+    let identity = identity();
+    let now = millis("2026-11-09T09:01:00Z");
+    let mut card = map_of(&hex("app_card_origin_formats_cbor"));
+    card.insert("issuer", identity.peer_id());
+    let stored = |card: &Map| Value::Map(stored_ad(AD_TYPE_APP_CARD, card, &identity));
+    assert!(verify_stored_ad(&stored(&card), now).is_some());
+    let mut realm = card.clone();
+    realm.insert("kind", "realm");
+    assert_eq!(verify_stored_ad(&stored(&realm), now), None);
+    let mut extra = card.clone();
+    extra.insert("future", "field");
+    assert_eq!(
+        verify_stored_ad(&stored(&extra), now),
+        None,
+        "P1: an unknown field"
     );
 }

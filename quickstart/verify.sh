@@ -19,7 +19,8 @@
 #
 #   0. Each README snippet marked <!-- quickstart/FILE --> equals FILE, licence header aside,
 #      and every command below appears in the README as written there.
-#   1. aspace installs (into the scratch directory), the Fulfiller builds, and ./seed.sh starts.
+#   1. aspace installs (into the scratch directory), the Fulfiller builds, and ./seed.sh starts
+#      `aspace seed` (no Java).
 #   2. Two workers serve, and the desk's kite comes back shipped by one of them.
 #   3. Kill one: with SHIP_SECONDS=10, the worker that takes the desk's order is killed with
 #      kill -9 in the middle of it. The other worker ships it (attempt 2) once the 30 s take
@@ -29,10 +30,10 @@
 #
 #   ./verify.sh
 #
-# Needs Rust (through rustup: the repository pins its toolchain), a JDK 21 or newer, Maven, and
-# port 7700 free (PORT=7711 picks another). About two minutes once built; the first build takes
-# a few more. Optional: CARGO_TARGET_DIR (reuse a build directory between runs), KEEP=1 (keep
-# the scratch directory and its logs), MAVEN_ARGS=-o (Maven offline).
+# Needs Rust (through rustup: the repository pins its toolchain) and port 7700 free (PORT=7711
+# picks another); no Java. About two minutes once built; the first build takes a few more.
+# Optional: CARGO_TARGET_DIR (reuse a build directory between runs), KEEP=1 (keep the scratch
+# directory and its logs).
 #
 # Every process it starts is stopped before it exits, also on a failure or Ctrl-C. The README's
 # commands run with HOME in the scratch directory, so the keystore aspace makes is not yours.
@@ -57,14 +58,15 @@ readonly SCRIPT_DESK='cargo run -q -- top'
 say() { printf '==> %s\n' "$*"; }
 ok() { printf 'ok   %s\n' "$*"; }
 
-for tool in cargo java mvn; do
+for tool in cargo; do
     command -v "$tool" >/dev/null 2>&1 || { echo "verify.sh: $tool not found" >&2; exit 1; }
 done
 
 # No configuration of yours applies: the fleet file is the quick start's, and the keystores are
 # the scratch directory's.
 unset ASPACE_CONFIG ASPACE_SEEDS ASPACE_GROUP ASPACE_JOIN ASPACE_KEYSTORE ASPACE_PROFILE \
-    ASPACE_SPACES ASPACE_SOCKET ASPACE_NO_DAEMON XDG_CONFIG_HOME SHIP_SECONDS
+    ASPACE_SPACES ASPACE_SOCKET ASPACE_NO_DAEMON ASPACE_INVITE ASPACE_LISTEN ASPACE_ADVERTISE \
+    XDG_CONFIG_HOME SHIP_SECONDS SEED
 export CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}
 export RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-4}
@@ -77,16 +79,11 @@ qs=$scratch/repo/quickstart
 mkdir -p "$logs" "$scratch/home"
 pids=()
 seed=
-seed_open=0
 
 # ---------------------------------------------------------------------------------- plumbing
 
 stop_all() {
     local pid round alive
-    if [ "$seed_open" = 1 ]; then
-        exec 3>&-
-        seed_open=0
-    fi
     for pid in ${pids[@]+"${pids[@]}"}; do kill -TERM "$pid" 2>/dev/null || true; done
     for round in 1 2 3 4 5 6 7 8 9 10; do
         alive=0
@@ -183,7 +180,7 @@ start() {
     local name=$1 command=$2
     in_readme "$command"
     (cd "$qs" && export HOME="$scratch/home" && eval "exec env $command") \
-        >"$logs/$name.log" 2>&1 3>&- &
+        >"$logs/$name.log" 2>&1 &
     last=$!
     pids+=("$last")
 }
@@ -267,17 +264,14 @@ if [ "$port" != 7700 ]; then
     sed -i.orig "s/127\.0\.0\.1:7700/127.0.0.1:$port/" "$qs/fleet.yaml"
 fi
 
-say "./seed.sh (compiles the seed on its first run)"
-# The seed reads commands from standard input: a named pipe this script holds open on descriptor
-# 3 (opened read-write, so the open never blocks). Closing it ends the seed.
-mkfifo "$scratch/seed.in"
-exec 3<>"$scratch/seed.in"
-seed_open=1
-(cd "$qs" && exec ./seed.sh "$port") <"$scratch/seed.in" >"$logs/seed.log" 2>&1 3>&- &
+say "./seed.sh (aspace seed)"
+(cd "$qs" && export HOME="$scratch/home" && exec ./seed.sh "$port") </dev/null >"$logs/seed.log" 2>&1 &
 seed=$!
 pids+=("$seed")
 wait_for "$logs/seed.log" '"event":"listening"' 300 "$seed" seed
-ok "the seed listens on 127.0.0.1:$port"
+grep -q -F "\"listen\":[\"tcp://127.0.0.1:$port\"]" "$logs/seed.log" ||
+    fail "the seed does not listen on tcp://127.0.0.1:$port"
+ok "aspace seed listens on 127.0.0.1:$port"
 
 # ----------------------------------------------------------- 2. two workers and the desk
 
@@ -383,16 +377,15 @@ ok "the Rust desk, served by the script: $(grep '^Shipment' "$logs/desk-3.log")"
 grep -c -F 'aspace: completed ' "$logs/script.log" | grep -q -x 3 ||
     fail "aspace work did not complete exactly three orders"
 
-say "stopping aspace work (SIGTERM) and the seed (quit)"
+say "stopping aspace work and the seed (SIGTERM, as Ctrl-C)"
 kill -TERM "$script"
 wait_exit "$script" 45 "aspace work"
 [ "$status" = 0 ] || fail "aspace work exited with $status"
-printf 'quit\n' >&3
-wait_for "$logs/seed.log" '"bye":true' 30 "$seed" seed
-exec 3>&-
-seed_open=0
+kill -TERM "$seed"
 wait_exit "$seed" 30 seed
+[ "$status" = 0 ] || fail "the seed exited with $status"
+grep -q -x -F 'aspace: stopped' "$logs/seed.log" || fail "the seed did not say it stopped"
 pids=()
-ok "aspace work and the seed stopped"
+ok "aspace work and the seed stopped with status 0"
 
 echo "quick start: ok"

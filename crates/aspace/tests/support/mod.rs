@@ -56,10 +56,13 @@ pub const DEADLINE: Duration = Duration::from_secs(30);
 
 /// Every variable the configuration (and the daemon's and the gateway's files) reads, removed
 /// from each `aspace` run first.
-const CLEARED: [&str; 17] = [
+const CLEARED: [&str; 20] = [
     "ASPACE_SEEDS",
     "ASPACE_GROUP",
     "ASPACE_JOIN",
+    "ASPACE_INVITE",
+    "ASPACE_LISTEN",
+    "ASPACE_ADVERTISE",
     "ASPACE_KEYSTORE",
     "ASPACE_PROFILE",
     "ASPACE_SPACES",
@@ -171,6 +174,7 @@ fn mvn(dir: &Path, args: &[&str]) -> Result<(), String> {
 
 /// The seed's classpath, or a return from the test with a note (a failure under
 /// `ASPACE_INTEROP_REQUIRED=1`).
+#[allow(unused_macros)]
 macro_rules! classpath_or_skip {
     () => {
         match support::seed_classpath() {

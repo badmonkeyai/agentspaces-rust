@@ -21,13 +21,14 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use agentspaces::config::Overrides;
+use agentspaces::group::MembershipPolicy;
 use agentspaces::space::{EventKind, Lease};
 use clap::{ArgAction, Args, Parser, Subcommand};
 
 /// What `aspace --help` shows after the commands.
 const EXAMPLES: &str = "\
 Configuration: --config, then ASPACE_* variables (ASPACE_CONFIG, ASPACE_SEEDS, ASPACE_GROUP,
-ASPACE_JOIN, ASPACE_KEYSTORE, ASPACE_PROFILE, ASPACE_SOCKET), then the fleet file
+ASPACE_JOIN, ASPACE_INVITE, ASPACE_KEYSTORE, ASPACE_PROFILE, ASPACE_SOCKET), then the fleet file
 (~/.config/agentspaces/fleet.yaml by default); flags override variables, variables the file.
 ASPACE_NO_DAEMON=1 is --no-daemon, ASPACE_ALLOW_READABLE_KEY=1 --allow-readable-key, and
 ASPACE_MCP_TOKENS and ASPACE_MCP_POLICY name the files of aspace mcp --tokens and --policy.
@@ -38,6 +39,7 @@ standard error. Exit codes: 0 success, 1 error, 2 refused or not found, 3 timeou
 
 Examples:
   aspace id
+  aspace --profile dev-local seed --found demo      # a group of your own on 127.0.0.1:7700
   aspace --seeds tls://fleet.example.com:7500 --join aspace://zQm... status
   aspace write 'shop.Order#v1' --json '{\"sku\":\"A-1\",\"qty\":2}' --space orders
   aspace read 'shop.Order#v1' --where 'qty>1' --space orders
@@ -54,8 +56,9 @@ Examples:
     long_about = "aspace joins an AgentSpaces fleet as a visitor, does one thing (write, read, \
                   take, complete, or watch entries of a replicated space), and leaves; `aspace \
                   work` stays and runs a program for each task it takes, `aspace daemon` stays \
-                  and serves the visitors, and `aspace mcp` stays and serves the fleet's \
-                  offerings as MCP tools.",
+                  and serves the visitors, `aspace mcp` stays and serves the fleet's \
+                  offerings as MCP tools, and `aspace seed` stays and listens, so other \
+                  members link to it and join its group.",
     after_help = EXAMPLES,
     propagate_version = true
 )]
@@ -89,6 +92,16 @@ pub struct Global {
         help = "Join a group by id, aspace://<group-id> (over ASPACE_JOIN)"
     )]
     pub join: Option<String>,
+    /// An invite key of an INVITE group, aspace-inv1-... as `aspace invite` prints it (over
+    /// `ASPACE_INVITE`); with no group named, it names the group.
+    #[arg(
+        long,
+        global = true,
+        value_name = "KEY",
+        help = "An invite key of an INVITE group, aspace-inv1-... as aspace invite prints it \
+                (over ASPACE_INVITE); with no group named, it names the group"
+    )]
+    pub invite: Option<String>,
     /// The keystore directory (over ASPACE_KEYSTORE and the file's keystore; default
     /// ~/.config/agentspaces/keys).
     #[arg(long, global = true, value_name = "DIR")]
@@ -136,6 +149,8 @@ impl Global {
             profile: self.profile.clone(),
             socket: self.socket.clone(),
             join_timeout: self.join_timeout,
+            invite: self.invite.clone(),
+            ..Overrides::default()
         }
     }
 }
@@ -552,6 +567,86 @@ Examples:
         policy: Option<PathBuf>,
     },
 
+    /// Listen and serve a group as its seed, until interrupted.
+    #[command(after_help = SEED_HELP)]
+    Seed {
+        /// Listen here: tcp://host:port, tls://host:port, or host:port (repeatable; over
+        /// ASPACE_LISTEN and the file's bind; default 127.0.0.1:7700, on tcp under dev-local
+        /// and tls otherwise).
+        #[arg(
+            long = "listen",
+            value_name = "ADDR",
+            help = "Listen here: tcp://host:port, tls://host:port, or host:port (repeatable; over \
+                    ASPACE_LISTEN and the file's bind; default 127.0.0.1:7700, on tcp under \
+                    dev-local and tls otherwise)"
+        )]
+        listen: Vec<String>,
+        /// The address members dial, when it is not the one bound: host:port, or
+        /// scheme://host:port with several listeners (repeatable; over ASPACE_ADVERTISE and the
+        /// file's advertise).
+        #[arg(
+            long = "advertise",
+            value_name = "ADDR",
+            help = "The address members dial, when it is not the one bound: host:port, or \
+                    scheme://host:port with several listeners (repeatable; over \
+                    ASPACE_ADVERTISE and the file's advertise)"
+        )]
+        advertise: Vec<String>,
+        /// Found the group NAME: a signed founding made on the first run and kept beside the
+        /// keystore (founding-NAME.cbor), so members join it by its aspace:// id.
+        #[arg(long, value_name = "NAME")]
+        found: Option<String>,
+        /// Who may join a group --found founds: open (every verified peer, the default) or
+        /// invite (only peers with an invite key from `aspace invite`).
+        #[arg(
+            long,
+            value_name = "POLICY",
+            requires = "found",
+            value_parser = parse_membership,
+            help = "Who may join a group --found founds: open (every verified peer, the \
+                    default) or invite (only peers with an invite key from aspace invite)"
+        )]
+        membership: Option<MembershipPolicy>,
+        /// Replicate this space from the start (repeatable; default: the group's spaces,
+        /// ASPACE_SPACES or the file's). Every space heard of is replicated too, up to
+        /// --max-spaces.
+        #[arg(long = "replicate", value_name = "SPACE")]
+        replicate: Vec<String>,
+        /// The most spaces opened because they were heard of.
+        #[arg(long, value_name = "N", default_value_t = 64, value_parser = clap::value_parser!(u16).range(0..=4096))]
+        max_spaces: u16,
+        /// Admit only members whose link attests them: tls listeners only (SPEC §5.6).
+        #[arg(long)]
+        require_attestation: bool,
+    },
+
+    /// Print an invite key of an INVITE group this keystore founded.
+    #[command(after_help = "\
+The founder (the keystore `aspace seed --found NAME --membership invite` ran with) signs a
+delegation of a fresh invite key to the group, valid for --not-after, and prints it as
+{\"invite\": \"aspace-inv1-...\", \"group\", \"join\": \"aspace://...\", \"name\", \"label\",
+\"notAfter\"}. Whoever holds the key joins: `aspace --invite KEY --seeds ADDR <command>` (or
+ASPACE_INVITE) signs its own PeerID under it and presents that as its join credential. The
+delegation only limits first admission: a member admitted in time stays a member. The key
+carries a secret: hand it over as you would a password. Exit 2 when the group is not this
+keystore's, or is open.
+
+Examples:
+  aspace invite --found crew
+  aspace invite --found crew --label 'ci runners' --not-after 30d | jq -r .invite
+  aspace --invite \"$KEY\" --seeds tcp://127.0.0.1:7700 write 'crew.Note#v1' --json '{}' --space notes")]
+    Invite {
+        /// The group, as `aspace seed --found NAME` founded it with this keystore.
+        #[arg(long, value_name = "NAME")]
+        found: String,
+        /// The founder's label for the delegation (who it is for).
+        #[arg(long, value_name = "TEXT")]
+        label: Option<String>,
+        /// How long the key admits newcomers (at most 365d).
+        #[arg(long, default_value = "7d", value_parser = parse_invite_lifetime, value_name = "DURATION")]
+        not_after: Duration,
+    },
+
     /// Print a shell completion script.
     #[command(after_help = "\
 Examples:
@@ -578,6 +673,40 @@ Examples:
         out_dir: Option<PathBuf>,
     },
 }
+
+/// What `aspace seed --help` shows after the options.
+const SEED_HELP: &str = "\
+The seed is a listening member (SPEC §5.1 to §5.4): members dial it, it admits them under the
+group's membership, forwards what each one gossips to the others, answers their anti-entropy
+pulls, relays the frames they address to one another, and holds the entries (and payload
+blocks) of the spaces it replicates, so a writer may leave and a later visitor still reads
+what it wrote. It serves one group:
+
+  --found NAME     a group it founds: the signed founding is made on the first run, kept
+                   beside the keystore as founding-NAME.cbor, and reused, so the group id
+                   stays; members join with --join aspace://<group-id>
+  --group TEXT     a group founded from a text (every member passes the same --group)
+  --join URI       another seed's group, through --seeds: a second seed of it
+  (none)           the fleet file's group, as every command reads it
+
+Once listening it prints one JSON line, {\"event\": \"listening\", \"peer\", \"group\",
+\"join\": \"aspace://...\" (null for a group founded from a text), \"listen\": [...],
+\"membership\"}, and says on standard error who it admits. The listeners, their
+advertisement, and the group's membership and spaces may come from the fleet file
+(agentspaces.bind and .advertise, a group's membership and spaces) and from ASPACE_LISTEN and
+ASPACE_ADVERTISE; flags override variables, variables the file. A tcp listener outside loopback
+needs --profile dev-local. The seed's own address in its seeds is skipped, and the other seeds
+are redialed for as long as it runs. SIGINT, SIGTERM, or SIGHUP stops it: it stops accepting,
+gives its links 2s to send what they queued, and closes (exit 0; a second signal closes at
+once). Give each seed and each member a keystore of its own (--keystore).
+
+Examples:
+  aspace --profile dev-local --keystore keys/seed seed --found demo
+  aspace --keystore keys/seed seed --found crew --membership invite --listen tls://0.0.0.0:7500 \\
+         --advertise seed.example.com:7500
+  aspace --profile dev-local --keystore keys/seed seed --group shop-v1 --replicate orders
+  aspace --keystore keys/seed2 --seeds tls://seed.example.com:7500 --join aspace://zQm... seed \\
+         --listen tls://0.0.0.0:7501 --advertise seed2.example.com:7501";
 
 /// What `aspace mcp --help` shows after the options.
 const MCP_HELP: &str = "\
@@ -687,6 +816,30 @@ pub fn parse_call_timeout(text: &str) -> Result<Duration, String> {
         ));
     }
     Ok(timeout)
+}
+
+/// A membership policy: `open` or `invite`.
+pub fn parse_membership(text: &str) -> Result<MembershipPolicy, String> {
+    MembershipPolicy::parse(text).ok_or_else(|| {
+        format!(
+            "{text:?} is not a membership; write open (every verified peer joins) or invite \
+             (only peers with an invite key)"
+        )
+    })
+}
+
+/// The longest an invite key admits newcomers: a year, the founding's own lifetime.
+pub const MAX_INVITE_LIFETIME: Duration = Duration::from_secs(365 * 24 * 3600);
+
+/// How long an invite admits newcomers ([`parse_positive_duration`], at most a year).
+pub fn parse_invite_lifetime(text: &str) -> Result<Duration, String> {
+    let lifetime = parse_positive_duration(text)?;
+    if lifetime > MAX_INVITE_LIFETIME {
+        return Err(format!(
+            "{text:?} is longer than an invite may last (365d, the founding's lifetime)"
+        ));
+    }
+    Ok(lifetime)
 }
 
 /// A lease ([`Lease::parse`]).

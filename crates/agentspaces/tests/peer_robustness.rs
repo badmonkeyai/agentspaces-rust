@@ -84,7 +84,7 @@ async fn joined() -> (MemoryNetwork, FakeSeed, Peer) {
 fn ack_nonces(seed: &FakeSeed, link: usize) -> Vec<i64> {
     seed.of_kind(link, KIND_ACK)
         .iter()
-        .map(|ack| bodies::parse_ping(ack.body()).expect("an ACK body"))
+        .map(|ack| bodies::parse_ack(ack.body()).expect("an ACK body"))
         .collect()
 }
 
@@ -94,7 +94,7 @@ async fn wait_ack(seed: &FakeSeed, link: usize, nonce: i64) {
         received.iter().any(|frame| {
             frame.link == link
                 && frame.kind() == KIND_ACK
-                && bodies::parse_ping(frame.body()) == Some(nonce)
+                && bodies::parse_ack(frame.body()) == Some(nonce)
         })
     })
     .await;
@@ -203,20 +203,29 @@ async fn kinds_this_peer_does_not_speak_are_ignored_and_counted() {
         "DIGEST",
         "CHANNEL_HELLO",
         "QUERY",
-        "NOT_A_KIND",
     ];
     for (i, kind) in kinds.iter().enumerate() {
         let body = cbor::encode(&cbor_map! { "anything" => i });
         seed.send(0, kind, &body, Some(peer.peer_id())).await;
     }
+    // A kind outside wire version 3's names is no envelope (`Envelope.kind` is an enum, SPEC
+    // §9.1 P2): the frame does not decode and counts as malformed.
+    seed.send(
+        0,
+        "NOT_A_KIND",
+        &cbor::encode(&cbor_map! {}),
+        Some(peer.peer_id()),
+    )
+    .await;
     seed.ping(0, 9, Some(peer.peer_id())).await;
     wait_ack(&seed, 0, 9).await;
     let counters = peer.counters().await;
-    assert_eq!(counters.ignored_total(), 9);
+    assert_eq!(counters.ignored_total(), 8);
     for kind in kinds {
         assert_eq!(counters.ignored_kinds.get(kind), Some(&1), "{kind}");
     }
-    assert_eq!(counters.malformed, 0);
+    assert_eq!(counters.ignored_kinds.get("NOT_A_KIND"), None);
+    assert_eq!(counters.malformed, 1);
     assert!(
         seed.kinds(0)
             .iter()
@@ -1136,7 +1145,9 @@ async fn a_pull_response_folds_golden_claims_before_states() {
     let mut deltas = Map::new();
     deltas.insert(
         "space:other",
-        cbor::encode(&cbor_map! { "states" => cbor_array![write.get("state").cloned()] }),
+        cbor::encode(
+            &cbor_map! { "states" => cbor_array![write.get("state").cloned()], "claims" => cbor_map! {} },
+        ),
     );
     seed.send(
         0,

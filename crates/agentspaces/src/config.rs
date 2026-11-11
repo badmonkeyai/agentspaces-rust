@@ -29,6 +29,9 @@
 //! | `ASPACE_SPACES` | Comma-separated space names to pull after joining. |
 //! | `ASPACE_CONFIG` | The fleet YAML file ([`Config`] only). |
 //! | `ASPACE_SOCKET` | The socket of `aspace daemon` ([`Config`] only: carried in [`Config::socket`], read by the `aspace` command). |
+//! | `ASPACE_INVITE` | An invite key of an `INVITE` group (`aspace-inv1-...`, as `aspace invite` prints it): the peer presents the delegated credential it signs as the `aspace:join` resource hint ([`Config`] only). |
+//! | `ASPACE_LISTEN` | A listening peer's listeners, comma-separated: `tcp://host:port`, `tls://host:port`, or `host:port` (`tls` under `mtls`, `tcp` under `dev-local`). Read only for a listening configuration ([`Overrides::listening`], `aspace seed`). |
+//! | `ASPACE_ADVERTISE` | What a listening peer's advertisement names in place of what it binds, comma-separated `host:port` or `scheme://host:port` (one per listener). Read only for a listening configuration. |
 //!
 //! The `aspace` command reads a few more, outside this module: `ASPACE_NO_DAEMON` (join in the
 //! process even when a daemon answers), `ASPACE_ALLOW_READABLE_KEY` (through
@@ -88,8 +91,11 @@
 //!
 //! Keys are read in kebab-case, snake_case, or camelCase (`founding-document`,
 //! `founding_document`, `foundingDocument`), as Spring's relaxed binding and the Ruby `Config`
-//! read them. Keys this peer does not use are ignored ([`FleetFile::ignored`]); the listener
-//! keys (`bind`, `advertise`, `roles`) are logged, since this peer is dial-only. A group joins:
+//! read them. Keys this peer does not use are ignored ([`FleetFile::ignored`]). The listener
+//! keys `bind` and `advertise` are listed there too, since a dial-only peer never binds what the
+//! file names (the file is shared with the node that does); a listening configuration
+//! ([`Overrides::listening`], `aspace seed`) reads them as described under
+//! [Listening](#listening). `roles` is logged and ignored. A group joins:
 //!
 //! - by `join: aspace://<id>` (or `group-id: <id>`): the founding advertisement is fetched from
 //!   the seeds and verified against the id;
@@ -102,6 +108,33 @@
 //! The file is read under bounds ([`MAX_FLEET_FILE_BYTES`], one document, a few hundred nodes of
 //! anchors and aliases at most), so an alias bomb or an oversize file is refused, never
 //! expanded. Every refusal names the flag, variable, or key (with the file) it read.
+//!
+//! # Listening
+//!
+//! A configuration resolved with [`Overrides::listening`] is a listening peer's (`aspace seed`,
+//! SPEC §5.1 to §5.4): it needs no seed (the first seed of a group dials nobody), and it carries
+//! the listeners to bind ([`Config::listen`]) and, from [`Config::peer_config`], a
+//! [`PeerConfig`](crate::peer::PeerConfig) that binds them. The listeners come from the highest
+//! layer that names any:
+//!
+//! 1. `--listen` ([`Overrides::listen`]), then `ASPACE_LISTEN`, then
+//! 2. the file's `agentspaces.bind`, as the Java starter spells it (`bind: 127.0.0.1:7500`; a
+//!    list of them is read too), else
+//! 3. `127.0.0.1:7700` ([`DEFAULT_LISTEN_PORT`]).
+//!
+//! Each is `tcp://host:port`, `tls://host:port`, or `host:port`, which listens on `tls` under the
+//! `mtls` profile and on `tcp` under `dev-local` (Java's `bind` follows its transport the same
+//! way). A plaintext `tcp` listener on an address that is not loopback (a wildcard included) is
+//! refused unless the profile is `dev-local`. What the advertisement names in place of the bound
+//! address comes from `--advertise`, `ASPACE_ADVERTISE`, or the file's `agentspaces.advertise`,
+//! taken from the listeners' layer or one above it: `host:port` for a configuration with one
+//! listener, `scheme://host:port` to name the listener of that scheme. An advertisement with no
+//! listener to name, or naming a scheme no listener serves, is refused. A group of the file may
+//! also name the `membership` its founder founds it with (`open` or `invite`, read into
+//! [`FleetGroup::membership`]).
+//!
+//! A dial-only configuration never reads `ASPACE_LISTEN`, `ASPACE_ADVERTISE`, `bind`, or
+//! `advertise`, so a fleet file shared with a Java node that listens never makes a visitor bind.
 #![warn(missing_docs)]
 
 use std::fmt;
@@ -115,7 +148,10 @@ use agentspaces_wire::ids;
 use agentspaces_wire::seed::{self, Seed, SeedError};
 use serde_json::{Map as JsonMap, Value as Json};
 
-use crate::group::{GroupSpec, Profile};
+use agentspaces_wire::social::{self, InviteKey};
+
+use crate::group::{GroupSpec, MembershipPolicy, Profile};
+use crate::peer::ListenerSpec;
 
 /// Comma-separated seeds.
 pub const ENV_SEEDS: &str = "ASPACE_SEEDS";
@@ -270,7 +306,13 @@ impl PeerSettings {
     /// plaintext seed (`tcp`, `ws`, `http`) whose host is not loopback unless the profile is
     /// [`Profile::DevLocal`]; and a zero `reconnect_interval` or `peer_ad_interval`.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.seeds.is_empty() {
+        self.check(true)
+    }
+
+    /// [`PeerSettings::validate`], with the seeds optional unless `seeds_required` (a listening
+    /// peer may be the first of its group, dialing nobody).
+    pub(crate) fn check(&self, seeds_required: bool) -> Result<(), ConfigError> {
+        if seeds_required && self.seeds.is_empty() {
             return Err(ConfigError::NoSeeds { value: None });
         }
         match &self.group {
@@ -697,12 +739,18 @@ impl std::error::Error for ConfigError {
 
 /// The socket of `aspace daemon`: read and carried in [`Config::socket`].
 pub const ENV_SOCKET: &str = "ASPACE_SOCKET";
+/// An invite key of an `INVITE` group ([`Config::invite`]).
+pub const ENV_INVITE: &str = "ASPACE_INVITE";
+/// A listening peer's listeners, comma-separated ([`Config::listen`]).
+pub const ENV_LISTEN: &str = "ASPACE_LISTEN";
+/// What a listening peer's advertisement names in place of what it binds, comma-separated.
+pub const ENV_ADVERTISE: &str = "ASPACE_ADVERTISE";
 /// The base of the default configuration directory when set (XDG).
 pub const ENV_XDG_CONFIG_HOME: &str = "XDG_CONFIG_HOME";
 /// The home directory, for `~` and the default configuration directory.
 pub const ENV_HOME: &str = "HOME";
 /// Every variable [`Config::from_env`] reads.
-pub const CONFIG_VARIABLES: [&str; 10] = [
+pub const CONFIG_VARIABLES: [&str; 13] = [
     ENV_SEEDS,
     ENV_GROUP,
     ENV_JOIN,
@@ -713,6 +761,9 @@ pub const CONFIG_VARIABLES: [&str; 10] = [
     ENV_SOCKET,
     ENV_HOME,
     ENV_XDG_CONFIG_HOME,
+    ENV_INVITE,
+    ENV_LISTEN,
+    ENV_ADVERTISE,
 ];
 
 /// The flag naming the fleet file.
@@ -731,6 +782,16 @@ pub const FLAG_PROFILE: &str = "--profile";
 pub const FLAG_SOCKET: &str = "--socket";
 /// The flag overriding the join timeout.
 pub const FLAG_JOIN_TIMEOUT: &str = "--join-timeout";
+/// The flag naming an invite key.
+pub const FLAG_INVITE: &str = "--invite";
+/// The flag naming a listening peer's listeners.
+pub const FLAG_LISTEN: &str = "--listen";
+/// The flag naming what a listening peer's advertisement names.
+pub const FLAG_ADVERTISE: &str = "--advertise";
+/// The flag of a group the peer founded itself ([`Overrides::founded`]).
+pub const FLAG_FOUND: &str = "--found";
+/// The port a listening peer binds when no layer names a listener: `127.0.0.1:7700`.
+pub const DEFAULT_LISTEN_PORT: u16 = 7700;
 
 /// The largest fleet file read: 1 MiB. A fleet file is a few hundred bytes; the bound keeps a
 /// mistaken path (a log, a device) from being read whole.
@@ -751,8 +812,9 @@ pub const DEFAULT_FLEET_FILE: &str = "fleet.yaml";
 pub const DEFAULT_KEYSTORE_DIR: &str = "keys";
 /// How long a join may take by default: 10 s, the Java starter's `join-timeout-millis`.
 pub const DEFAULT_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
-/// The subtree keys of a listener (`bind`, `advertise`, `roles`): logged and ignored, since this
-/// peer is dial-only (the Ruby `Config::LISTENER_KEYS`).
+/// The subtree keys of a listener (`bind`, `advertise`, `roles`), the Ruby `Config::LISTENER_KEYS`:
+/// a dial-only configuration ignores all three (and lists them in [`FleetFile::ignored`]); a
+/// listening one reads `bind` and `advertise` ([`FleetFile::bind`], [`FleetFile::advertise`]).
 pub const LISTENER_KEYS: [&str; 3] = ["bind", "advertise", "roles"];
 
 /// Where a setting came from: a flag, a variable, a key of the fleet file, or the default.
@@ -815,6 +877,66 @@ pub struct Overrides {
     pub socket: Option<String>,
     /// `--join-timeout`: how long a join may take (over the group's `join-timeout-millis`).
     pub join_timeout: Option<Duration>,
+    /// `--invite`: an invite key of an `INVITE` group (over `ASPACE_INVITE`).
+    pub invite: Option<String>,
+    /// `--listen` (each item may be comma-separated): a listening peer's listeners (over
+    /// `ASPACE_LISTEN` and the file's `bind`). Read only when [`Overrides::listening`].
+    pub listen: Vec<String>,
+    /// `--advertise` (each item may be comma-separated): what the listeners' advertisement names
+    /// (over `ASPACE_ADVERTISE` and the file's `advertise`). Read only when
+    /// [`Overrides::listening`].
+    pub advertise: Vec<String>,
+    /// `--found`: a group this peer founded itself, its signed founding document. It is the
+    /// group, over the variables and the file; `--group` or `--join` beside it is refused.
+    pub founded: Option<Founded>,
+    /// Whether the configuration is a listening peer's (`aspace seed`): no seed is required, and
+    /// the listeners are resolved (see [Listening](self#listening)).
+    pub listening: bool,
+}
+
+/// A group a peer founded itself ([`Overrides::founded`]): its name and the CBOR of its signed
+/// founding document ([`crate::group::found_or_load`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Founded {
+    /// The group's name, as the founder gave it.
+    pub name: String,
+    /// The signed founding document.
+    pub document: Vec<u8>,
+}
+
+/// One listener of a listening configuration ([`Config::listen`]): its scheme, the address it
+/// binds, the address the advertisement names for it, and where it was read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenAddress {
+    /// `tcp` or `tls`.
+    pub scheme: String,
+    /// The address bound, `host:port` (port `0` lets the system choose).
+    pub bind: String,
+    /// The address the advertisement names instead (`host:port`), when one was configured.
+    pub advertise: Option<String>,
+    /// Where the listener was read.
+    pub origin: Origin,
+}
+
+impl ListenAddress {
+    /// The listener to bind ([`ListenerSpec::tcp`] or [`ListenerSpec::tls`]), advertising
+    /// [`ListenAddress::advertise`] when set.
+    pub fn spec(&self) -> ListenerSpec {
+        let spec = if self.scheme == "tls" {
+            ListenerSpec::tls(self.bind.clone())
+        } else {
+            ListenerSpec::tcp(self.bind.clone())
+        };
+        match &self.advertise {
+            Some(address) => spec.advertise(address.clone()),
+            None => spec,
+        }
+    }
+
+    /// `scheme://bind`.
+    pub fn uri(&self) -> String {
+        format!("{}://{}", self.scheme, self.bind)
+    }
 }
 
 /// One group of a fleet file, checked: its name, how it is joined, its seeds and spaces.
@@ -839,6 +961,9 @@ pub struct FleetGroup {
     pub spaces: Vec<String>,
     /// The group's `join-timeout-millis`, when set.
     pub join_timeout: Option<Duration>,
+    /// The group's `membership` (`open` or `invite`), as written: who a founder admits. Only a
+    /// listening configuration judges it ([`Config::membership`]).
+    pub membership: Option<String>,
 }
 
 /// The `agentspaces:` subtree of a fleet file, read and checked ([`FleetFile::read`]).
@@ -857,8 +982,14 @@ pub struct FleetFile {
     pub peer_ad_interval: Option<Duration>,
     /// `groups`, in order.
     pub groups: Vec<FleetGroup>,
-    /// The keys of the subtree and its groups this peer does not use, as dotted paths (values are
-    /// never kept, so a secret under an unknown key is never shown).
+    /// `bind`, as written (a scalar, a comma-separated scalar, or a list), unchecked: only a
+    /// listening configuration reads it ([`Config::listen`]).
+    pub bind: Vec<String>,
+    /// `advertise`, as written, unchecked, as [`FleetFile::bind`].
+    pub advertise: Vec<String>,
+    /// The keys of the subtree and its groups a dial-only peer does not use, as dotted paths
+    /// (values are never kept, so a secret under an unknown key is never shown); `bind` and
+    /// `advertise` are listed too, since only a listening configuration reads them.
     pub ignored: Vec<String>,
 }
 
@@ -882,6 +1013,19 @@ pub struct Config {
     pub origins: Vec<(&'static str, Origin)>,
     /// The keys of the file this peer does not use ([`FleetFile::ignored`]).
     pub ignored: Vec<String>,
+    /// The invite key the peer presents (`--invite`, `ASPACE_INVITE`): [`Config::peer_config`]
+    /// signs this peer's PeerID under its delegation and carries the credential as the
+    /// `aspace:join` resource hint (SPEC §5.1). Its secret is never shown ([`InviteKey`]'s
+    /// `Debug` names its code only).
+    pub invite: Option<InviteKey>,
+    /// Whether this is a listening peer's configuration ([`Overrides::listening`]).
+    pub listening: bool,
+    /// The listeners of a listening configuration, each with what its advertisement names; empty
+    /// for a dial-only one (see [Listening](self#listening)).
+    pub listen: Vec<ListenAddress>,
+    /// The membership the chosen group of the file names (`membership`), with the key, in a
+    /// listening configuration; `None` otherwise.
+    pub membership: Option<(MembershipPolicy, Origin)>,
 }
 
 impl Config {
@@ -1023,24 +1167,72 @@ impl Config {
             ));
         }
 
+        // The invite key, read first: with no group named, it names the group.
+        let invite = match flag(&overrides.invite)
+            .map(|v| (v, Origin::Flag(FLAG_INVITE)))
+            .or_else(|| var(ENV_INVITE).map(|v| (v, Origin::Variable(ENV_INVITE))))
+        {
+            Some((text, origin)) => Some((parse_invite(&text, &origin)?, origin)),
+            None => None,
+        };
+
         // The group: the highest layer that names one.
         let flags = layer_choice(
             flag(&overrides.group).map(|v| (v, Origin::Flag(FLAG_GROUP))),
             flag(&overrides.join).map(|v| (v, Origin::Flag(FLAG_JOIN))),
         )?;
-        let choice = match flags {
-            Some(choice) => Some(choice),
-            None => match (var(ENV_GROUP), var(ENV_JOIN)) {
+        let groups: &[FleetGroup] = file.map_or(&[], |file| file.groups.as_slice());
+        let choice = match (&overrides.founded, flags) {
+            (Some(founded), flags) => {
+                if let Some(Choice::Name(_, other) | Choice::Join(_, other)) = flags {
+                    return Err(ConfigError::Conflict {
+                        first: Box::new(Origin::Flag(FLAG_FOUND)),
+                        second: Box::new(other),
+                        fix: "a peer serves one group: the one it founds, or the one it names \
+                              or joins; keep one"
+                            .to_owned(),
+                    });
+                }
+                Some(Choice::Founded(founded.clone()))
+            }
+            (None, Some(choice)) => Some(choice),
+            (None, None) => match (var(ENV_GROUP), var(ENV_JOIN)) {
                 (Some(group), Some(join)) => {
                     return Err(ConfigError::GroupAndJoin { group, join });
                 }
                 (Some(group), None) => Some(Choice::Name(group, Origin::Variable(ENV_GROUP))),
                 (None, Some(join)) => Some(Choice::Join(join, Origin::Variable(ENV_JOIN))),
-                (None, None) => None,
+                // An invite names its group: the file's group of that id, else a join by id.
+                (None, None) => invite.as_ref().and_then(|((_, invited), origin)| {
+                    (!groups.iter().any(|group| group.group_id == *invited)).then(|| {
+                        Choice::Join(format!("{}{invited}", ids::URI_PREFIX), origin.clone())
+                    })
+                }),
             },
         };
-        let groups: &[FleetGroup] = file.map_or(&[], |file| file.groups.as_slice());
         let (spec, group_origin, chosen) = match choice {
+            Some(Choice::Founded(founded)) => {
+                let id =
+                    verified_founding(&founded.document).ok_or_else(|| ConfigError::Invalid {
+                        origin: Box::new(Origin::Flag(FLAG_FOUND)),
+                        value: founded.name.clone(),
+                        reason: "names a founding document that does not verify (SPEC §5.1)"
+                            .to_owned(),
+                    })?;
+                let chosen = groups
+                    .iter()
+                    .find(|group| group.group_id == id)
+                    .or_else(|| {
+                        groups
+                            .iter()
+                            .find(|group| group.name == founded.name.trim())
+                    });
+                (
+                    GroupSpec::FoundingDocument(founded.document),
+                    Origin::Flag(FLAG_FOUND),
+                    chosen,
+                )
+            }
             Some(Choice::Join(uri, origin)) => {
                 let uri = parse_join_at(&uri, &origin)?;
                 let id = ids::parse_group_id(&uri).unwrap_or_default().to_owned();
@@ -1060,7 +1252,15 @@ impl Config {
                     None => (GroupSpec::FoundingText(text), origin, None),
                 }
             }
-            None => match (groups.first(), file) {
+            None => match (
+                invite
+                    .as_ref()
+                    .and_then(|((_, invited), _)| {
+                        groups.iter().find(|group| group.group_id == *invited)
+                    })
+                    .or_else(|| groups.first()),
+                file,
+            ) {
                 (Some(group), Some(file)) => (
                     group.spec.clone(),
                     Origin::key(&file.path, group.spec_key.clone()),
@@ -1091,6 +1291,26 @@ impl Config {
                 reason: "is an empty founding text; name the group, or join it by id".to_owned(),
             });
         }
+        // An invite is for one group: the group named must be it.
+        if let Some(((_, invited), invite_origin)) = &invite {
+            let named = match &spec {
+                GroupSpec::FoundingText(text) => Some(ids::group_id_from_founding(text.as_bytes())),
+                GroupSpec::Join(uri) => ids::parse_group_id(uri).map(str::to_owned),
+                GroupSpec::FoundingDocument(document) => verified_founding(document),
+            };
+            if let Some(named) = named.filter(|named| named != invited) {
+                return Err(ConfigError::Conflict {
+                    first: Box::new(invite_origin.clone()),
+                    second: Box::new(group_origin),
+                    fix: format!(
+                        "the invite key admits to group {invited}, and the group named is \
+                         {named}; drop the group to join the invite's, or use an invite of the \
+                         group named"
+                    ),
+                });
+            }
+            origins.push(("invite", invite_origin.clone()));
+        }
         origins.push(("group", group_origin));
         let group_key = chosen.map(|group| group.key.clone());
 
@@ -1109,7 +1329,7 @@ impl Config {
         } else {
             (Vec::new(), Origin::Default)
         };
-        if seeds.is_empty() {
+        if seeds.is_empty() && !overrides.listening {
             let file_key = match (&group_key, file) {
                 (Some(key), Some(file)) => format!("{key}.seeds in {}", file.path.display()),
                 _ => "agentspaces.groups[].seeds in the fleet file".to_owned(),
@@ -1122,7 +1342,9 @@ impl Config {
                 ),
             });
         }
-        origins.push(("seeds", seeds_origin.clone()));
+        if !seeds.is_empty() {
+            origins.push(("seeds", seeds_origin.clone()));
+        }
 
         // The profile.
         let (profile_text, profile_origin) = if let Some(value) = flag(&overrides.profile) {
@@ -1251,7 +1473,37 @@ impl Config {
                 allow_plain: file.is_some_and(|file| file.allow_plain),
             });
         }
-        settings.validate()?;
+        settings.check(!overrides.listening)?;
+
+        // A listening configuration's listeners and membership.
+        let (listen, membership) = if overrides.listening {
+            let listen =
+                resolve_listeners(overrides, &var, file, settings.profile, &profile_origin)?;
+            if let Some(first) = listen.first() {
+                origins.push(("listen", first.origin.clone()));
+            }
+            let membership = match (chosen, file) {
+                (Some(group), Some(file)) => match &group.membership {
+                    Some(text) if !text.trim().is_empty() => {
+                        let origin = Origin::key(&file.path, format!("{}.membership", group.key));
+                        let policy =
+                            MembershipPolicy::parse(text).ok_or_else(|| ConfigError::Invalid {
+                                origin: Box::new(origin.clone()),
+                                value: shorten(text),
+                                reason: "is not a membership; write open (every verified peer \
+                                         joins) or invite (only peers with an invite)"
+                                    .to_owned(),
+                            })?;
+                        Some((policy, origin))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            (listen, membership)
+        } else {
+            (Vec::new(), None)
+        };
         Ok(Config {
             settings,
             group_name: chosen.map(|group| group.name.clone()),
@@ -1260,6 +1512,10 @@ impl Config {
             file: file.map(|file| file.path.clone()),
             origins,
             ignored: file.map(|file| file.ignored.clone()).unwrap_or_default(),
+            invite: invite.map(|((key, _), _)| key),
+            listening: overrides.listening,
+            listen,
+            membership,
         })
     }
 
@@ -1283,12 +1539,45 @@ impl Config {
     /// configuration's join timeout.
     ///
     /// [`PeerConfig::from_settings`]: crate::peer::PeerConfig::from_settings
+    ///
+    /// With an invite key ([`Config::invite`]) the configuration carries the delegated credential
+    /// for `identity` as the `aspace:join` resource hint. A listening configuration
+    /// ([`Config::listening`]) needs no seed and binds [`Config::listen`]; a dial-only one binds
+    /// nothing, whatever the file's `bind` says.
     pub fn peer_config(
         &self,
         identity: agentspaces_wire::identity::Identity,
     ) -> Result<crate::peer::PeerConfig, ConfigError> {
-        let mut config = crate::peer::PeerConfig::from_settings(&self.settings, identity)?;
+        self.settings.check(!self.listening)?;
+        let mut hints = None;
+        if let Some(key) = &self.invite {
+            let origin = self
+                .origin("invite")
+                .cloned()
+                .unwrap_or(Origin::Flag(FLAG_INVITE));
+            let refuse = |reason: String| ConfigError::Invalid {
+                origin: Box::new(origin.clone()),
+                value: redacted_invite(key),
+                reason,
+            };
+            let delegation = key.delegation().ok_or_else(|| {
+                refuse("carries no delegation; ask the founder for one from aspace invite".into())
+            })?;
+            hints = Some(
+                social::hints_for(key, &delegation, identity.peer_id())
+                    .map_err(|error| refuse(format!("cannot sign a credential: {error}")))?,
+            );
+        }
+        let mut config = crate::peer::PeerConfig::from_checked_settings(&self.settings, identity);
         config.join_timeout = self.join_timeout;
+        if let Some(hints) = hints {
+            config.resource_hints.extend(hints);
+        }
+        if self.listening {
+            for listener in &self.listen {
+                config = config.listen_on(listener.spec());
+            }
+        }
         Ok(config)
     }
 }
@@ -1378,6 +1667,8 @@ impl FleetFile {
             allow_plain: false,
             peer_ad_interval: None,
             groups: Vec::new(),
+            bind: Vec::new(),
+            advertise: Vec::new(),
             ignored: Vec::new(),
         };
         for (normal, key, value) in &fields.entries {
@@ -1418,11 +1709,16 @@ impl FleetFile {
                     }
                 }
                 _ => {
+                    match normal.as_str() {
+                        "bind" => file.bind = listener_texts(value),
+                        "advertise" => file.advertise = listener_texts(value),
+                        _ => {}
+                    }
                     if LISTENER_KEYS.contains(&normal.as_str()) {
                         tracing::info!(
                             key = %at.key,
                             file = %path.display(),
-                            "a listener setting; this peer is dial-only and ignores it"
+                            "a listener setting: only a listening peer (aspace seed) reads it"
                         );
                     }
                     file.ignored.push(at.key);
@@ -1471,6 +1767,7 @@ impl FleetGroup {
         let mut seeds = Vec::new();
         let mut spaces = Vec::new();
         let mut join_timeout = None;
+        let mut membership = None;
         for (normal, key, value) in &fields.entries {
             let field = at.child(key);
             let text = |value: &Json| -> Result<Option<String>, ConfigError> {
@@ -1509,6 +1806,15 @@ impl FleetGroup {
                     }
                 }
                 "jointimeoutmillis" => join_timeout = millis_of(value, &field)?,
+                // Judged only by a listening configuration, so a value a visitor cannot use
+                // never stops it.
+                "membership" => {
+                    membership = match value {
+                        Json::String(text) => Some(text.clone()),
+                        Json::Null => None,
+                        other => Some(other.to_string()),
+                    }
+                }
                 _ => ignored.push(field.key.clone()),
             }
         }
@@ -1552,6 +1858,7 @@ impl FleetGroup {
             seeds,
             spaces,
             join_timeout,
+            membership,
         };
         Ok((FleetGroup::named(&name, at, parts, lookup)?, ignored))
     }
@@ -1569,6 +1876,7 @@ impl FleetGroup {
             seeds,
             spaces,
             join_timeout,
+            membership,
         } = parts;
         let name = name.trim().to_owned();
         let (spec, spec_key, group_id) = if let Some((uri, uri_at)) = join {
@@ -1605,6 +1913,7 @@ impl FleetGroup {
             seeds,
             spaces,
             join_timeout,
+            membership,
         })
     }
 }
@@ -1618,6 +1927,21 @@ struct Parts<'a> {
     seeds: Vec<Seed>,
     spaces: Vec<String>,
     join_timeout: Option<Duration>,
+    membership: Option<String>,
+}
+
+/// The texts of a listener key (`bind`, `advertise`): a scalar or a list of them, kept as
+/// written; anything else as its compact JSON, which a listening configuration then refuses. A
+/// dial-only one never reads them, so nothing here refuses.
+fn listener_texts(value: &Json) -> Vec<String> {
+    list_of(value)
+        .into_iter()
+        .map(|item| match item {
+            Json::String(text) => text.clone(),
+            other => short_json(other),
+        })
+        .take(64)
+        .collect()
 }
 
 /// The GroupID a signed founding advertisement's CBOR bytes verify to, `None` when they do not
@@ -1672,10 +1996,259 @@ fn founding_document_bytes(
     }
 }
 
-/// The group a layer names: by name (or founding text), or by id.
+/// The group a layer names: by name (or founding text), by id, or founded by this peer.
 enum Choice {
     Name(String, Origin),
     Join(String, Origin),
+    Founded(Founded),
+}
+
+/// An invite key as a refusal shows it: its code, never its secret.
+fn redacted_invite(key: &InviteKey) -> String {
+    format!("{}{}-...", social::PREFIX, key.code())
+}
+
+/// An invite key, with the GroupID its delegation names, naming `origin` in a refusal (whose
+/// value shows the key's code at most, never its secret).
+fn parse_invite(text: &str, origin: &Origin) -> Result<(InviteKey, String), ConfigError> {
+    let refuse = |value: String, reason: &str| ConfigError::Invalid {
+        origin: Box::new(origin.clone()),
+        value,
+        reason: reason.to_owned(),
+    };
+    let key = InviteKey::parse(text).map_err(|_| {
+        refuse(
+            format!("{}...", social::PREFIX),
+            "is not an invite key; pass the aspace-inv1-... text the group's founder printed \
+             with aspace invite",
+        )
+    })?;
+    let Some(delegation) = key.delegation() else {
+        return Err(refuse(
+            redacted_invite(&key),
+            "carries no delegation, so it admits nobody; ask the founder for one printed by \
+             aspace invite",
+        ));
+    };
+    let group = social::delegation_group(&delegation).map_err(|_| {
+        refuse(
+            redacted_invite(&key),
+            "carries a delegation that does not decode; ask the founder for a new invite",
+        )
+    })?;
+    if ids::parse_group_id(&group).is_none_or(|id| id != group) {
+        return Err(refuse(
+            redacted_invite(&key),
+            "carries a delegation that names no group id; ask the founder for a new invite",
+        ));
+    }
+    Ok((key, group))
+}
+
+/// The rank of a layer, for which advertisements apply to which listeners: a flag over a
+/// variable over the file over the default.
+fn layer_rank(origin: &Origin) -> u8 {
+    match origin {
+        Origin::Flag(_) => 3,
+        Origin::Variable(_) => 2,
+        Origin::Key { .. } => 1,
+        Origin::Default => 0,
+    }
+}
+
+/// The listeners of a listening configuration, each with its advertisement (see
+/// [Listening](self#listening)).
+fn resolve_listeners(
+    overrides: &Overrides,
+    var: &impl Fn(&str) -> Option<String>,
+    file: Option<&FleetFile>,
+    profile: Profile,
+    profile_origin: &Origin,
+) -> Result<Vec<ListenAddress>, ConfigError> {
+    let layer = |values: &[String]| -> Vec<String> {
+        values
+            .iter()
+            .flat_map(|value| value.split(','))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
+    let flag_listen = layer(&overrides.listen);
+    let var_listen = var(ENV_LISTEN).map(|v| layer(&[v])).unwrap_or_default();
+    let file_listen = file.map(|f| layer(&f.bind)).unwrap_or_default();
+    let (entries, origin) = if !flag_listen.is_empty() {
+        (flag_listen, Origin::Flag(FLAG_LISTEN))
+    } else if !var_listen.is_empty() {
+        (var_listen, Origin::Variable(ENV_LISTEN))
+    } else if let (false, Some(file)) = (file_listen.is_empty(), file) {
+        (file_listen, Origin::key(&file.path, "agentspaces.bind"))
+    } else {
+        (
+            vec![format!("127.0.0.1:{DEFAULT_LISTEN_PORT}")],
+            Origin::Default,
+        )
+    };
+    let mut listen: Vec<ListenAddress> = Vec::new();
+    for entry in &entries {
+        let parsed = parse_listener(entry, &origin, profile, profile_origin)?;
+        if !listen
+            .iter()
+            .any(|known| known.scheme == parsed.scheme && known.bind == parsed.bind)
+        {
+            listen.push(parsed);
+        }
+    }
+
+    // The advertisements: from the highest layer at or above the listeners' that names any.
+    let rank = layer_rank(&origin);
+    let flag_ads = layer(&overrides.advertise);
+    let var_ads = var(ENV_ADVERTISE).map(|v| layer(&[v])).unwrap_or_default();
+    let file_ads = file.map(|f| layer(&f.advertise)).unwrap_or_default();
+    let candidates = [
+        (flag_ads, Origin::Flag(FLAG_ADVERTISE)),
+        (var_ads, Origin::Variable(ENV_ADVERTISE)),
+        (
+            file_ads,
+            file.map_or(Origin::Default, |file| {
+                Origin::key(&file.path, "agentspaces.advertise")
+            }),
+        ),
+    ];
+    let Some((ads, ad_origin)) = candidates
+        .into_iter()
+        .find(|(ads, origin)| !ads.is_empty() && layer_rank(origin) >= rank)
+    else {
+        return Ok(listen);
+    };
+    for ad in &ads {
+        let refuse = |reason: String| ConfigError::Invalid {
+            origin: Box::new(ad_origin.clone()),
+            value: shorten(ad),
+            reason,
+        };
+        let (scheme, address) = match ad.split_once("://") {
+            Some((scheme, address)) => (Some(scheme.to_ascii_lowercase()), address),
+            None => (None, ad.as_str()),
+        };
+        let (host, _) = seed::seed_address(address)
+            .ok()
+            .filter(|_| !address.contains('/'))
+            .ok_or_else(|| {
+                refuse(
+                    "is not an address to advertise; write host:port or scheme://host:port".into(),
+                )
+            })?;
+        if matches!(host.as_str(), "0.0.0.0" | "::") {
+            return Err(refuse(
+                "is a wildcard address, which no member can dial; advertise the address members \
+                 dial"
+                    .into(),
+            ));
+        }
+        let matching: Vec<usize> = listen
+            .iter()
+            .enumerate()
+            .filter(|(_, listener)| scheme.as_deref().is_none_or(|s| s == listener.scheme))
+            .map(|(index, _)| index)
+            .collect();
+        let index = match (matching.as_slice(), &scheme) {
+            ([index], _) => *index,
+            ([], Some(scheme)) => {
+                return Err(refuse(format!(
+                    "names the scheme {scheme}, and no listener serves it ({}); advertise a \
+                     listener's scheme",
+                    listen
+                        .iter()
+                        .map(ListenAddress::uri)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+            (_, None) => {
+                return Err(refuse(
+                    "names no scheme, and there are several listeners; write \
+                     scheme://host:port for each"
+                        .into(),
+                ));
+            }
+            (_, Some(scheme)) => {
+                return Err(refuse(format!(
+                    "names the scheme {scheme}, which several listeners serve; give one listener \
+                     per scheme an advertisement"
+                )));
+            }
+        };
+        let Some(listener) = listen.get_mut(index) else {
+            continue;
+        };
+        if listener.advertise.is_some() {
+            return Err(refuse(format!(
+                "names a second address for the listener {}; give each listener one",
+                listener.uri()
+            )));
+        }
+        listener.advertise = Some(address.trim().to_owned());
+    }
+    Ok(listen)
+}
+
+/// One listener: `tcp://host:port`, `tls://host:port`, or `host:port` (`tls`, or `tcp` under
+/// `dev-local`). A plaintext one on an address that is not loopback is refused unless the
+/// profile is `dev-local`.
+fn parse_listener(
+    text: &str,
+    origin: &Origin,
+    profile: Profile,
+    profile_origin: &Origin,
+) -> Result<ListenAddress, ConfigError> {
+    let refuse = |reason: String| ConfigError::Invalid {
+        origin: Box::new(origin.clone()),
+        value: shorten(text),
+        reason,
+    };
+    let (scheme, address) = match text.split_once("://") {
+        Some((scheme, address)) => (scheme.trim().to_ascii_lowercase(), address.trim()),
+        None => (
+            if profile == Profile::DevLocal {
+                "tcp".to_owned()
+            } else {
+                "tls".to_owned()
+            },
+            text.trim(),
+        ),
+    };
+    if scheme != "tcp" && scheme != "tls" {
+        return Err(refuse(format!(
+            "names the scheme {scheme}; this peer listens on tcp and tls only, e.g. \
+             tls://0.0.0.0:7500"
+        )));
+    }
+    let (host, _) = seed::seed_address(address)
+        .ok()
+        .filter(|_| !address.contains('/'))
+        .ok_or_else(|| {
+            refuse(
+                "is not an address to listen on; write tcp://host:port, tls://host:port, or \
+                 host:port (port 0 lets the system choose)"
+                    .into(),
+            )
+        })?;
+    if scheme == "tcp" && profile != Profile::DevLocal && !is_loopback_host(&host) {
+        return Err(refuse(format!(
+            "is a plaintext tcp listener on {host}, which is not loopback, and the profile is \
+             {} ({profile_origin}): members would link in the clear, and members under mtls \
+             refuse to dial it; write tls://{address}, or set the profile to dev-local \
+             ({FLAG_PROFILE}, {ENV_PROFILE}, or agentspaces.security.profile) on a closed network",
+            profile_name(profile)
+        )));
+    }
+    Ok(ListenAddress {
+        scheme,
+        bind: address.to_owned(),
+        advertise: None,
+        origin: origin.clone(),
+    })
 }
 
 /// One layer's group: refuses both a name and a join in the same layer.

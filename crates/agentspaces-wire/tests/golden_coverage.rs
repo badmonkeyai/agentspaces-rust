@@ -124,26 +124,42 @@ const SKIPPED: &[SkipGroup] = &[
     },
     SkipGroup {
         patterns: &["pdt_*"],
-        what: "Java's persistent data tree nodes and chunk cuts (agentspaces-pdt PdtVectors)",
-        phase: "not planned: only Java's own PdtVectorsConformanceTest reads them, no client consumes the tree",
+        what: "persistent data tree nodes, refs, version graphs, pins, and chunk cuts (annex H, PDT 2)",
+        phase: "future work: persistent data trees, which this peer does not implement yet",
     },
     SkipGroup {
         patterns: &[
-            "content_root_cidv1",
             "content_manifest*",
             "content_holding_*",
             "content_piece*",
             "content_have_cbor",
             "content_cancel_cbor",
             "content_reject_cbor",
-            "content_node*",
-            "content_tree_*",
+            "content_node_want_cbor",
+            "content_nodes_cbor",
+            "content_tree_want_cbor",
+            "content_tree_end_cbor",
         ],
-        what: "the content swarm's root, Manifest, Holding, and piece-exchange bodies (annex G)",
+        what: "the content swarm's Manifest, Holding, piece-exchange, and tree bodies (annex G)",
         phase: "future work: the content swarm client",
     },
     SkipGroup {
-        patterns: &["data_query_*", "data_result_cbor", "asset_*"],
+        patterns: &[
+            "content_challenge_cbor",
+            "content_nodes_deltas_cbor",
+            "content_tree_want_sketch_cbor",
+            "content_tree_end_sketch_cbor",
+        ],
+        what: "the content swarm's pdt level: CHALLENGE, NODES.deltas, and the sketch grammar (SPEC §8)",
+        phase: "future work: the content swarm's pdt level, after the content swarm client",
+    },
+    SkipGroup {
+        patterns: &[
+            "data_query_*",
+            "data_result_cbor",
+            "asset_change_cbor",
+            "asset_invocation*",
+        ],
         what: "connector entries: aspace:cap/data-query records, its canonical hash, asset invocations",
         phase: "future work: the connector clients",
     },
@@ -151,11 +167,6 @@ const SKIPPED: &[SkipGroup] = &[
         patterns: &["beacon_seal_*"],
         what: "the sealed multicast bootstrap-beacon datagram (SPEC §10.1 v0.1.19, HKDF and AES-256-GCM)",
         phase: "future work: an optional multicast beacon locator",
-    },
-    SkipGroup {
-        patterns: &["space_state_hash", "space_claim_hash"],
-        what: "ReplicatedSpace stateHash and claimHash, the lines a serving host answers a DIGEST with",
-        phase: "future work: a Rust serving host (the TypeScript client's serving tests use them)",
     },
 ];
 

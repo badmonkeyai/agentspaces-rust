@@ -28,9 +28,9 @@ use agentspaces_wire::identity::Identity;
 use agentspaces_wire::ids::derive_id;
 use agentspaces_wire::revocation::{
     Authority, CREDENTIAL_STREAM, KEY_COMPROMISE, KINDS, MAX_EVIDENCE, MAX_ISSUED_SKEW_MILLIS,
-    PEER_STREAM, REASONS, Registry, STREAMS, agent_key_target, agent_target, canonical_target,
-    credential_revocation, is_valid_target, join_credential_target, revocation_id, sign_revocation,
-    x509_leaf_target,
+    PEER_STREAM, REASONS, Registry, STREAMS, UNSPECIFIED, agent_key_target, agent_target,
+    canonical_target, credential_revocation, is_valid_target, join_credential_target,
+    revocation_id, sign_revocation, x509_leaf_target,
 };
 use agentspaces_wire::time::parse_instant_millis;
 use common::{hex, s};
@@ -399,6 +399,9 @@ fn a_revocation_without_a_reason_is_unspecified_as_java_reads_it() {
         ("spaces", Some(Value::from("  "))),
         ("em space", Some(Value::from("\u{2003}"))),
     ];
+    // Since v0.1.31 a record arrives as the bytes Java writes for it (SPEC §9.1 F3): Java reads
+    // an absent, null, or blank reason as `unspecified` and re-encodes it so, which is not what
+    // arrived, so each of these is refused; the record its issuer wrote as `unspecified` holds.
     for (name, reason) in unspecified {
         let mut ad = good.clone();
         match reason {
@@ -411,21 +414,26 @@ fn a_revocation_without_a_reason_is_unspecified_as_java_reads_it() {
         }
         let mut registry = Registry::new(None, group());
         assert!(
-            registry.accept(CREDENTIAL_STREAM, &signed_payload(&ad, &identity), now()),
+            !registry.accept(CREDENTIAL_STREAM, &signed_payload(&ad, &identity), now()),
             "{name}"
         );
-        let held = &registry.credentials()[&format!("AGENT:{agent}")];
-        assert!(!held.compromise, "{name}");
-        assert_eq!(held.effective_ms, effective, "{name}");
-        // The freeze rule of an unspecified reason: an unknown time is refused, a signature
-        // before the effective instant is not, one at or after it is.
-        assert!(registry.refuses(&agent, None, None), "{name}");
-        assert!(
-            !registry.refuses(&agent, None, Some(effective - 1)),
-            "{name}"
-        );
-        assert!(registry.refuses(&agent, None, Some(effective)), "{name}");
     }
+    let mut written = good.clone();
+    written.insert("reason", UNSPECIFIED);
+    let mut registry = Registry::new(None, group());
+    assert!(registry.accept(
+        CREDENTIAL_STREAM,
+        &signed_payload(&written, &identity),
+        now()
+    ));
+    let held = &registry.credentials()[&format!("AGENT:{agent}")];
+    assert!(!held.compromise);
+    assert_eq!(held.effective_ms, effective);
+    // The freeze rule of an unspecified reason: an unknown time is refused, a signature before
+    // the effective instant is not, one at or after it is.
+    assert!(registry.refuses(&agent, None, None));
+    assert!(!registry.refuses(&agent, None, Some(effective - 1)));
+    assert!(registry.refuses(&agent, None, Some(effective)));
     for (name, reason) in [
         ("no-break space", Value::from("\u{A0}")),
         ("figure space", Value::from("\u{2007}")),
@@ -580,17 +588,24 @@ fn hostile_and_malformed_records_are_refused() {
             "{name}"
         );
     }
-    // A record with no reason is not malformed: Java reads it as `unspecified`.
+    // A record with no reason breaks P1 since v0.1.31 (SPEC §9.1): the field is always written.
     let mut reasonless = good.clone();
     reasonless.remove("reason");
-    assert!(Registry::new(None, group()).accept(
+    assert!(!Registry::new(None, group()).accept(
         CREDENTIAL_STREAM,
         &signed_payload(&reasonless, &identity),
         now()
     ));
-    // A null effectiveFrom is an absent one.
+    // An effectiveFrom written null breaks P1 too (it is omitted when null), and an absent one
+    // is the issue instant.
     let mut null_effective = good.clone();
     null_effective.insert("effectiveFrom", Value::Null);
+    assert!(!registry.accept(
+        CREDENTIAL_STREAM,
+        &signed_payload(&null_effective, &identity),
+        now()
+    ));
+    null_effective.remove("effectiveFrom");
     assert!(registry.accept(
         CREDENTIAL_STREAM,
         &signed_payload(&null_effective, &identity),

@@ -22,16 +22,49 @@
 //! (base64 CBOR), the seeds, the wire hints, the multicast group, free parameters, and, at a
 //! social beacon, the public delegation (`invite`). Document-wide it carries the issuer PeerID,
 //! its raw key (base64), the issue time, a time to live in seconds, and the issuer's Ed25519
-//! signature over the canonical bytes: every field but `signature`, in declared order, null
-//! fields omitted, map keys sorted, no whitespace, exactly as Jackson writes them
-//! ([`canonical_bytes`]). A reader ignores unknown fields. A document never carries a content
-//! key, a credential, or a membership hint: parameters by those names
-//! ([`FORBIDDEN_PARAMETERS`]) are refused when a group is built, parsed, or signed.
+//! signature over the canonical bytes. A document never carries a content key, a credential, or
+//! a membership hint: parameters by those names ([`FORBIDDEN_PARAMETERS`]) are refused when a
+//! group is built, parsed, or signed.
 //!
-//! The document is typed ([`BeaconDocument`], [`Group`], [`DocumentSeed`]) and read as Java's
-//! Jackson mapper reads it ([`BeaconDocument::parse`]): an absent or null number is 0, a
-//! fractional number is truncated, a number outside its Java type is refused, an absent or null
-//! list is empty, and a value of the wrong JSON type is refused rather than coerced.
+//! # The canonical JSON (SPEC §9.1, §10.1)
+//!
+//! The document is JSON and lies outside the CBOR wire encoding, yet a signed one keeps one form,
+//! Java's `BeaconDocument.toJson` ([`to_json`]): the members `v`, `issuer`, `issuerKey`, `issued`,
+//! `ttl`, `groups`, `signature` in that order; a group's `name`, `id`, `founding`, `seeds`,
+//! `wire`, `multicast`, `parameters`, `invite`; a seed's `transport`, `address`, `priority`; a
+//! null member of the document or of a group omitted, and a null seed member or map value
+//! written `null`; the keys of `wire` and `parameters` sorted in UTF-16 code unit order; no
+//! whitespace; integers in decimal; strings escaped as Jackson escapes them (`\"`, `\\`, then
+//! `\b \t \n \f \r`, every other character below U+0020 as upper-case `\u00XX`, and every
+//! other character, DEL included, as itself). The signature covers the document without its
+//! `signature` member written the same way, except that each character past U+FFFF appears as
+//! the two upper-case `\uXXXX` escapes of its UTF-16 surrogates ([`canonical_bytes`]); the
+//! served document holds such a character as UTF-8.
+//!
+//! # Reading a document
+//!
+//! [`BeaconDocument::parse`] reads as Java's `BeaconDocument.parse` does, with every coercion
+//! off:
+//!
+//! - every member it names holds Java's type, signed or not: `v` and a seed's `priority` a JSON
+//!   integer within a 32-bit `int`, each `wire` value null or such an integer, `ttl` an integer
+//!   within a 64-bit `long`, `groups` and `seeds` arrays, `wire` and `parameters` objects (a
+//!   parameter value text or null), and every other member text or null. A number written with a
+//!   fraction or an exponent fills no integer member, and text never stands for a number. An
+//!   absent or null number reads as 0 and an absent or null list as empty;
+//! - every group meets Java's `Group` record: it has a name, no seed is null, and no parameter
+//!   carries a forbidden name;
+//! - a document that carries a `signature` must arrive as exactly its canonical JSON, the bytes
+//!   [`to_json`] writes for what was read, and its `signature` and `issuerKey` must each be the
+//!   padded standard base64 (RFC 4648 §4) of the bytes they decode to. Whitespace, a byte order
+//!   mark, a trailing newline, another member order, an unknown or duplicate member, another
+//!   escape, a number sent as text or as a float, and another base64 text of the same signature
+//!   therefore each refuse a signed document ([`BeaconError::NotCanonical`]) instead of
+//!   relabelling it.
+//!
+//! A document without a signature still reads leniently in form: whitespace, a byte order mark,
+//! any member order, and unknown members are accepted, while each member it names holds its type
+//! as above.
 #![warn(missing_docs)]
 
 use std::collections::BTreeMap;
@@ -88,6 +121,11 @@ pub enum BeaconError {
     /// A group carries a forbidden parameter.
     #[error("a beacon document never carries {0:?}")]
     ForbiddenParameter(String),
+    /// A document that carries a signature is not exactly its canonical JSON ([`to_json`]), or
+    /// its `signature` or `issuerKey` is not the padded standard base64 text of the bytes it
+    /// decodes to (SPEC §9.1).
+    #[error("a signed beacon document is not its canonical JSON")]
+    NotCanonical,
     /// A carried signature does not verify under a key hashing to the issuer.
     #[error("the beacon document's signature does not verify")]
     BadSignature,
@@ -150,12 +188,14 @@ pub struct Group {
     pub founding: Option<String>,
     /// The seeds, by position.
     pub seeds: Vec<DocumentSeed>,
-    /// Wire hints (`session`, `batch`, ...).
-    pub wire: Option<BTreeMap<String, i32>>,
+    /// Wire hints (`session`, `batch`, ...); a hint may be null, as Java's
+    /// `Map<String, Integer>` holds it.
+    pub wire: Option<BTreeMap<String, Option<i32>>>,
     /// The multicast group, `address:port`.
     pub multicast: Option<String>,
-    /// Free parameters; never one of [`FORBIDDEN_PARAMETERS`].
-    pub parameters: Option<BTreeMap<String, String>>,
+    /// Free parameters; never one of [`FORBIDDEN_PARAMETERS`]. A value may be null, as Java's
+    /// `Map<String, String>` holds it.
+    pub parameters: Option<BTreeMap<String, Option<String>>>,
     /// At a social beacon, the founder's delegation string (public data).
     pub invite: Option<String>,
 }
@@ -219,7 +259,7 @@ impl Group {
     pub fn with_wire(mut self, key: impl Into<String>, value: i32) -> Self {
         self.wire
             .get_or_insert_with(BTreeMap::new)
-            .insert(key.into(), value);
+            .insert(key.into(), Some(value));
         self
     }
 
@@ -240,7 +280,7 @@ impl Group {
         check_parameter(&key)?;
         self.parameters
             .get_or_insert_with(BTreeMap::new)
-            .insert(key, value.into());
+            .insert(key, Some(value.into()));
         Ok(self)
     }
 
@@ -307,20 +347,34 @@ pub struct BeaconDocument {
 }
 
 impl BeaconDocument {
-    /// Parses a document as Java `BeaconDocument.parse` does: at most [`MAX_DOCUMENT_BYTES`],
-    /// a JSON object, unknown fields ignored, `v` at least 1, and no forbidden parameter. A
-    /// value of the wrong shape is refused (see the module documentation for the number rules).
-    /// A leading UTF-8 byte order mark is skipped, as Jackson skips it.
+    /// Parses a document as Java `BeaconDocument.parse` does (SPEC §9.1; see the module
+    /// documentation): at most [`MAX_DOCUMENT_BYTES`], a JSON object whose named members hold
+    /// Java's types, groups that meet Java's `Group` record, and `v` at least 1. A document that
+    /// carries a `signature` must be exactly its canonical JSON with its signature and key in
+    /// padded standard base64 ([`BeaconError::NotCanonical`] otherwise). An unsigned document
+    /// may carry whitespace, any member order, unknown members, and a leading UTF-8 byte order
+    /// mark, which Jackson skips.
+    ///
+    /// Parsing checks the form alone: [`verify_document`] checks the signature.
     pub fn parse(bytes: &[u8]) -> Result<BeaconDocument, BeaconError> {
         if bytes.len() > MAX_DOCUMENT_BYTES {
             return Err(BeaconError::TooLarge(bytes.len()));
         }
-        let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+        let json_bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
         let json: Json =
-            serde_json::from_slice(bytes).map_err(|e| BeaconError::Json(e.to_string()))?;
+            serde_json::from_slice(json_bytes).map_err(|e| BeaconError::Json(e.to_string()))?;
         let doc = document_from_json(&json)?;
         if doc.v < 1 {
             return Err(BeaconError::Version(doc.v));
+        }
+        if let Some(signature) = doc.signature.as_deref() {
+            // The bytes received, a byte order mark included, are the document's own.
+            let canonical = to_json(&doc) == bytes
+                && canonical_base64(signature)
+                && doc.issuer_key.as_deref().is_none_or(canonical_base64);
+            if !canonical {
+                return Err(BeaconError::NotCanonical);
+            }
         }
         Ok(doc)
     }
@@ -345,38 +399,24 @@ fn text(value: Option<&Json>, field: &'static str) -> Result<Option<String>, Bea
     }
 }
 
-/// A Java integral field of the range `min..=max`: absent or null is 0, a fraction truncates
-/// (Jackson's `ACCEPT_FLOAT_AS_INT`), numeric text is read as its number, and anything else or
-/// out of range is refused.
+/// A Java integral field of the range `min..=max`, read with Jackson's coercions off: absent or
+/// null is 0 (a primitive's default), a JSON integer inside the range is its value, and anything
+/// else is refused: a number written with a fraction or an exponent (`1.0`, `7e2`), numeric
+/// text, a boolean, a container, or an integer outside the range.
 fn integer(
     value: Option<&Json>,
     field: &'static str,
     min: i64,
     max: i64,
 ) -> Result<i64, BeaconError> {
-    let malformed = BeaconError::Malformed { field };
-    let n = match value {
-        None | Some(Json::Null) => return Ok(0),
-        Some(Json::Number(n)) => match n.as_i64() {
-            Some(n) => n,
-            None => {
-                let x = n.as_f64().ok_or(malformed.clone())?.trunc();
-                // `max as f64 + 1.0` is exact for i32 and rounds to 2^63 for i64.
-                if !(x >= min as f64 && x < max as f64 + 1.0) {
-                    return Err(malformed);
-                }
-                // In range by the check above.
-                x as i64
-            }
-        },
-        Some(Json::String(s)) if s.trim().is_empty() => return Ok(0),
-        Some(Json::String(s)) => s.trim().parse::<i64>().map_err(|_| malformed.clone())?,
-        Some(_) => return Err(malformed),
-    };
-    if (min..=max).contains(&n) {
-        Ok(n)
-    } else {
-        Err(malformed)
+    match value {
+        None | Some(Json::Null) => Ok(0),
+        // `as_i64` is `None` for a float, whatever its value, and for an integer past i64.
+        Some(Json::Number(n)) => n
+            .as_i64()
+            .filter(|n| (min..=max).contains(n))
+            .ok_or(BeaconError::Malformed { field }),
+        Some(_) => Err(BeaconError::Malformed { field }),
     }
 }
 
@@ -432,20 +472,15 @@ fn group_from_json(value: &Json) -> Result<Group, BeaconError> {
             .iter()
             .map(seed_from_json)
             .collect::<Result<_, _>>()?,
-        wire: map_of(group.get("wire"), "groups[].wire", |v| {
-            match v {
-                // Java's Map<String, Integer> keeps a null; this reader refuses it instead.
-                Json::Null => Err(BeaconError::Malformed {
-                    field: "groups[].wire",
-                }),
-                v => int32(Some(v), "groups[].wire"),
-            }
+        // Java's Map<String, Integer> keeps a null value as null.
+        wire: map_of(group.get("wire"), "groups[].wire", |v| match v {
+            Json::Null => Ok(None),
+            v => int32(Some(v), "groups[].wire").map(Some),
         })?,
         multicast: text(group.get("multicast"), "groups[].multicast")?,
+        // Java's Map<String, String> keeps a null value as null; any other non-text is refused.
         parameters: map_of(group.get("parameters"), "groups[].parameters", |v| {
-            v.as_str().map(str::to_owned).ok_or(BeaconError::Malformed {
-                field: "groups[].parameters",
-            })
+            text(Some(v), "groups[].parameters")
         })?,
         invite: text(group.get("invite"), "groups[].invite")?,
     };
@@ -469,13 +504,33 @@ fn document_from_json(value: &Json) -> Result<BeaconDocument, BeaconError> {
     })
 }
 
+/// Whether `text` is the padded standard base64 (RFC 4648 §4) of the bytes it decodes to (Java
+/// `BeaconDocument.canonicalBase64`): another text of the same bytes (no padding, other unused
+/// low bits, another alphabet, an embedded newline) is not.
+fn canonical_base64(text: &str) -> bool {
+    base64_decode(text).is_some_and(|bytes| base64_encode(&bytes) == text)
+}
+
 // ---------------------------------------------------------------------------------------------
 // Writing JSON as Jackson does
 
+/// Which of Jackson's two writers a document is written as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Form {
+    /// The signed bytes, `writeValueAsBytes`: without the signature, and each character past
+    /// U+FFFF written as the escapes of its two UTF-16 surrogates.
+    Canonical,
+    /// The served document, `writeValueAsString`: with the signature, and every character past
+    /// U+FFFF as its UTF-8.
+    Served,
+}
+
 /// A JSON string as Jackson's generator writes it: `"` and `\` escaped, the control characters
 /// with a short escape as `\b \t \n \f \r`, every other one below U+0020 as upper-case
-/// `\u00XX`, and everything else (DEL and non-ASCII included) as its UTF-8.
-fn write_string(out: &mut String, text: &str) {
+/// `\u00XX`, and everything else (DEL and non-ASCII included) as its UTF-8, except that the
+/// canonical form writes a character past U+FFFF as two upper-case `\uXXXX` escapes of its
+/// UTF-16 surrogates, as Jackson's byte writer does.
+fn write_string(out: &mut String, text: &str, form: Form) {
     out.push('"');
     for c in text.chars() {
         match c {
@@ -490,127 +545,163 @@ fn write_string(out: &mut String, text: &str) {
                 // Writing to a String cannot fail.
                 let _ = write!(out, "\\u{:04X}", u32::from(c));
             }
+            c if form == Form::Canonical && u32::from(c) > 0xFFFF => {
+                let mut units = [0u16; 2];
+                for unit in c.encode_utf16(&mut units) {
+                    // Writing to a String cannot fail.
+                    let _ = write!(out, "\\u{unit:04X}");
+                }
+            }
             c => out.push(c),
         }
     }
     out.push('"');
 }
 
-fn write_field(out: &mut String, first: &mut bool, key: &str) {
+fn write_field(out: &mut String, first: &mut bool, key: &str, form: Form) {
     if !*first {
         out.push(',');
     }
     *first = false;
-    write_string(out, key);
+    write_string(out, key, form);
     out.push(':');
 }
 
-fn write_text_field(out: &mut String, first: &mut bool, key: &str, value: Option<&str>) {
+fn write_text_field(
+    out: &mut String,
+    first: &mut bool,
+    key: &str,
+    value: Option<&str>,
+    form: Form,
+) {
     if let Some(value) = value {
-        write_field(out, first, key);
-        write_string(out, value);
+        write_field(out, first, key, form);
+        write_string(out, value, form);
     }
 }
 
-/// A map sorted by key, each value written by `value`: in Java's `String.compareTo` order
-/// ([`java_order`]), the order `ORDER_MAP_ENTRIES_BY_KEYS` sorts map keys in.
-fn write_sorted<T>(out: &mut String, map: &BTreeMap<String, T>, value: impl Fn(&mut String, &T)) {
+/// A map sorted by key, each value written by `value` and a null value as `null`: in Java's
+/// `String.compareTo` order ([`java_order`]), the order `ORDER_MAP_ENTRIES_BY_KEYS` sorts map
+/// keys in.
+fn write_sorted<T>(
+    out: &mut String,
+    map: &BTreeMap<String, Option<T>>,
+    form: Form,
+    value: impl Fn(&mut String, &T),
+) {
     let mut entries: Vec<_> = map.iter().collect();
     entries.sort_by(|(a, _), (b, _)| java_order(a, b));
     out.push('{');
     let mut first = true;
     for (key, item) in entries {
-        write_field(out, &mut first, key);
-        value(out, item);
+        write_field(out, &mut first, key, form);
+        match item {
+            Some(item) => value(out, item),
+            None => out.push_str("null"),
+        }
     }
     out.push('}');
 }
 
-fn write_seed(out: &mut String, seed: &DocumentSeed) {
+fn write_seed(out: &mut String, seed: &DocumentSeed, form: Form) {
     out.push('{');
     let mut first = true;
     // Java's Seed record has no NON_NULL inclusion: a missing transport or address is null.
     for (key, value) in [("transport", &seed.transport), ("address", &seed.address)] {
-        write_field(out, &mut first, key);
+        write_field(out, &mut first, key, form);
         match value {
-            Some(text) => write_string(out, text),
+            Some(text) => write_string(out, text, form),
             None => out.push_str("null"),
         }
     }
-    write_field(out, &mut first, "priority");
+    write_field(out, &mut first, "priority", form);
     out.push_str(&seed.priority.to_string());
     out.push('}');
 }
 
-fn write_group(out: &mut String, group: &Group) {
+fn write_group(out: &mut String, group: &Group, form: Form) {
     out.push('{');
     let mut first = true;
-    write_text_field(out, &mut first, "name", Some(&group.name));
-    write_text_field(out, &mut first, "id", group.id.as_deref());
-    write_text_field(out, &mut first, "founding", group.founding.as_deref());
-    write_field(out, &mut first, "seeds");
+    write_text_field(out, &mut first, "name", Some(&group.name), form);
+    write_text_field(out, &mut first, "id", group.id.as_deref(), form);
+    write_text_field(out, &mut first, "founding", group.founding.as_deref(), form);
+    write_field(out, &mut first, "seeds", form);
     out.push('[');
     for (i, seed) in group.seeds.iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
-        write_seed(out, seed);
+        write_seed(out, seed, form);
     }
     out.push(']');
     if let Some(wire) = &group.wire {
-        write_field(out, &mut first, "wire");
-        write_sorted(out, wire, |out, n| out.push_str(&n.to_string()));
+        write_field(out, &mut first, "wire", form);
+        write_sorted(out, wire, form, |out, n| out.push_str(&n.to_string()));
     }
-    write_text_field(out, &mut first, "multicast", group.multicast.as_deref());
+    write_text_field(
+        out,
+        &mut first,
+        "multicast",
+        group.multicast.as_deref(),
+        form,
+    );
     if let Some(parameters) = &group.parameters {
-        write_field(out, &mut first, "parameters");
-        write_sorted(out, parameters, |out, text| write_string(out, text));
+        write_field(out, &mut first, "parameters", form);
+        write_sorted(out, parameters, form, |out, text| {
+            write_string(out, text, form);
+        });
     }
-    write_text_field(out, &mut first, "invite", group.invite.as_deref());
+    write_text_field(out, &mut first, "invite", group.invite.as_deref(), form);
     out.push('}');
 }
 
-/// The document's fields in declared order, without the closing brace, with or without the
-/// signature.
-fn write_document(doc: &BeaconDocument, signature: bool) -> String {
+/// The document's fields in declared order: in the canonical form without the signature, in the
+/// served form with it.
+fn write_document(doc: &BeaconDocument, form: Form) -> String {
     let mut out = String::with_capacity(512);
     out.push('{');
     let mut first = true;
-    write_field(&mut out, &mut first, "v");
+    write_field(&mut out, &mut first, "v", form);
     out.push_str(&doc.v.to_string());
-    write_text_field(&mut out, &mut first, "issuer", doc.issuer.as_deref());
-    write_text_field(&mut out, &mut first, "issuerKey", doc.issuer_key.as_deref());
-    write_text_field(&mut out, &mut first, "issued", doc.issued.as_deref());
-    write_field(&mut out, &mut first, "ttl");
+    write_text_field(&mut out, &mut first, "issuer", doc.issuer.as_deref(), form);
+    let issuer_key = doc.issuer_key.as_deref();
+    write_text_field(&mut out, &mut first, "issuerKey", issuer_key, form);
+    write_text_field(&mut out, &mut first, "issued", doc.issued.as_deref(), form);
+    write_field(&mut out, &mut first, "ttl", form);
     out.push_str(&doc.ttl.to_string());
-    write_field(&mut out, &mut first, "groups");
+    write_field(&mut out, &mut first, "groups", form);
     out.push('[');
     for (i, group) in doc.groups.iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
-        write_group(&mut out, group);
+        write_group(&mut out, group, form);
     }
     out.push(']');
-    if signature {
-        write_text_field(&mut out, &mut first, "signature", doc.signature.as_deref());
+    if form == Form::Served {
+        let signature = doc.signature.as_deref();
+        write_text_field(&mut out, &mut first, "signature", signature, form);
     }
     out.push('}');
     out
 }
 
-/// The bytes the signature covers (Java `BeaconDocument.canonicalBytes`): every field but
-/// `signature`, in declared order (`v`, `issuer`, `issuerKey`, `issued`, `ttl`, `groups`; a
+/// The bytes the signature covers (Java `BeaconDocument.canonicalBytes`, SPEC §9.1): every field
+/// but `signature`, in declared order (`v`, `issuer`, `issuerKey`, `issued`, `ttl`, `groups`; a
 /// group's `name`, `id`, `founding`, `seeds`, `wire`, `multicast`, `parameters`, `invite`; a
-/// seed's `transport`, `address`, `priority`), null fields omitted (a seed's excepted), map keys
-/// sorted, no whitespace, strings escaped as Jackson escapes them.
+/// seed's `transport`, `address`, `priority`), null fields omitted (a seed's and a map value
+/// excepted, written `null`), map keys sorted by UTF-16 code units, no whitespace, strings
+/// escaped as Jackson escapes them, and each character past U+FFFF written as the two
+/// upper-case `\uXXXX` escapes of its UTF-16 surrogates, as Jackson's byte writer writes it.
 pub fn canonical_bytes(doc: &BeaconDocument) -> Vec<u8> {
-    write_document(doc, false).into_bytes()
+    write_document(doc, Form::Canonical).into_bytes()
 }
 
-/// The document as one line of JSON, signature last (Java `BeaconDocument.toJson`).
+/// The document as one line of JSON, signature last (Java `BeaconDocument.toJson`, SPEC §9.1):
+/// the canonical JSON a signed document must arrive as. It is written as [`canonical_bytes`]
+/// is, with the signature, and with a character past U+FFFF as its UTF-8.
 pub fn to_json(doc: &BeaconDocument) -> Vec<u8> {
-    write_document(doc, true).into_bytes()
+    write_document(doc, Form::Served).into_bytes()
 }
 
 /// Java `BeaconDocument.signed`: a document of version [`VERSION`] issued at `issued_iso` with a
@@ -778,7 +869,13 @@ mod tests {
 
     fn written(text: &str) -> String {
         let mut out = String::new();
-        write_string(&mut out, text);
+        write_string(&mut out, text, Form::Served);
+        out
+    }
+
+    fn written_canonical(text: &str) -> String {
+        let mut out = String::new();
+        write_string(&mut out, text, Form::Canonical);
         out
     }
 
@@ -794,6 +891,34 @@ mod tests {
     }
 
     #[test]
+    fn the_signed_bytes_escape_each_character_past_the_bmp_as_its_surrogates() {
+        // Jackson's byte writer (`canonicalBytes`) escapes a supplementary character as its two
+        // UTF-16 surrogates, upper-case; its string writer (`toJson`) writes it as UTF-8.
+        assert_eq!(written_canonical("ü/€😀"), r#""ü/€\uD83D\uDE00""#);
+        assert_eq!(written_canonical("\u{10FFFF}"), r#""\uDBFF\uDFFF""#);
+        assert_eq!(
+            written_canonical("\u{FFFF}\u{E000}"),
+            "\"\u{FFFF}\u{E000}\""
+        );
+        assert_eq!(
+            written_canonical("\u{1}\u{1f}\u{7f}"),
+            written("\u{1}\u{1f}\u{7f}")
+        );
+    }
+
+    #[test]
+    fn a_canonical_base64_text_is_the_padded_standard_text_of_its_bytes() {
+        assert!(canonical_base64("QQ=="));
+        assert!(canonical_base64("QUJD"));
+        assert!(canonical_base64(""));
+        assert!(!canonical_base64("QQ"), "unpadded");
+        assert!(!canonical_base64("QR=="), "other unused low bits");
+        assert!(!canonical_base64("Q\nQ=="), "a newline");
+        assert!(!canonical_base64("-_8="), "the URL-safe alphabet");
+        assert!(canonical_base64("+/8="));
+    }
+
+    #[test]
     fn map_keys_sort_by_utf16_units() {
         assert_eq!(java_order("\u{FFFD}", "\u{1F600}"), Ordering::Greater);
         assert_eq!("\u{FFFD}".cmp("\u{1F600}"), Ordering::Less);
@@ -802,7 +927,7 @@ mod tests {
             .with_wire("\u{FFFD}", 2)
             .with_wire("a", 3);
         let mut out = String::new();
-        write_group(&mut out, &group);
+        write_group(&mut out, &group, Form::Served);
         assert_eq!(
             out,
             "{\"name\":\"g\",\"seeds\":[],\"wire\":{\"a\":3,\"\u{1F600}\":1,\"\u{FFFD}\":2}}"
@@ -810,14 +935,21 @@ mod tests {
     }
 
     #[test]
-    fn numbers_are_read_as_jackson_reads_them() {
+    fn numbers_are_read_as_javas_reader_reads_them() {
+        // Java's reader turns Jackson's coercions off (SPEC §9.1): a fraction, an exponent, or
+        // numeric text fills no integer member, signed document or not.
         let read = |json: &str| int32(serde_json::from_str::<Json>(json).ok().as_ref(), "n");
         assert_eq!(read("7"), Ok(7));
-        assert_eq!(read("7.9"), Ok(7));
-        assert_eq!(read("-7.9"), Ok(-7));
-        assert_eq!(read("7e2"), Ok(700));
+        assert_eq!(read("-7"), Ok(-7));
+        assert!(read("7.9").is_err());
+        assert!(read("-7.9").is_err());
+        assert!(read("7.0").is_err());
+        assert!(read("7e2").is_err());
         assert_eq!(read("null"), Ok(0));
-        assert_eq!(read("\"12\""), Ok(12));
+        assert!(read("\"12\"").is_err());
+        assert!(read("\"\"").is_err());
+        assert_eq!(read("2147483647"), Ok(i32::MAX));
+        assert_eq!(read("-2147483648"), Ok(i32::MIN));
         assert!(read("2147483648").is_err());
         assert!(read("1e300").is_err());
         assert!(read("true").is_err());

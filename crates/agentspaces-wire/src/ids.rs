@@ -49,15 +49,22 @@ pub fn space_id_local(name: &str) -> String {
 }
 
 /// The `(peer, local name)` of an agent id, as Java `AgentId.parse` and its constructor accept
-/// it: `<peerId>/<localName>` split at the first `/`, with a non-empty peer id and a non-empty
-/// local name that holds no further `/`. `None` otherwise (`peer/`, `/name`, `peer/a/b`, no `/`).
+/// it: `<peerId>/<localName>` split at the first `/`, with a non-empty peer id and a local name
+/// [`is_local_name`] accepts. `None` otherwise (`peer/`, `/name`, `peer/a/b`, `peer/a:b`, no `/`).
 ///
 /// The text of an id this accepts is exactly what Java writes the id back as
-/// (`AgentId.encoded`), so a signature over it means the same bytes to Java. The peer id is not
-/// checked to be well-formed multibase.
+/// (`AgentId.encoded`), so a signature over it means the same bytes to Java. A record, claim,
+/// lease, or certificate naming any other text as an agent is undecodable (SPEC §9.2, R5). The
+/// peer id is not checked to be well-formed multibase.
 pub fn parse_agent_id(agent: &str) -> Option<(&str, &str)> {
     let (peer, local) = agent.split_once('/')?;
-    (!peer.is_empty() && !local.is_empty() && !local.contains('/')).then_some((peer, local))
+    (!peer.is_empty() && is_local_name(local)).then_some((peer, local))
+}
+
+/// Whether `local_name` may name an agent (Java `AgentId`, SPEC §9.2 R5): non-empty, with no
+/// `/` and no `:` (an agent stamps with its id, and a stamp's node holds no `:`).
+pub fn is_local_name(local_name: &str) -> bool {
+    !local_name.is_empty() && !local_name.contains(['/', ':'])
 }
 
 /// The bare GroupID of a join URI, as Java `GroupId.ofUri` parses it: surrounding whitespace and
@@ -104,9 +111,13 @@ mod tests {
     fn agent_ids_parse_as_java_parses_them() {
         assert_eq!(parse_agent_id("zP/a"), Some(("zP", "a")));
         assert_eq!(parse_agent_id("zP/a.b-c"), Some(("zP", "a.b-c")));
-        for bad in ["zP/", "/a", "zP/a/b", "zP", "", "/", "zP//a"] {
+        for bad in [
+            "zP/", "/a", "zP/a/b", "zP", "", "/", "zP//a", "zP/a:b", "zP/:",
+        ] {
             assert_eq!(parse_agent_id(bad), None, "{bad}");
         }
+        // SPEC §9.2 R5: a local name holds no ':' (an agent stamps with its id).
+        assert!(is_local_name("a.b-c") && !is_local_name("a:b") && !is_local_name(""));
     }
 
     #[test]

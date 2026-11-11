@@ -27,14 +27,18 @@
 //! | attested | absent or null    | absent or null              | [`encode_bare_frame`]              |
 //! | session  | absent or null    | HMAC-SHA-256 tag (32 bytes) | [`encode_session_frame`]           |
 //!
-//! [`decode_frame_detailed`] accepts each form only where it may appear: a bare frame on a
-//! connection whose transport attested exactly its sender, a session frame on the connection
-//! whose session names its sender and whose key verifies its tag, and a hello
-//! ([`HELLO_KINDS`]) only fully signed. The version check runs first, so a frame of another
-//! wire version costs no signature work.
+//! [`decode_frame_detailed`] runs the receiver's procedure of SPEC §9.1 on the frame: the item
+//! rules, the wire version (a frame of another version drops before any other work), the record
+//! rules of `WireCodec.Signed` and its `Envelope` (annex I), and the canonical-bytes check, so the
+//! envelope bytes a signature or tag covers are exactly the bytes that arrived. A stamp that is
+//! not a canonical stamp in its one CBOR form makes the frame undecodable before any signature
+//! check. It then accepts each form only where it may appear: a bare frame on a connection whose
+//! transport attested exactly its sender, a session frame on the connection whose session names
+//! its sender and whose key verifies its tag, and a hello ([`HELLO_KINDS`]) only fully signed.
 //!
-//! [`FrameFilter`] then admits each verified frame once and fresh, and [`accepts`] is the reader
-//! filter on group and destination.
+//! [`FrameFilter`] then judges each verified frame's stamp in the order of SPEC §9 (v0.1.30):
+//! stale, replayed, past the far-future ceiling (within the skew margin or beyond it), and a
+//! counter above the logical limit. [`accepts`] is the reader filter on group and destination.
 #![warn(missing_docs)]
 
 use std::collections::{HashSet, VecDeque};
@@ -45,8 +49,10 @@ use crate::hlc;
 use crate::identity::Identity;
 use crate::ids;
 use crate::limits::{
-    FRAME_FILTER_CAPACITY, MAX_FRAME_AGE_MILLIS, MAX_HLC_SKEW_MILLIS, WIRE_VERSION,
+    FRAME_FILTER_CAPACITY, MAX_FRAME_AGE_MILLIS, MAX_HLC_SKEW_MILLIS, SKEW_MARGIN_MILLIS,
+    WIRE_VERSION,
 };
+use crate::schema;
 use crate::session::{self, HELLO_KINDS, MAC_LENGTH};
 use crate::util::{encode_map, encode_map_into, non_null};
 
@@ -105,49 +111,21 @@ pub fn encode_session_frame(env: &Map, key: &[u8; MAC_LENGTH]) -> Vec<u8> {
     session::session_frame(&encode_map(env), key)
 }
 
-/// `WireCodec.encodeBare`: the frame `{envelope}` with no key and no signature, what a node sends
-/// on a connection whose transport attested it, toward a peer that announced it accepts bare
-/// frames there (`CHANNEL_HELLO`). A hello never travels this way.
+/// `WireCodec.encodeBare`: the frame `{envelope, senderPublicKey: null, signature: null}` with no
+/// key and no signature (both written null: the wrapper's fields are always present, SPEC §9.1
+/// P1), what a node sends on a connection whose transport attested it, toward a peer that
+/// announced it accepts bare frames there (`CHANNEL_HELLO`). A hello never travels this way.
 pub fn encode_bare_frame(env: &Map) -> Vec<u8> {
     let mut frame = Vec::new();
     frame.push(0xBF);
     cbor::encode_into(&Value::from("envelope"), &mut frame);
     encode_map_into(env, &mut frame);
+    cbor::encode_into(&Value::from("senderPublicKey"), &mut frame);
+    cbor::encode_into(&Value::Null, &mut frame);
+    cbor::encode_into(&Value::from("signature"), &mut frame);
+    cbor::encode_into(&Value::Null, &mut frame);
     frame.push(0xFF);
     frame
-}
-
-/// The fields of an envelope, in Java record order.
-const ENVELOPE_FIELDS: [&str; 7] = ["ver", "group", "kind", "from", "to", "stamp", "body"];
-
-/// Whether a received envelope is exactly what Java writes back for the `Envelope` it decodes
-/// from it, so a signature or session tag over its CBOR here covers the bytes Java verifies
-/// (`WireCodec.decodeDetailed` verifies `codec.toBytes(envelope)`): the seven fields of
-/// [`envelope`] in order and nothing else, a non-empty text `group`, `kind`, and `from`, a `to`
-/// that is null or non-empty text, a `stamp` in canonical form ([`hlc::Stamp::parse_canonical`]),
-/// and a byte-string `body`. `ver` is checked before this. The kind is not checked against
-/// [`crate::bodies::FRAME_KINDS`]: the layer above ignores and counts an unknown one.
-fn is_canonical_envelope(env: &Map) -> bool {
-    let non_empty = |name: &str| {
-        env.get(name)
-            .and_then(Value::as_str)
-            .is_some_and(|text| !text.is_empty())
-    };
-    let to_ok = match env.get("to") {
-        Some(Value::Null) => true,
-        _ => non_empty("to"),
-    };
-    env.len() == ENVELOPE_FIELDS.len()
-        && env
-            .keys()
-            .zip(ENVELOPE_FIELDS)
-            .all(|(key, name)| key.as_str() == Some(name))
-        && non_empty("group")
-        && non_empty("kind")
-        && non_empty("from")
-        && to_ok
-        && hlc::Stamp::canonical_of(env.get("stamp")).is_some()
-        && env.get("body").and_then(Value::as_bytes).is_some()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -181,12 +159,12 @@ impl Auth {
 /// session frames are refused: this is [`decode_frame_detailed`] on a connection with neither an
 /// attested peer nor a session.
 ///
-/// The checks, in order: the frame is a map whose `envelope` is a map; the envelope's `ver` is
-/// the integer [`WIRE_VERSION`] (before any signature work, SPEC §9); `senderPublicKey` is 32
-/// bytes that hash to the envelope's `from`; the envelope is already the form Java writes it back
-/// as (its seven fields in order, a canonical stamp, a null or non-empty `to`), since Java
-/// verifies over that re-encoding; the Ed25519 `signature` verifies over the envelope's CBOR.
-/// Never panics.
+/// The checks, in order: the frame is one item in the wire encoding (S1 to S12) whose `envelope`
+/// is a map; the envelope's `ver` is the integer [`WIRE_VERSION`] (SPEC §9); the frame is a
+/// `WireCodec.Signed` record and its envelope an `Envelope` record under rules P1 to P4 (a
+/// canonical stamp, a known kind, the seven fields in order and no other); re-encoding the frame
+/// gives back exactly its bytes (F3); `senderPublicKey` is 32 bytes that hash to the envelope's
+/// `from`; the Ed25519 `signature` verifies over the envelope's CBOR. Never panics.
 pub fn decode_frame(frame: &[u8]) -> Option<Map> {
     decode_frame_detailed(frame, None, None).map(|(env, _)| env)
 }
@@ -201,22 +179,26 @@ pub fn decode_frame(frame: &[u8]) -> Option<Map> {
 ///   key over the envelope's canonical re-encoding.
 /// - A hello (`SESSION_HELLO`, `CHANNEL_HELLO`) is accepted only fully signed.
 ///
-/// An absent key or signature and a null one are alike. The version check runs before any other
-/// judgment. A signed or session frame's envelope must already be in the form Java writes back
-/// (seven fields in order, a canonical stamp, a null or non-empty `to`): Java verifies the
-/// signature or tag over its re-encoding, so an envelope in another form would cover other bytes
-/// there. A bare frame carries no signature, so its envelope's form is not judged. Every
-/// malformed or hostile input is `None`, never a panic.
+/// The wrapper's key and signature are written null where absent, as every field of the record
+/// is (SPEC §9.1 P1); a frame that omits either does not decode. The version check runs right
+/// after the item rules, then the record rules and the canonical-bytes check (SPEC §9.1, the
+/// receiver's procedure), so the envelope bytes a signature or tag covers are the bytes that
+/// arrived. Every malformed or hostile input is `None`, never a panic.
 pub fn decode_frame_detailed(
     frame: &[u8],
     attested: Option<&str>,
     session: Option<(&str, &[u8; MAC_LENGTH])>,
 ) -> Option<(Map, Auth)> {
-    let mut signed = cbor::decode(frame).ok()?.into_map()?;
-    let env = signed.remove("envelope")?.into_map()?;
-    if env.get("ver") != Some(&Value::Int(i128::from(WIRE_VERSION))) {
+    let decoded = cbor::decode(frame).ok()?;
+    let version = decoded.get("envelope").and_then(|env| env.get("ver"));
+    if version != Some(&Value::Int(i128::from(WIRE_VERSION))) {
         return None;
     }
+    if !schema::conforms(&decoded, "WireCodec.Signed") || cbor::encode(&decoded) != frame {
+        return None;
+    }
+    let mut signed = decoded.into_map()?;
+    let env = signed.remove("envelope")?.into_map()?;
     let key = non_null(signed.get("senderPublicKey"));
     let signature = non_null(signed.get("signature"));
     let from = env.get("from").and_then(Value::as_str);
@@ -232,11 +214,7 @@ pub fn decode_frame_detailed(
         (None, Some(tag)) => {
             let (peer, session_key) = session?;
             let tag = tag.as_bytes()?;
-            if hello
-                || Some(peer) != from
-                || tag.len() != MAC_LENGTH
-                || !is_canonical_envelope(&env)
-            {
+            if hello || Some(peer) != from || tag.len() != MAC_LENGTH {
                 return None;
             }
             session::verify_session_tag(&encode_map(&env), tag, session_key)
@@ -244,7 +222,7 @@ pub fn decode_frame_detailed(
         }
         (Some(key), signature) => {
             let key = key.as_bytes().filter(|key| key.len() == KEY_LENGTH)?;
-            if Some(ids::derive_id(key).as_str()) != from || !is_canonical_envelope(&env) {
+            if Some(ids::derive_id(key).as_str()) != from {
                 return None;
             }
             let signature = signature.and_then(Value::as_bytes).unwrap_or_default();
@@ -266,22 +244,35 @@ pub fn accepts(env: &Map, group: &str, own_peer_id: &str) -> bool {
     for_group && for_us
 }
 
-/// The physical milliseconds of an envelope's HLC stamp: the text before the first `:` read as a
-/// signed decimal `i64` (Java `Long.parseLong`: an optional sign, then ASCII digits), or `None`
-/// when the stamp is not text or that part is not such a number ([`hlc::physical_lenient`], the
-/// Java frame filter's rules, looser than [`hlc::Stamp::parse`]).
+/// The physical milliseconds of an envelope's HLC stamp, or `None` when the stamp is not a
+/// canonical stamp ([`hlc::Stamp::parse`]); a decoded frame's always is.
 pub fn stamp_physical(env: &Map) -> Option<i64> {
-    hlc::physical_lenient(env.get("stamp")?.as_str()?)
+    hlc::Stamp::of(env.get("stamp")).map(|stamp| stamp.physical)
 }
 
 // ---------------------------------------------------------------------------------------------
 // The frame filter
 
-/// Admits each verified frame once, fresh (SPEC §9's frame-age window and replay filter; the
-/// Java node's `isStaleOrReplay`): a stamp older than [`MAX_FRAME_AGE_MILLIS`] is stale, one
-/// further ahead than [`MAX_HLC_SKEW_MILLIS`] is refused, and a `(from, stamp)` pair seen before
-/// is a replay. All three are dropped silently and counted: late, duplicated, and replayed frames
-/// are the normal case on a network, not evidence of anything.
+/// Admits each verified frame once, fresh, and within the stamp bounds (SPEC §9, the frame
+/// filters of v0.1.30; the Java node's `isStaleOrReplay` and its stamp checks), judging the
+/// stamp in the order every implementation shares, each against the caller's wall time:
+///
+/// 1. *stale*: the stamp's physical part trails the wall by more than [`MAX_FRAME_AGE_MILLIS`];
+/// 2. *replayed*: a `(from, stamp)` pair the filter holds (an admitted or later-judged pair is
+///    remembered);
+/// 3. *far-future, skewed*: past `wall + MAX_DRIFT` by at most [`SKEW_MARGIN_MILLIS`], which an
+///    honest peer a hostile member dragged to its ceiling can reach when the receiver's wall
+///    trails the sender's;
+/// 4. *far-future*: further past the ceiling than the margin;
+/// 5. *logical refused*: a counter above [`crate::limits::LOGICAL_LIMIT`]
+///    ([`hlc::Stamp::is_acceptable`]).
+///
+/// Each drop is counted under its own counter (Java's `framesStale`, `framesReplayed`,
+/// `framesFarFutureSkewed`, `framesFarFuture`, `framesLogicalRefused`). Anyone can replay a
+/// signed frame, so the first two strike nobody where a peer keeps strikes; the later three
+/// judge a fresh frame only its sender could have signed (this peer keeps no strikes, so it
+/// counts them alone). A stamp that is no canonical stamp never reaches the filter: its frame
+/// does not decode.
 ///
 /// The filter remembers at most `capacity` pairs and forgets the oldest first. It holds no clock:
 /// the caller passes its own time to [`FrameFilter::admit`].
@@ -291,8 +282,10 @@ pub struct FrameFilter {
     order: VecDeque<(String, String)>,
     capacity: usize,
     stale: u64,
-    ahead: u64,
     replayed: u64,
+    far_future_skewed: u64,
+    far_future: u64,
+    logical_refused: u64,
 }
 
 impl Default for FrameFilter {
@@ -315,38 +308,33 @@ impl FrameFilter {
             order: VecDeque::new(),
             capacity,
             stale: 0,
-            ahead: 0,
             replayed: 0,
+            far_future_skewed: 0,
+            far_future: 0,
+            logical_refused: 0,
         }
     }
 
-    /// Whether to handle a verified envelope received at `now_ms` on the caller's clock.
-    ///
-    /// An envelope whose stamp has no readable physical time ([`stamp_physical`]) or whose
-    /// `from` is not text is refused without being counted (a verified frame always has both).
-    /// Otherwise a stale stamp counts in [`FrameFilter::stale`], a stamp too far ahead in
-    /// [`FrameFilter::ahead`], and a repeated `(from, stamp)` in [`FrameFilter::replayed`]; an
-    /// admitted pair is remembered. The arithmetic is exact, so a hostile stamp cannot overflow.
+    /// Whether to handle a verified envelope received at `now_ms` on the caller's clock, judged in
+    /// the order of the type's documentation. An envelope whose stamp is not a canonical stamp, or
+    /// whose `from` is not text, is refused without being counted (a decoded frame always has
+    /// both). The arithmetic is exact, so a hostile stamp cannot overflow.
     pub fn admit(&mut self, env: &Map, now_ms: i64) -> bool {
-        let Some(physical) = stamp_physical(env) else {
-            return false;
-        };
-        let (Some(from), Some(stamp)) = (
+        let (Some(from), Some(text)) = (
             env.get("from").and_then(Value::as_str),
             env.get("stamp").and_then(Value::as_str),
         ) else {
             return false;
         };
-        let (now, physical) = (i128::from(now_ms), i128::from(physical));
+        let Some(stamp) = hlc::Stamp::parse(text) else {
+            return false;
+        };
+        let (now, physical) = (i128::from(now_ms), i128::from(stamp.physical));
         if now - physical > i128::from(MAX_FRAME_AGE_MILLIS) {
             self.stale = self.stale.saturating_add(1);
             return false;
         }
-        if physical - now > i128::from(MAX_HLC_SKEW_MILLIS) {
-            self.ahead = self.ahead.saturating_add(1);
-            return false;
-        }
-        let key = (from.to_owned(), stamp.to_owned());
+        let key = (from.to_owned(), text.to_owned());
         if self.seen.contains(&key) {
             self.replayed = self.replayed.saturating_add(1);
             return false;
@@ -358,6 +346,19 @@ impl FrameFilter {
                 self.seen.remove(&oldest);
             }
         }
+        let ahead = physical - now - i128::from(MAX_HLC_SKEW_MILLIS);
+        if ahead > i128::from(SKEW_MARGIN_MILLIS) {
+            self.far_future = self.far_future.saturating_add(1);
+            return false;
+        }
+        if ahead > 0 {
+            self.far_future_skewed = self.far_future_skewed.saturating_add(1);
+            return false;
+        }
+        if !stamp.is_acceptable() {
+            self.logical_refused = self.logical_refused.saturating_add(1);
+            return false;
+        }
         true
     }
 
@@ -366,9 +367,28 @@ impl FrameFilter {
         self.stale
     }
 
-    /// How many frames were dropped as further ahead than [`MAX_HLC_SKEW_MILLIS`].
+    /// How many frames were dropped as past the far-future ceiling, skewed or not:
+    /// [`FrameFilter::far_future_skewed`] plus [`FrameFilter::far_future`].
     pub fn ahead(&self) -> u64 {
-        self.ahead
+        self.far_future_skewed.saturating_add(self.far_future)
+    }
+
+    /// How many frames were dropped as past `wall + MAX_DRIFT` by at most
+    /// [`SKEW_MARGIN_MILLIS`] (`framesFarFutureSkewed`).
+    pub fn far_future_skewed(&self) -> u64 {
+        self.far_future_skewed
+    }
+
+    /// How many frames were dropped as past `wall + MAX_DRIFT` by more than
+    /// [`SKEW_MARGIN_MILLIS`] (`framesFarFuture`).
+    pub fn far_future(&self) -> u64 {
+        self.far_future
+    }
+
+    /// How many frames were dropped for a logical counter above
+    /// [`crate::limits::LOGICAL_LIMIT`] (`framesLogicalRefused`).
+    pub fn logical_refused(&self) -> u64 {
+        self.logical_refused
     }
 
     /// How many frames were dropped as replays of a remembered `(from, stamp)` pair.

@@ -17,10 +17,13 @@
 //!
 //! This crate drives the protocol core with real I/O: transports ([`transport`]: `tcp`, `tls`
 //! with [`channel_cert`] attestation, and an in-memory network for tests), the keystore
-//! ([`keystore`]), configuration ([`config`]), and the [`peer`], a dial-only fleet member that
-//! joins a group through a seed, answers membership probes, folds replicated state, verifies
-//! every signature, and reconnects after a lost link. The Python and Ruby peers are its
-//! behavioural references; the Java node is the authority.
+//! ([`keystore`]), configuration ([`config`]), and the [`peer`]: a fleet member that joins a group
+//! through a seed, answers membership probes, folds replicated state, verifies every signature,
+//! and reconnects after a lost link, and that, started with listeners, is a listening member
+//! other peers link to (admission, gossip forwarding, the anti-entropy server, relaying, and
+//! founding a group with [`group::found_or_load`]), so Rust peers form a group of their own. The
+//! Python and Ruby peers are the dial-only role's behavioural references; the Java node is the
+//! authority.
 //!
 //! Over the peer sit the Space API ([`space`]: leased writes, reads, exclusive takes and their
 //! completion, and watches, with [`blocking`] mirroring it for code without an async runtime)
@@ -81,7 +84,10 @@
 //!
 //! [`Fleet::join_config`](space::Fleet::join_config) joins with a fleet file read explicitly
 //! (`Fleet::join_config(&Config::load("fleet.yaml")?)`); [`config::PeerSettings`] and
-//! [`peer::PeerConfig`] build the same peer in code.
+//! [`peer::PeerConfig`] build the same peer in code. A listening peer (a seed, as `aspace seed`
+//! runs one) resolves its configuration with [`config::Overrides::listening`]: no seed is
+//! required, and its listeners come from `--listen`, `ASPACE_LISTEN`, or the fleet file's `bind`
+//! ([`config`]'s Listening section).
 //!
 //! # Agents, remote actions, and the catalogue
 //!

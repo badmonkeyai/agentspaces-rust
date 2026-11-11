@@ -993,6 +993,68 @@ pub fn judge_delegated_credential(
     }
 }
 
+/// Java `JoinCredentials.issue`: the founder-issued credential for `candidate` in `group`, the
+/// founder's signature over the [`credential_view`] wrapped with its raw key as the CBOR
+/// `{founderKey, signature}` in base64. It has no expiry; only a `JOIN_CREDENTIAL` revocation of
+/// its hash ([`credential_hash`]) refuses it.
+pub fn issue_credential(founder: &Identity, group: &str, candidate: &str) -> String {
+    let view = encode_map(&credential_view(candidate, group));
+    let mut credential = Map::with_capacity(2);
+    credential.insert("founderKey", founder.public_raw().as_slice());
+    credential.insert("signature", founder.sign(&view).as_slice());
+    base64_encode(&encode_map(&credential))
+}
+
+/// Java `JoinCredentials.judge` for either form of an `aspace:join` credential, with public data
+/// only: a `d1:` credential by [`judge_delegated_credential`] once its bytes decode as
+/// `JoinCredentials.DelegatedCredential` under the wire encoding (Java reads it with
+/// `fromWire`); otherwise a founder-issued one, which is [`JoinVerdict::Valid`] when it decodes
+/// as `JoinCredentials.Credential` under the wire encoding, its 32-byte key hashes to the
+/// founding's issuer, and that key's signature verifies over `(candidate, group)`, and
+/// [`JoinVerdict::Invalid`] otherwise. Revocation is the caller's (the hash of the credential,
+/// and of a delegated one's delegation). Since the hash a revocation names is that of the
+/// credential's bytes, a credential is judged only in the one encoding of its fields: the same
+/// fields in another shape (reordered, padded with another field) would hash differently and
+/// dodge the revocation of the credential issued.
+pub fn judge_credential(
+    credential: &str,
+    candidate: &str,
+    group_ad_issuer: &str,
+    group_id: &str,
+    now_ms: i64,
+) -> JoinVerdict {
+    let trimmed = trim_pasted(credential);
+    if let Some(encoded) = trimmed.strip_prefix(DELEGATED_PREFIX) {
+        let canonical = base64_decode(encoded).is_some_and(|bytes| {
+            crate::schema::decode(&bytes, "JoinCredentials.DelegatedCredential").is_some()
+        });
+        if !canonical {
+            return JoinVerdict::Invalid;
+        }
+        return judge_delegated_credential(trimmed, candidate, group_ad_issuer, group_id, now_ms);
+    }
+    let Some(decoded) = base64_decode(trimmed)
+        .and_then(|bytes| crate::schema::decode_map(&bytes, "JoinCredentials.Credential"))
+    else {
+        return JoinVerdict::Invalid;
+    };
+    let (Some(key), Some(signature)) = (
+        decoded.get("founderKey").and_then(Value::as_bytes),
+        decoded.get("signature").and_then(Value::as_bytes),
+    ) else {
+        return JoinVerdict::Invalid;
+    };
+    if key.len() != KEY_LENGTH || ids::derive_id(key) != group_ad_issuer {
+        return JoinVerdict::Invalid;
+    }
+    let view = encode_map(&credential_view(candidate, group_id));
+    if Identity::verify(key, &view, signature) {
+        JoinVerdict::Valid
+    } else {
+        JoinVerdict::Invalid
+    }
+}
+
 /// Java `SocialGroups.hintsFor`: the resource hints a holder of `key` presents, the delegated
 /// credential for `self_peer_id` under [`HINT_KEY`].
 pub fn hints_for(

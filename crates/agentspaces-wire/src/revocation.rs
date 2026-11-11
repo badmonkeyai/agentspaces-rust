@@ -37,7 +37,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::cbor::{self, Map, Value};
+use crate::cbor::{Map, Value};
 use crate::crypto::{self, KEY_LENGTH};
 use crate::filters::java_whitespace;
 use crate::identity::Identity;
@@ -203,6 +203,35 @@ fn reason_of(ad: &Map) -> Option<&str> {
     }
 }
 
+/// A peer's `RevocationAdvertisement` in Java record order (`id` =
+/// `aspace://<group>/revocation/<revoked>`, `issuer`, `group`, `issued`, `ttl`, `revoked`,
+/// `reason`, `successor`, written null when `None`): every field the record writes, so it decodes
+/// under the wire encoding (SPEC §9.1, annex I). The instants and the lifetime are `java.time`
+/// text and are not checked here; only the founder's verifies on [`PEER_STREAM`].
+pub fn peer_revocation(
+    issuer: &str,
+    group: &str,
+    issued_iso: &str,
+    ttl_iso: &str,
+    revoked: &str,
+    reason: &str,
+    successor: Option<&str>,
+) -> Map {
+    let mut ad = Map::with_capacity(8);
+    ad.insert(
+        "id",
+        format!("{}{group}/revocation/{revoked}", ids::URI_PREFIX),
+    );
+    ad.insert("issuer", issuer);
+    ad.insert("group", group);
+    ad.insert("issued", issued_iso);
+    ad.insert("ttl", ttl_iso);
+    ad.insert("revoked", revoked);
+    ad.insert("reason", reason);
+    ad.insert("successor", successor);
+    ad
+}
+
 /// A `CredentialRevocation` in Java record order (`id`, `issuer`, `group`, `issued`, `ttl`,
 /// `target`, `reason`, then `effectiveFrom` only when given), with the canonical id. A blank
 /// reason (Java `String.isBlank`) reads as `unspecified`, as Java's constructor reads it. `None`
@@ -281,6 +310,9 @@ pub struct HeldRevocation {
     pub compromise: bool,
     /// The decoded advertisement.
     pub ad: Map,
+    /// The `SignedRevocation` it arrived as (`{adBytes, publicKey, signature}`): what a serving
+    /// node hands a partner whose digest lacks it.
+    pub signed: Map,
 }
 
 impl HeldRevocation {
@@ -360,11 +392,12 @@ impl Registry {
     }
 
     /// Verifies and accepts one rumor payload of `stream` (the CBOR of a `SignedRevocation`);
-    /// returns whether it newly revoked its target. Bytes that do not decode are refused.
+    /// returns whether it newly revoked its target. Bytes that do not decode as a
+    /// `RevocationRegistry.SignedRevocation` under the wire encoding (SPEC §9.1) are refused.
     pub fn accept(&mut self, stream: &str, payload: &[u8], now_ms: i64) -> bool {
-        match cbor::decode(payload) {
-            Ok(signed) => self.accept_signed(stream, &signed, now_ms),
-            Err(_) => false,
+        match crate::schema::decode(payload, "RevocationRegistry.SignedRevocation") {
+            Some(signed) => self.accept_signed(stream, &signed, now_ms),
+            None => false,
         }
     }
 
@@ -372,8 +405,11 @@ impl Registry {
     /// returns whether it newly revoked its target (a record that outranks a kept one replaces
     /// it but returns `false`).
     ///
-    /// The checks, all of which must pass: the advertisement decodes to a map whose `issuer` is
-    /// the PeerID of the carried 32-byte key; the signature verifies under that key over
+    /// The checks, all of which must pass: `signed` is a `SignedRevocation` record and its
+    /// `adBytes` decode under the wire encoding as the stream's record, a
+    /// `RevocationAdvertisement` on [`PEER_STREAM`] or a `CredentialRevocation` on
+    /// [`CREDENTIAL_STREAM`] (SPEC §9.1, annex I), whose `issuer` is the PeerID of the carried
+    /// 32-byte key; the signature verifies under that key over
     /// `adBytes`; `issued` parses and lies no more than [`MAX_ISSUED_SKEW_MILLIS`] past
     /// `now_ms`; the `group` is the registry's (when set); and the stream's own rule holds. On
     /// [`PEER_STREAM`] only the founder revokes a peer. On [`CREDENTIAL_STREAM`] the target is
@@ -383,6 +419,9 @@ impl Registry {
     /// founder or, for an agent or agent key, the agent's own peer.
     pub fn accept_signed(&mut self, stream: &str, signed: &Value, now_ms: i64) -> bool {
         if !STREAMS.contains(&stream) {
+            return false;
+        }
+        if !crate::schema::conforms(signed, "RevocationRegistry.SignedRevocation") {
             return false;
         }
         let Some(signed) = signed.as_map() else {
@@ -397,7 +436,12 @@ impl Registry {
         if key.len() != KEY_LENGTH {
             return false;
         }
-        let Ok(Value::Map(ad)) = cbor::decode(ad_bytes) else {
+        let record = if stream == PEER_STREAM {
+            "RevocationAdvertisement"
+        } else {
+            "CredentialRevocation"
+        };
+        let Some(ad) = crate::schema::decode_map(ad_bytes, record) else {
             return false;
         };
         let Some(issued_ms) = ad
@@ -420,14 +464,15 @@ impl Registry {
             return false;
         }
         let digest = crypto::port().sha256(ad_bytes);
+        let signed = signed.clone();
         if stream == PEER_STREAM {
-            self.accept_peer(ad, issued_ms, digest)
+            self.accept_peer(ad, issued_ms, digest, signed)
         } else {
-            self.accept_credential(ad, issued_ms, digest)
+            self.accept_credential(ad, issued_ms, digest, signed)
         }
     }
 
-    fn accept_peer(&mut self, ad: Map, issued_ms: i64, digest: [u8; 32]) -> bool {
+    fn accept_peer(&mut self, ad: Map, issued_ms: i64, digest: [u8; 32], signed: Map) -> bool {
         // Founder-rooted only: a CA-rooted record (evidence) is not trusted here, and only the
         // founder may name a successor.
         let Some(founder) = self.founder.as_deref() else {
@@ -446,11 +491,18 @@ impl Registry {
             effective_ms: issued_ms,
             compromise: ad.get("reason").and_then(Value::as_str) == Some(KEY_COMPROMISE),
             ad,
+            signed,
         };
         keep(&mut self.peers, revoked, held)
     }
 
-    fn accept_credential(&mut self, ad: Map, issued_ms: i64, digest: [u8; 32]) -> bool {
+    fn accept_credential(
+        &mut self,
+        ad: Map,
+        issued_ms: i64,
+        digest: [u8; 32],
+        signed: Map,
+    ) -> bool {
         let Some(target) = ad.get("target").and_then(Value::as_map) else {
             return false;
         };
@@ -511,6 +563,7 @@ impl Registry {
             effective_ms,
             compromise: reason == Some(KEY_COMPROMISE),
             ad,
+            signed,
         };
         keep(&mut self.credentials, key, held)
     }
@@ -518,6 +571,14 @@ impl Registry {
     /// Whether the peer is revoked.
     pub fn peer_revoked(&self, peer_id: &str) -> bool {
         self.peers.contains_key(peer_id)
+    }
+
+    /// Whether a `JOIN_CREDENTIAL` revocation names `hash`: the hash of a join credential
+    /// ([`crate::social::credential_hash`]) or of a delegation
+    /// ([`crate::social::delegation_hash`]), which refuses every credential issued under it.
+    pub fn join_credential_revoked(&self, hash: &[u8; DIGEST_LENGTH]) -> bool {
+        self.credentials
+            .contains_key(&format!("JOIN_CREDENTIAL:{}", hex_lower(hash)))
     }
 
     /// Java `RevocationView.refuses`: whether a newly arriving signature by `agent_id` is
@@ -588,6 +649,7 @@ mod tests {
             effective_ms: issued_ms,
             compromise: false,
             ad: Map::new(),
+            signed: Map::new(),
         }
     }
 

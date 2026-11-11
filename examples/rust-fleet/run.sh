@@ -27,7 +27,7 @@
 #   rust-worker    the Rust worker, this example's binary.
 #   script-worker  `aspace work`, running research.sh once per task.
 #   coordinator    example 02's ResearchFleet, run from the installed example-02-research-fleet
-#                  0.5.0 jar. It publishes TASKS ResearchTasks (6 by default), prints the
+#                  0.6.0 jar. It publishes TASKS ResearchTasks (6 by default), prints the
 #                  Findings and a tally, and leaves.
 #   aspace cards   lists the fleet's offerings.
 #   aspace call    writes a ResearchTask for the topic "rust" through the fleet catalogue and
@@ -125,7 +125,7 @@ mvn_offline() {
     local dir=$1 what=$2
     shift 2
     if ! (cd "$dir" && mvn -q -o "$@"); then
-        echo "run.sh: cannot $what offline in $dir; the AgentSpaces 0.5.0 artifacts (example" \
+        echo "run.sh: cannot $what offline in $dir; the AgentSpaces 0.6.0 artifacts (example" \
             "02's included) must be installed in ~/.m2" >&2
         exit 1
     fi

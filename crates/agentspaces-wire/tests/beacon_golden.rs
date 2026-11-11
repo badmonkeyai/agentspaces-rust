@@ -15,9 +15,10 @@
 
 //! The beacon document (`test_beacon.py` without the HTTP server): the canonical bytes are
 //! Jackson's, a document Java signed verifies and its canonical bytes and JSON are reproduced
-//! exactly, a tampered signature, body, or issuer is refused, a pinned beacon is honoured,
-//! groups are selected and their foundings verified, and seeds of schemes the client cannot
-//! dial are skipped.
+//! exactly, a signed document arrives as exactly its canonical JSON (SPEC §9.1), a tampered
+//! signature, body, or issuer is refused, a pinned beacon is honoured, groups are selected and
+//! their foundings verified, seeds of schemes the client cannot dial are skipped, and every
+//! beacon vector of annex I gets its verdict.
 
 mod common;
 
@@ -124,18 +125,26 @@ fn canonical_bytes_are_jacksons() {
     );
     assert_eq!(String::from_utf8(canonical_bytes(&doc)).unwrap(), expected);
 
-    // Unknown fields and pretty whitespace do not change the signed bytes.
+    // A signed document arrives as exactly its canonical JSON (SPEC §9.1): unknown fields and
+    // pretty whitespace refuse it rather than relabel it. Unsigned, the same form reads, and the
+    // unknown fields and whitespace change nothing it would sign.
     let mut json: serde_json::Value = serde_json::from_slice(&to_json(&doc)).unwrap();
     json["extra"] = serde_json::json!(1);
     json["groups"][0]["unknown"] = serde_json::json!("x");
     json["groups"][0]["seeds"][0]["weight"] = serde_json::json!(5);
+    assert_eq!(
+        BeaconDocument::parse(&serde_json::to_vec_pretty(&json).unwrap()),
+        Err(BeaconError::NotCanonical)
+    );
+    json.as_object_mut().unwrap().remove("signature");
     let reparsed = BeaconDocument::parse(&serde_json::to_vec_pretty(&json).unwrap()).unwrap();
     assert_eq!(canonical_bytes(&reparsed), canonical_bytes(&doc));
+    assert_eq!(verify_document(&reparsed, None), Ok(None));
+    assert_eq!(BeaconDocument::parse(&to_json(&doc)), Ok(doc.clone()));
     assert_eq!(
-        verify_document(&reparsed, Some(issuer.peer_id())),
+        verify_document(&doc, Some(issuer.peer_id())),
         Ok(Some(issuer.peer_id().to_owned()))
     );
-    assert_eq!(BeaconDocument::parse(&to_json(&doc)), Ok(doc.clone()));
 
     // A document never carries a secret.
     for name in ["content-key", "Content-Key", "SECRET", "join-credential"] {
@@ -145,7 +154,7 @@ fn canonical_bytes_are_jacksons() {
         );
     }
     let mut smuggled = Group::new("g");
-    smuggled.parameters = Some([("hints".to_owned(), "x".to_owned())].into());
+    smuggled.parameters = Some([("hints".to_owned(), Some("x".to_owned()))].into());
     assert_eq!(
         sign_document(&issuer, ISSUED, 300, vec![smuggled]),
         Err(BeaconError::ForbiddenParameter("hints".to_owned()))
@@ -178,8 +187,8 @@ fn a_document_java_signed_verifies_and_its_canonical_bytes_are_reproduced() {
         JAVA_SIGNED_DOCUMENT
     );
     assert_eq!(
-        doc.groups[0].parameters.as_ref().unwrap()["a"],
-        "ü \"q\" \u{1}"
+        doc.groups[0].parameters.as_ref().unwrap()["a"].as_deref(),
+        Some("ü \"q\" \u{1}")
     );
     // The same document re-signed by this issuer carries Java's signature exactly.
     let resigned = sign_document(
@@ -191,9 +200,18 @@ fn a_document_java_signed_verifies_and_its_canonical_bytes_are_reproduced() {
     .unwrap();
     assert_eq!(resigned.signature, doc.signature);
     assert_eq!(resigned, doc);
-    // A byte order mark before the JSON is skipped, as Jackson skips it.
+    // A byte order mark before a signed document makes its bytes another form than its
+    // canonical JSON, which refuses it (SPEC §9.1); before an unsigned one it is skipped, as
+    // Jackson skips it.
     let with_bom = [b"\xEF\xBB\xBF".as_slice(), JAVA_SIGNED_DOCUMENT.as_bytes()].concat();
-    assert_eq!(BeaconDocument::parse(&with_bom), Ok(doc));
+    assert_eq!(
+        BeaconDocument::parse(&with_bom),
+        Err(BeaconError::NotCanonical)
+    );
+    let mut unsigned = doc.clone();
+    unsigned.signature = None;
+    let unsigned_with_bom = [b"\xEF\xBB\xBF".as_slice(), &to_json(&unsigned)].concat();
+    assert_eq!(BeaconDocument::parse(&unsigned_with_bom), Ok(unsigned));
 }
 
 #[test]
@@ -222,7 +240,6 @@ fn a_tampered_signature_or_body_is_refused() {
         ("signature", bad_signature),
         ("body", bad_body),
         ("issuer", wrong_issuer),
-        ("not base64", not_base64),
         ("short key", short_key),
         ("empty signature", empty_signature),
     ] {
@@ -235,6 +252,17 @@ fn a_tampered_signature_or_body_is_refused() {
         );
         assert_eq!(document_signer(&fetched), None, "{name}");
     }
+    // A signature that is no base64 at all fails verification, and through the wire form it is
+    // no padded standard base64 text, which refuses the document before any verification.
+    assert_eq!(
+        verify_document(&not_base64, None),
+        Err(BeaconError::BadSignature)
+    );
+    assert_eq!(document_signer(&not_base64), None);
+    assert_eq!(
+        BeaconDocument::parse(&to_json(&not_base64)),
+        Err(BeaconError::NotCanonical)
+    );
 }
 
 #[test]
@@ -457,7 +485,7 @@ fn seeds_sort_by_priority_and_default_to_tcp() {
 }
 
 #[test]
-fn malformed_documents_are_refused_and_lenient_numbers_read_as_jackson_reads_them() {
+fn malformed_documents_are_refused_and_numbers_read_as_javas_reader_reads_them() {
     let parse = |text: &str| BeaconDocument::parse(text.as_bytes());
     let too_big = format!("[{}1]", "1,".repeat(MAX_DOCUMENT_BYTES / 2));
     assert_eq!(
@@ -478,7 +506,6 @@ fn malformed_documents_are_refused_and_lenient_numbers_read_as_jackson_reads_the
         r#"{"v":1,"groups":[{"name":"g","seeds":[null]}]}"#,
         r#"{"v":1,"groups":[{"name":"g","seeds":[{"priority":true}]}]}"#,
         r#"{"v":1,"groups":[{"name":"g","seeds":[{"address":7500}]}]}"#,
-        r#"{"v":1,"groups":[{"name":"g","wire":{"session":null}}]}"#,
         r#"{"v":1,"groups":[{"name":"g","wire":{"session":2147483648}}]}"#,
         r#"{"v":1,"groups":[{"name":"g","parameters":{"a":1}}]}"#,
         r#"{"v":1,"groups":[{"name":"g","parameters":[]}]}"#,
@@ -486,23 +513,122 @@ fn malformed_documents_are_refused_and_lenient_numbers_read_as_jackson_reads_the
         r#"{"v":2147483648}"#,
         r#"{"v":1,"ttl":"soon"}"#,
         r#"{"v":1,"ttl":1e300}"#,
+        // Java's reader turns Jackson's coercions off (SPEC §9.1): a fraction, an exponent, or
+        // numeric text fills no integer member, signed or not.
+        r#"{"v":1.9}"#,
+        r#"{"v":1.0}"#,
+        r#"{"v":"1"}"#,
+        r#"{"v":1,"ttl":"300"}"#,
+        r#"{"v":1,"ttl":300.0}"#,
+        r#"{"v":1,"ttl":3e2}"#,
+        r#"{"v":1,"groups":[{"name":"g","wire":{"b":2.5}}]}"#,
+        r#"{"v":1,"groups":[{"name":"g","wire":{"b":"2"}}]}"#,
+        r#"{"v":1,"groups":[{"name":"g","seeds":[{"priority":"0"}]}]}"#,
+        r#"{"v":1,"groups":[{"name":"g","seeds":[{"priority":1.0}]}]}"#,
     ] {
         assert!(
             matches!(parse(bad), Err(BeaconError::Malformed { .. })),
             "{bad}"
         );
     }
-    // Absent and null numbers are 0, fractions truncate, numeric text is its number, and null
-    // lists are empty (Jackson's defaults).
+    // Absent and null numbers are 0, null lists are empty, and a null wire hint or parameter
+    // stays null, as Java's reader reads them.
     let doc = parse(
-        r#"{"v":1.9,"ttl":"300","groups":[{"name":"g","seeds":null,"wire":{"b":2.5}},
+        r#"{"v":1,"groups":[{"name":"g","seeds":null,"wire":{"b":2,"n":null},
+            "parameters":{"k":null}},
             {"name":"h","seeds":[{"transport":"tcp","address":"h:1","priority":null}]}],
             "issuer":null,"signature":null}"#,
     )
     .unwrap();
-    assert_eq!((doc.v, doc.ttl, doc.issuer.clone()), (1, 300, None));
+    assert_eq!((doc.v, doc.ttl, doc.issuer.clone()), (1, 0, None));
     assert!(doc.groups[0].seeds.is_empty());
-    assert_eq!(doc.groups[0].wire.as_ref().unwrap()["b"], 2);
+    assert_eq!(doc.groups[0].wire.as_ref().unwrap()["b"], Some(2));
+    assert_eq!(doc.groups[0].wire.as_ref().unwrap()["n"], None);
+    assert_eq!(doc.groups[0].parameters.as_ref().unwrap()["k"], None);
     assert_eq!(doc.groups[1].seeds[0].priority, 0);
     assert_eq!(parse(r#"{"v":1,"groups":null}"#).unwrap().groups, vec![]);
+    let session = parse(r#"{"v":1,"groups":[{"name":"g","wire":{"session":null}}]}"#).unwrap();
+    assert_eq!(session.groups[0].wire.as_ref().unwrap()["session"], None);
+}
+
+#[test]
+fn a_signed_document_with_null_hints_and_supplementary_text_round_trips() {
+    // A null wire hint and parameter are written null, and a character past U+FFFF is UTF-8 in
+    // the served JSON and its surrogates' escapes in the signed bytes (SPEC §9.1).
+    let issuer = Identity::generate().unwrap();
+    let mut group = Group::new("g")
+        .with_seed("tcp", "127.0.0.1:7500")
+        .with_parameter("\u{1F600}", "smile \u{1F600}")
+        .unwrap()
+        .with_parameter("\u{FF01}", "x")
+        .unwrap();
+    group.wire = Some([("session".to_owned(), None)].into());
+    group
+        .parameters
+        .get_or_insert_with(Default::default)
+        .insert("k".to_owned(), None);
+    let doc = sign_document(&issuer, ISSUED, 300, vec![group]).unwrap();
+    let served = String::from_utf8(to_json(&doc)).unwrap();
+    assert!(served.contains(r#""wire":{"session":null}"#), "{served}");
+    assert!(
+        served.contains(
+            "\"parameters\":{\"k\":null,\"\u{1F600}\":\"smile \u{1F600}\",\"\u{FF01}\":\"x\"}"
+        ),
+        "{served}"
+    );
+    let signed = String::from_utf8(canonical_bytes(&doc)).unwrap();
+    assert!(
+        signed.contains(r#"{"k":null,"\uD83D\uDE00":"smile \uD83D\uDE00","#),
+        "{signed}"
+    );
+    let fetched = BeaconDocument::parse(served.as_bytes()).unwrap();
+    assert_eq!(fetched, doc);
+    assert_eq!(
+        verify_document(&fetched, Some(issuer.peer_id())),
+        Ok(Some(issuer.peer_id().to_owned()))
+    );
+}
+
+/// The beacon-document vectors of annex I (`tests/wire-encoding-vectors.json`): the JSON bytes,
+/// the verdict, and the signer an accepted signed document names.
+fn annex_i_beacon_vectors() -> Vec<(String, Vec<u8>, String, Option<String>)> {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/wire-encoding-vectors.json"
+    );
+    let text = std::fs::read_to_string(path).expect("the annex I vectors");
+    let vectors: serde_json::Value = serde_json::from_str(&text).expect("the vectors parse");
+    vectors["vectors"]
+        .as_array()
+        .expect("a vector list")
+        .iter()
+        .filter(|vector| vector["carrier"] == "beacon-document")
+        .map(|vector| {
+            let field = |name: &str| vector[name].as_str().unwrap_or_default().to_owned();
+            let bytes = hex::decode(field("hex")).expect("hex");
+            (
+                field("id"),
+                bytes,
+                field("verdict"),
+                vector["signer"].as_str().map(str::to_owned),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn every_annex_i_beacon_vector_gets_its_verdict() {
+    let vectors = annex_i_beacon_vectors();
+    assert_eq!(vectors.len(), 40, "beacon-01 to beacon-40");
+    let mut agree = 0;
+    for (id, bytes, verdict, signer) in &vectors {
+        let read = BeaconDocument::parse(bytes).and_then(|doc| verify_document(&doc, None));
+        match verdict.as_str() {
+            "accept" => assert_eq!(read.as_ref(), Ok(signer), "{id}"),
+            "refuse" => assert!(read.is_err(), "{id}: {read:?}"),
+            other => panic!("{id}: an unknown verdict {other}"),
+        }
+        agree += 1;
+    }
+    assert_eq!(agree, 40);
 }

@@ -17,7 +17,7 @@
 -->
 
 <!-- Jackson's chunked text strings as test vectors for agentspaces-rust (see README.md). It builds
-     against the AgentSpaces 0.5.0 artifacts in the local Maven repository and changes nothing in
+     against the AgentSpaces 0.6.0 artifacts in the local Maven repository and changes nothing in
      the Java repository. -->
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -30,7 +30,7 @@
   <properties>
     <maven.compiler.release>21</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <agentspaces.version>0.5.0</agentspaces.version>
+    <agentspaces.version>0.6.0</agentspaces.version>
     <jackson.version>2.21.7</jackson.version>
   </properties>
   <dependencies>

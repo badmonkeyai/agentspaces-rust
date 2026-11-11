@@ -185,7 +185,7 @@ impl SocketSeed {
         let state = Arc::new(Mutex::new(SeedState::default()));
         let accept = tokio::spawn(accept_loop(listener, Arc::clone(&state)));
         Self {
-            hlc: Mutex::new(Hlc::new(identity.peer_id())),
+            hlc: Mutex::new(Hlc::new(identity.peer_id()).expect("a PeerID is a stamp node")),
             identity,
             group: group.to_owned(),
             seed,
@@ -299,9 +299,7 @@ impl SocketSeed {
     async fn wait_ack(&self, link: usize, nonce: i64) {
         self.wait_for(&format!("the ACK of {nonce}"), |got| {
             got.iter().any(|g| {
-                g.link == link
-                    && g.kind() == KIND_ACK
-                    && bodies::parse_ping(g.body()) == Some(nonce)
+                g.link == link && g.kind() == KIND_ACK && bodies::parse_ack(g.body()) == Some(nonce)
             })
         })
         .await;

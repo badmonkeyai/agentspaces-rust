@@ -15,9 +15,10 @@
 
 //! Hybrid logical clock stamps and seeds: the golden stamp `hlc_encoded` parses and re-renders,
 //! the clock issues what `wire.py`'s `hlc_now` and `hlc_observe` issue (sequences recorded from
-//! the Python reference), the skew ceiling holds, the strict and lenient stamp parsers keep their
-//! documented differences, and seeds parse and refuse as `seed.py` does (`test_tls.py`'s seed
-//! cases and the edges recorded from `parse_seed`).
+//! the Python reference), the clock rules of SPEC §9 (v0.1.30) hold (the carry, the clamp one
+//! millisecond inside the drift ceiling, the acceptable stamp), the canonical grammar refuses
+//! every other text, and seeds parse and refuse as `seed.py` does (`test_tls.py`'s seed cases and
+//! the edges recorded from `parse_seed`).
 
 mod common;
 
@@ -25,7 +26,7 @@ use agentspaces_wire::beacon;
 use agentspaces_wire::cbor::Value;
 use agentspaces_wire::envelope::{self, stamp_physical};
 use agentspaces_wire::hlc::{Hlc, Stamp, physical_lenient};
-use agentspaces_wire::limits::MAX_HLC_SKEW_MILLIS;
+use agentspaces_wire::limits::{LOGICAL_LIMIT, MAX_HLC_SKEW_MILLIS};
 use agentspaces_wire::seed::{DEFAULT_SCHEME, Seed, SeedError, parse_seed, seed_address};
 use common::s;
 
@@ -50,7 +51,7 @@ fn the_golden_stamp_parses_and_re_renders() {
 #[test]
 fn the_clock_reissues_the_golden_stamp() {
     // The Java node stamped four events in one millisecond; the fourth is the golden stamp.
-    let mut hlc = Hlc::new(s("peer_id"));
+    let mut hlc = Hlc::new(s("peer_id")).expect("a node");
     assert_eq!(hlc.node(), s("peer_id"));
     assert_eq!(hlc.last(), None);
     let stamps: Vec<String> = (0..4).map(|_| hlc.now(1_735_689_600_000)).collect();
@@ -72,7 +73,7 @@ fn stamps_order_as_java_orders_them() {
 #[test]
 fn the_clock_issues_what_hlc_now_issues() {
     // wire.hlc_now("zN", t) for t in [5, 5, 3, 10, 10, 0, 11], recorded from the Python client.
-    let mut hlc = Hlc::new("zN");
+    let mut hlc = Hlc::new("zN").expect("a node");
     let issued: Vec<String> = [5, 5, 3, 10, 10, 0, 11]
         .into_iter()
         .map(|now| hlc.now(now))
@@ -84,7 +85,7 @@ fn the_clock_issues_what_hlc_now_issues() {
         ]
     );
     // A clock at or before zero starts at 0:0, then counts.
-    let mut zero = Hlc::new("zK");
+    let mut zero = Hlc::new("zK").expect("a node");
     assert_eq!(
         [zero.now(0), zero.now(-5), zero.now(0)],
         ["0:0:zK", "0:1:zK", "0:2:zK"]
@@ -93,7 +94,7 @@ fn the_clock_issues_what_hlc_now_issues() {
 
 #[test]
 fn stamps_are_strictly_monotonic_under_a_backwards_clock() {
-    let mut hlc = Hlc::new("zMono");
+    let mut hlc = Hlc::new("zMono").expect("a node");
     let clock = [
         100,
         100,
@@ -120,20 +121,20 @@ fn stamps_are_strictly_monotonic_under_a_backwards_clock() {
 #[test]
 fn observed_stamps_advance_the_clock_up_to_the_skew_ceiling() {
     // wire.hlc_observe / hlc_now on "zM" at a wall clock of 1000, recorded from the Python client.
-    let mut hlc = Hlc::new("zM");
+    let mut hlc = Hlc::new("zM").expect("a node");
     assert_eq!(hlc.now(1000), "1000:0:zM");
     assert!(hlc.observe("1500:7:zR", 1000));
     assert_eq!(hlc.now(1000), "1500:8:zM");
-    // Exactly at the ceiling is merged ...
-    let at_ceiling = format!("{}:2:zR", 1000 + MAX_HLC_SKEW_MILLIS);
-    assert!(hlc.observe(&at_ceiling, 1000));
-    assert_eq!(hlc.now(1000), "601000:3:zM");
-    // ... one millisecond beyond it is ignored, and so is an older stamp.
-    let beyond = format!("{}:9:zR", 1001 + MAX_HLC_SKEW_MILLIS);
-    assert!(!hlc.observe(&beyond, 1000));
-    assert_eq!(hlc.now(1000), "601000:4:zM");
+    // A stamp at or past the ceiling is clamped one millisecond inside it (SPEC §9, v0.1.30) ...
+    let ceiling = 1000 + MAX_HLC_SKEW_MILLIS;
+    assert!(hlc.observe(&format!("{ceiling}:2:zR"), 1000));
+    assert_eq!(hlc.now(1000), format!("{}:3:zM", ceiling - 1));
+    let beyond = format!("{}:9:zR", ceiling + 1);
+    assert!(hlc.observe(&beyond, 1000));
+    assert_eq!(hlc.now(1000), format!("{}:10:zM", ceiling - 1));
+    // ... an older stamp merges nothing.
     assert!(!hlc.observe("5:0:zR", 1000));
-    assert_eq!(hlc.now(1000), "601000:5:zM");
+    assert_eq!(hlc.now(1000), format!("{}:11:zM", ceiling - 1));
     assert_eq!(hlc.now(700_000), "700000:0:zM");
 
     // A later counter at the same millisecond merges; an equal pair does not.
@@ -142,54 +143,96 @@ fn observed_stamps_advance_the_clock_up_to_the_skew_ceiling() {
     assert_eq!(hlc.now(700_000), "700000:5:zM");
 
     // A hostile far-future stamp cannot pin the clock, and nothing overflows.
-    let mut edge = Hlc::new("zE");
-    assert!(!edge.observe(&format!("{}:0:zR", i64::MAX), 0));
+    let mut edge = Hlc::new("zE").expect("a node");
+    assert!(edge.observe(&format!("{}:0:zR", i64::MAX), 0));
+    assert_eq!(edge.last(), Some((MAX_HLC_SKEW_MILLIS - 1, 0)));
     assert!(edge.observe(&format!("{}:0:zR", i64::MAX), i64::MAX));
-    assert!(!edge.observe(
-        &format!("{}:0:zR", i64::MAX),
-        i64::MAX - MAX_HLC_SKEW_MILLIS
-    ));
     assert_eq!(edge.now(i64::MAX), format!("{}:1:zE", i64::MAX));
     assert!(!edge.observe("1:0:zR", i64::MIN));
 }
 
 #[test]
-fn malformed_stamps_are_not_observed() {
-    let mut hlc = Hlc::new("zM");
+fn malformed_and_unacceptable_stamps_are_not_observed() {
+    let mut hlc = Hlc::new("zM").expect("a node");
+    let above = format!("5:{}:zR", LOGICAL_LIMIT + 1);
     for bad in [
-        "", "5", "5:0", "5:0:", "-5:0:n", "5:-1:n", "x:0:n", "5:0:a:b", " 5:0:n",
+        "",
+        "5",
+        "5:0",
+        "5:0:",
+        "-5:0:n",
+        "5:-1:n",
+        "x:0:n",
+        "5:0:a:b",
+        " 5:0:n",
+        "+5:0:n",
+        "05:0:n",
+        "5:00:n",
+        "5:0:a\u{1}",
+        &above,
     ] {
         assert!(!hlc.observe(bad, 10), "{bad:?}");
     }
     assert_eq!(hlc.last(), None);
     assert_eq!(hlc.now(10), "10:0:zM");
+    // A counter of exactly the limit is acceptable.
+    assert!(hlc.observe(&format!("10:{LOGICAL_LIMIT}:zR"), 10));
 }
 
 #[test]
-fn the_counter_saturates_so_a_stamp_stays_one_java_parses() {
-    let mut hlc = Hlc::new("zS");
-    assert!(hlc.observe(&format!("5:{}:zR", i32::MAX), 5));
-    let next = hlc.now(5);
-    assert_eq!(next, format!("5:{}:zS", i32::MAX));
-    assert!(Stamp::parse(&next).is_some());
-    assert_eq!(
-        hlc.now(6),
-        "6:0:zS",
-        "the counter resets when time moves on"
-    );
+fn the_counter_carries_into_the_next_millisecond_and_never_repeats() {
+    // SPEC §9 (v0.1.30): no saturation; an increment past LOGICAL_LIMIT advances the physical
+    // part by one millisecond and resets the counter.
+    let mut hlc = Hlc::new("zS").expect("a node");
+    assert!(hlc.observe(&format!("5:{LOGICAL_LIMIT}:zR"), 5));
+    assert_eq!(hlc.now(5), "6:0:zS");
+    assert_eq!(hlc.now(5), "6:1:zS");
+    let mut seen = std::collections::HashSet::new();
+    let mut busy = Hlc::new("zB").expect("a node");
+    let mut last = None;
+    for _ in 0..(2 * (LOGICAL_LIMIT as usize + 1) + 3) {
+        let stamp = busy.now(1_000);
+        let parsed = Stamp::parse(&stamp).expect("a stamp");
+        assert!(parsed.is_acceptable(), "{stamp}");
+        assert!(
+            last.as_ref()
+                .is_none_or(|last: &String| { Stamp::parse(last).expect("a stamp") < parsed })
+        );
+        assert!(seen.insert(stamp.clone()), "{stamp} twice");
+        last = Some(stamp);
+    }
+    assert_eq!(busy.last(), Some((1_002, 2)));
+    // A clock a hostile stamp dragged to the clamp carries at most onto the ceiling.
+    let mut dragged = Hlc::new("zD").expect("a node");
+    let ceiling = 1000 + MAX_HLC_SKEW_MILLIS;
+    assert!(dragged.observe(&format!("{}:{LOGICAL_LIMIT}:zR", i64::MAX), 1000));
+    assert_eq!(dragged.now(1000), format!("{ceiling}:0:zD"));
 }
 
-/// A stamp's parts as the strict parser reads them: physical, logical, node.
+#[test]
+fn a_clock_validates_its_node() {
+    assert!(Hlc::new("").is_err());
+    assert!(Hlc::new("peer:x").is_err());
+    assert!(Hlc::new("peer\u{7F}").is_err());
+    assert!(Hlc::new(s("peer_id")).is_ok());
+    assert!(Hlc::new(format!("{}/worker", s("peer_id"))).is_ok());
+}
+
+/// A stamp's parts as the canonical parser reads them: physical, logical, node.
 type Parts = (i64, i32, &'static str);
 
 #[test]
-fn the_strict_and_lenient_parsers_keep_their_differences() {
-    // (stamp, Java HlcTimestamp.parse, Java Long.parseLong of the text before the first ':')
-    let cases: [(&str, Option<Parts>, Option<i64>); 17] = [
+fn the_canonical_and_lenient_parsers_keep_their_differences() {
+    // (stamp, Java HlcTimestamp.parse since v0.1.30, Java Long.parseLong of the text before the
+    // first ':')
+    let cases: [(&str, Option<Parts>, Option<i64>); 20] = [
         ("5:0:n", Some((5, 0, "n")), Some(5)),
-        ("+5:+0:n", Some((5, 0, "n")), Some(5)),
-        ("-0:0:n", Some((0, 0, "n")), Some(0)),
+        ("+5:+0:n", None, Some(5)),
+        ("-0:0:n", None, Some(0)),
+        ("05:0:n", None, Some(5)),
+        ("5:00:n", None, Some(5)),
         ("5:0:n/agent", Some((5, 0, "n/agent")), Some(5)),
+        ("5:65537:n", Some((5, 65_537, "n")), Some(5)),
         ("-5:0:n", None, Some(-5)),
         ("5", None, Some(5)),
         ("5:x", None, Some(5)),
@@ -212,9 +255,13 @@ fn the_strict_and_lenient_parsers_keep_their_differences() {
         let parsed = Stamp::parse(text).map(|s| (s.physical, s.logical, s.node));
         assert_eq!(parsed, strict, "strict {text:?}");
         assert_eq!(physical_lenient(text), lenient, "lenient {text:?}");
-        // The envelope's frame filter reads the lenient way.
+        // The envelope reads a stamp only canonically: a decoded frame's always is one.
         let env = envelope::envelope("g", "PING", "zA", text, b"", None);
-        assert_eq!(stamp_physical(&env), lenient, "envelope {text:?}");
+        assert_eq!(
+            stamp_physical(&env),
+            strict.map(|(physical, _, _)| physical),
+            "envelope {text:?}"
+        );
     }
     // Unicode digits are not ASCII digits to either parser.
     assert_eq!(Stamp::parse("\u{661}:0:n"), None);

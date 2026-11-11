@@ -23,6 +23,20 @@
 //! a second, and on the actor's re-lease cadence ([`AdCache::expire`]), so a resident's cache
 //! follows the live set rather than every card it ever saw.
 //!
+//! # The cache budget (SPEC §6.3, v0.1.32)
+//!
+//! The cache is bounded by entry count and by bytes, the sum of the lengths of its
+//! advertisements' canonical encodings (`adBytes`): [`MAX_CACHED_ADS`] advertisements and
+//! [`MAX_CACHED_AD_BYTES`] bytes, the defaults every implementation shares (this peer never
+//! serves the RENDEZVOUS role, whose cache holds four times as much; a listening peer advertises
+//! RELAY alone). After the expired
+//! and revoked advertisements leave, a new (issuer, id) that would pass either bound is refused,
+//! and a newer version of a held one that would pass the byte budget is refused while the held
+//! version stays. Each refusal counts ([`AdCache::refused_cache_full`], `adsRefusedCacheFull`),
+//! drops the advertisement from this cache alone, and strikes nobody; anti-entropy offers it again
+//! once room returns. No card kind has a size cap of its own: a card past 65,536 bytes travels as
+//! a stub ([`agentspaces_wire::ads::spill_card`]), and a stub is held as it is.
+//!
 //! # One issuer, its own advertisements
 //!
 //! An advertisement's `id` is text its issuer chooses. Keyed by `id` alone, as Java's `AdCache`
@@ -40,15 +54,19 @@
 use std::collections::BTreeMap;
 
 use agentspaces_wire::ads::{AD_TYPE_AGENT_CARD, ad_expires_at_millis, verify_stored_ad};
-use agentspaces_wire::cbor::{self, Map, Value};
+use agentspaces_wire::cbor::{Map, Value};
+use agentspaces_wire::limits::{AD_CACHE_MAX_BYTES, AD_CACHE_MAX_ENTRIES};
 use agentspaces_wire::revocation::Registry;
 use agentspaces_wire::time::parse_instant_millis;
 
 use crate::agent::card::check_actions;
 
-/// The most advertisements the cache holds; a new (issuer, id) beyond it is refused once the
-/// expired and revoked ones are gone.
-pub(super) const MAX_CACHED_ADS: usize = 4096;
+/// The most advertisements the cache holds (SPEC §6.3's default); a new (issuer, id) beyond it is
+/// refused once the expired and revoked ones are gone.
+pub(super) const MAX_CACHED_ADS: usize = AD_CACHE_MAX_ENTRIES;
+
+/// The most bytes of advertisement encodings the cache holds (SPEC §6.3's default, 32 MiB).
+pub(super) const MAX_CACHED_AD_BYTES: usize = AD_CACHE_MAX_BYTES;
 
 /// How often, at most, an arriving advertisement makes the cache evict the expired ones.
 const EXPIRE_EVERY_MILLIS: i64 = 1000;
@@ -66,6 +84,11 @@ pub(super) struct CachedAd {
     pub issued_ms: i64,
     /// When it expires (`issued + ttl`), epoch milliseconds.
     pub expires_ms: i64,
+    /// The length of its canonical encoding (`adBytes`), what it costs the byte budget.
+    pub bytes: usize,
+    /// The stored advertisement it arrived as (`AdCache.StoredAd`), what a listening peer hands
+    /// a partner whose digest lacks it.
+    pub stored: Value,
 }
 
 /// What [`AdCache::accept`] admitted.
@@ -89,6 +112,12 @@ pub(super) struct AdCache {
     entries: BTreeMap<AdKey, CachedAd>,
     /// The most advertisements held, [`MAX_CACHED_ADS`] but in tests.
     max_entries: usize,
+    /// The most bytes held, [`MAX_CACHED_AD_BYTES`] but in tests.
+    max_bytes: usize,
+    /// The sum of the held advertisements' [`CachedAd::bytes`].
+    bytes: usize,
+    /// Advertisements refused under either bound (`adsRefusedCacheFull`).
+    refused_cache_full: u64,
     /// When an arrival last evicted the expired advertisements, epoch milliseconds.
     expired_at_ms: i64,
 }
@@ -98,6 +127,9 @@ impl Default for AdCache {
         AdCache {
             entries: BTreeMap::new(),
             max_entries: MAX_CACHED_ADS,
+            max_bytes: MAX_CACHED_AD_BYTES,
+            bytes: 0,
+            refused_cache_full: 0,
             expired_at_ms: i64::MIN,
         }
     }
@@ -113,6 +145,50 @@ impl AdCache {
         }
     }
 
+    /// A cache holding at most `max_bytes` bytes of advertisement encodings.
+    #[cfg(test)]
+    fn budgeted(max_bytes: usize) -> AdCache {
+        AdCache {
+            max_bytes,
+            ..AdCache::default()
+        }
+    }
+
+    /// How many advertisements the cache refused under its entry bound or its byte budget
+    /// (`adsRefusedCacheFull`, SPEC §6.3).
+    pub fn refused_cache_full(&self) -> u64 {
+        self.refused_cache_full
+    }
+
+    /// The bytes of advertisement encodings held now.
+    #[cfg(test)]
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Recounts [`AdCache::bytes`] after entries left.
+    fn recount(&mut self) {
+        self.bytes = self.entries.values().map(|cached| cached.bytes).sum();
+    }
+
+    /// Whether `cached`, under `key`, fits both bounds given what the cache holds (Java
+    /// `AdCache.fits`): a new key needs room for one more advertisement and its bytes; a newer
+    /// version of a held key needs room for the difference.
+    fn fits(&self, key: &AdKey, cached: &CachedAd) -> bool {
+        match self.entries.get(key) {
+            None => {
+                self.entries.len() < self.max_entries
+                    && self.bytes.saturating_add(cached.bytes) <= self.max_bytes
+            }
+            Some(held) => {
+                self.bytes
+                    .saturating_sub(held.bytes)
+                    .saturating_add(cached.bytes)
+                    <= self.max_bytes
+            }
+        }
+    }
+
     /// [`AdCache::admit`] under no revocations.
     #[cfg(test)]
     fn accept(&mut self, stored: &Value, now_ms: i64) -> Option<Admitted> {
@@ -124,6 +200,7 @@ impl AdCache {
         let before = self.entries.len();
         self.entries.retain(|_, cached| cached.expires_ms > now_ms);
         self.expired_at_ms = now_ms;
+        self.recount();
         before - self.entries.len()
     }
 
@@ -133,6 +210,7 @@ impl AdCache {
     pub fn purge(&mut self, registry: &Registry) -> usize {
         let before = self.entries.len();
         self.entries.retain(|_, cached| !refused(cached, registry));
+        self.recount();
         before - self.entries.len()
     }
 
@@ -142,11 +220,16 @@ impl AdCache {
     /// ...), not refused by `registry` (a revoked issuer, or an agent card of a revoked agent or
     /// agent key: Java's `refuseIssuers` and `refuseAgents`), and last-writer-wins by `issued` per
     /// (issuer, id): an advertisement replaces only one its own issuer issued under the same id
-    /// (see the [module docs](self#one-issuer-its-own-advertisements)). Bounded: an update of a
-    /// held (issuer, id) always lands; a new one is refused while the cache is full after the
-    /// expired and the revoked are dropped. `None` when refused.
+    /// (see the [module docs](self#one-issuer-its-own-advertisements)). Bounded by entries and
+    /// by bytes ([module docs](self#the-cache-budget-spec-63-v0132)): a new one, or a newer
+    /// version of a held one, that does not fit after the expired and the revoked are dropped is
+    /// refused and counted. `None` when refused.
     pub fn admit(&mut self, stored: &Value, now_ms: i64, registry: &Registry) -> Option<Admitted> {
         let (ad_type, ad, issuer) = verify_stored_ad(stored, now_ms)?;
+        let bytes = stored
+            .get("adBytes")
+            .and_then(Value::as_bytes)
+            .map_or(0, <[u8]>::len);
         if ad_type == AD_TYPE_AGENT_CARD && check_actions(&ad).is_err() {
             // Jackson's decode in Java's AdCache throws on such a card, which refuses it.
             return None;
@@ -160,6 +243,8 @@ impl AdCache {
             issuer,
             issued_ms,
             expires_ms,
+            bytes,
+            stored: stored.clone(),
         };
         if refused(&cached, registry) {
             return None;
@@ -178,10 +263,12 @@ impl AdCache {
                 changed: false,
             });
         }
-        if !self.entries.contains_key(&key) && self.entries.len() >= self.max_entries {
+        if !self.fits(&key, &cached) {
             self.entries
                 .retain(|_, held| held.expires_ms > now_ms && !refused(held, registry));
-            if self.entries.len() >= self.max_entries {
+            self.recount();
+            if !self.fits(&key, &cached) {
+                self.refused_cache_full = self.refused_cache_full.saturating_add(1);
                 return None;
             }
         }
@@ -194,7 +281,11 @@ impl AdCache {
             id: key.1.clone(),
             changed,
         };
-        self.entries.insert(key, cached);
+        let added = cached.bytes;
+        if let Some(previous) = self.entries.insert(key, cached) {
+            self.bytes = self.bytes.saturating_sub(previous.bytes);
+        }
+        self.bytes = self.bytes.saturating_add(added);
         Some(admitted)
     }
 
@@ -210,6 +301,19 @@ impl AdCache {
             })
             .map(|cached| cached.ad.clone())
             .collect()
+    }
+
+    /// The live advertisements at `now_ms` with their stored form, unless revoked: what the ads
+    /// stream's digest names and its delta carries (SPEC §6.2: an expired advertisement is never
+    /// forwarded).
+    pub fn live_entries<'a>(
+        &'a self,
+        now_ms: i64,
+        registry: &'a Registry,
+    ) -> impl Iterator<Item = &'a CachedAd> + 'a {
+        self.entries
+            .values()
+            .filter(move |cached| cached.expires_ms > now_ms && !refused(cached, registry))
     }
 
     /// The live, unrevoked agent cards at `now_ms` (`Peer.cards`).
@@ -240,10 +344,11 @@ fn refused(cached: &CachedAd, registry: &Registry) -> bool {
     registry.refuses(agent, key, None)
 }
 
-/// The stored advertisements an `ads` stream delta of a pull response carries (`{ads: [...]}`),
-/// or `None` when the bytes are not such a map.
+/// The stored advertisements an `ads` stream delta of a pull response carries (`AdCache.Delta`
+/// `{ads: [...]}` under the wire encoding, SPEC §9.1), or `None` when the bytes are no such
+/// record.
 pub(super) fn pulled_ads(delta: &[u8]) -> Option<Vec<Value>> {
-    let mut delta = cbor::decode(delta).ok()?.into_map()?;
+    let mut delta = agentspaces_wire::schema::decode_map(delta, "AdCache.Delta")?;
     match delta.remove("ads") {
         None | Some(Value::Null) => Some(Vec::new()),
         Some(ads) => ads.into_array(),
@@ -476,14 +581,62 @@ mod tests {
         assert!(cards_of(&cache, &honest.agent("early"), later).is_empty());
     }
 
+    /// SPEC §6.3 (v0.1.32): the cache's byte budget. A new card that would pass it is refused
+    /// and counted, a newer version of a held card that would pass it is refused while the held
+    /// version stays, and a refusal strikes nobody: the card lands once room returns.
+    #[test]
+    fn the_byte_budget_refuses_and_counts_and_keeps_the_held_version() {
+        let issuer = Identity::from_seed(&[8; 32]);
+        let small = named(&issuer, "a", NOW, "a");
+        let length = |card: &Map| {
+            stored(card, &issuer)
+                .get("adBytes")
+                .and_then(Value::as_bytes)
+                .map_or(0, <[u8]>::len)
+        };
+        let mut cache = AdCache::budgeted(2 * length(&small) + 10);
+        assert!(cache.accept(&stored(&small, &issuer), NOW).is_some());
+        let other = named(&issuer, "b", NOW, "b");
+        assert!(cache.accept(&stored(&other, &issuer), NOW).is_some());
+        assert_eq!(cache.bytes(), length(&small) + length(&other));
+        // A third card would pass the budget.
+        let third = named(&issuer, "c", NOW, "c");
+        assert!(cache.accept(&stored(&third, &issuer), NOW).is_none());
+        assert_eq!(cache.refused_cache_full(), 1);
+        // A newer version of a held card that grows past the budget is refused; the held stays.
+        let grown = named(&issuer, "a", NOW + 1000, &"x".repeat(64));
+        assert!(cache.accept(&stored(&grown, &issuer), NOW).is_none());
+        assert_eq!(cache.refused_cache_full(), 2);
+        assert_eq!(
+            cards_of(&cache, &issuer.agent("a"), NOW)
+                .first()
+                .and_then(description_of),
+            Some("a")
+        );
+        // A newer version of the same size fits, and the bytes follow it.
+        let refreshed = named(&issuer, "a", NOW + 1000, "A");
+        assert!(cache.accept(&stored(&refreshed, &issuer), NOW).is_some());
+        assert_eq!(cache.bytes(), length(&refreshed) + length(&other));
+        // Once the cards expire, room returns.
+        let later = NOW + 11 * 60 * 1000;
+        let fresh = named(&issuer, "c", later, "c");
+        assert!(cache.accept(&stored(&fresh, &issuer), later).is_some());
+        assert_eq!(cache.bytes(), length(&fresh));
+        assert_eq!(MAX_CACHED_ADS, 8_192);
+        assert_eq!(MAX_CACHED_AD_BYTES, 33_554_432);
+    }
+
     /// The founder's signed revocation of peer `revoked` in `zGroup`, issued just before NOW.
     fn peer_revocation(founder: &Identity, revoked: &str) -> Value {
-        let mut ad = Map::new();
-        ad.insert("issuer", founder.peer_id());
-        ad.insert("group", "zGroup");
-        ad.insert("issued", instant_iso(NOW - 1000));
-        ad.insert("revoked", revoked);
-        ad.insert("reason", agentspaces_wire::revocation::KEY_COMPROMISE);
+        let ad = agentspaces_wire::revocation::peer_revocation(
+            founder.peer_id(),
+            "zGroup",
+            &instant_iso(NOW - 1000),
+            "PT1H",
+            revoked,
+            agentspaces_wire::revocation::KEY_COMPROMISE,
+            None,
+        );
         Value::Map(agentspaces_wire::revocation::sign_revocation(&ad, founder))
     }
 
@@ -715,10 +868,21 @@ mod tests {
 
     #[test]
     fn a_pulled_ads_delta_is_a_list_of_stored_ads() {
-        let bytes = cbor::encode(&agentspaces_wire::cbor_map! {
-            "ads" => agentspaces_wire::cbor_array![1, 2],
+        let encode = agentspaces_wire::cbor::encode;
+        let identity = Identity::from_seed(&[9; 32]);
+        let one = stored(&card(&identity, NOW, "one"), &identity);
+        let two = stored(&card(&identity, NOW + 1, "two"), &identity);
+        let bytes = encode(&agentspaces_wire::cbor_map! {
+            "ads" => Value::Array(vec![one, two]),
         });
         assert_eq!(pulled_ads(&bytes).map(|ads| ads.len()), Some(2));
+        let null = encode(&agentspaces_wire::cbor_map! { "ads" => Value::Null });
+        assert_eq!(pulled_ads(&null), Some(Vec::new()));
+        // An item that is no StoredAd breaks the record rules (SPEC §9.1): the delta is refused.
+        let numbers = encode(&agentspaces_wire::cbor_map! {
+            "ads" => agentspaces_wire::cbor_array![1, 2],
+        });
+        assert_eq!(pulled_ads(&numbers), None);
         assert_eq!(pulled_ads(&[0xff]), None);
     }
 }

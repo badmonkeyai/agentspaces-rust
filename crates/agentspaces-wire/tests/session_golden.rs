@@ -559,11 +559,21 @@ fn malformed_hellos_are_refused() {
     assert!(parse_hello(&shaped(bytes(32), bytes(32), bytes(2), Value::Null)).is_none());
     assert!(parse_hello(&shaped(bytes(32), bytes(32), "zB".into(), "echo".into())).is_none());
     assert!(parse_hello(&shaped(bytes(32), bytes(32), "zB".into(), Value::Int(1))).is_none());
-    // An absent echo is an opening; extra keys are ignored.
-    let absent = cbor::encode(&cbor_map! {
-        "ephemeralKey" => bytes(32), "nonce" => bytes(32), "remote" => "zB", "later" => 1,
+    // A null echo is an opening. Since v0.1.31 the record's fields are always written and no
+    // other is (SPEC §9.1 P1): an absent echo or an extra key does not decode.
+    let opening = cbor::encode(&cbor_map! {
+        "ephemeralKey" => bytes(32), "nonce" => bytes(32), "remote" => "zB", "echo" => Value::Null,
     });
-    assert!(parse_hello(&absent).is_some_and(|hello| hello.is_opening()));
+    assert!(parse_hello(&opening).is_some_and(|hello| hello.is_opening()));
+    let absent = cbor::encode(&cbor_map! {
+        "ephemeralKey" => bytes(32), "nonce" => bytes(32), "remote" => "zB",
+    });
+    assert!(parse_hello(&absent).is_none());
+    let extra = cbor::encode(&cbor_map! {
+        "ephemeralKey" => bytes(32), "nonce" => bytes(32), "remote" => "zB", "echo" => Value::Null,
+        "later" => 1,
+    });
+    assert!(parse_hello(&extra).is_none());
     // Missing fields, other shapes, and garbage.
     let missing = cbor::encode(&cbor_map! { "ephemeralKey" => bytes(32), "nonce" => bytes(32) });
     assert!(parse_hello(&missing).is_none());

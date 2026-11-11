@@ -69,6 +69,12 @@ impl PeerConfig {
     /// [`PeerConfig`]: [`Peer::join`] loads the one and pulls the other.
     pub fn from_settings(settings: &PeerSettings, identity: Identity) -> Result<Self, ConfigError> {
         settings.validate()?;
+        Ok(Self::from_checked_settings(settings, identity))
+    }
+
+    /// [`PeerConfig::from_settings`] of settings the caller checked (a listening peer's, which
+    /// may have no seed).
+    pub(crate) fn from_checked_settings(settings: &PeerSettings, identity: Identity) -> Self {
         let mut config = Self::new(identity, settings.group.clone());
         config.seeds = settings.seeds.clone();
         config.dialers = default_dialers();
@@ -76,7 +82,7 @@ impl PeerConfig {
         config.reconnect_interval = settings.reconnect_interval;
         config.reconnect_window = settings.reconnect_window;
         config.peer_ad_interval = settings.peer_ad_interval;
-        Ok(config)
+        config
     }
 }
 

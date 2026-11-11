@@ -17,7 +17,7 @@
 -->
 
 <!-- A scripted Java seed for agentspaces-rust interop tests. It builds against the AgentSpaces
-     0.5.0 artifacts in the local Maven repository and changes nothing in the Java repository. -->
+     0.6.0 artifacts in the local Maven repository and changes nothing in the Java repository. -->
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
@@ -29,7 +29,7 @@
   <properties>
     <maven.compiler.release>21</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <agentspaces.version>0.5.0</agentspaces.version>
+    <agentspaces.version>0.6.0</agentspaces.version>
   </properties>
   <dependencies>
     <dependency><groupId>ai.badmonkey.agentspaces</groupId><artifactId>agentspaces-peering</artifactId><version>${agentspaces.version}</version></dependency>

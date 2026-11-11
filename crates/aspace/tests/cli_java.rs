@@ -15,8 +15,8 @@
 
 //! The `aspace` command against the Java reference: each test starts its own
 //! scripted Java seed (`interop/java-seed`, `ai.badmonkey.agentspaces.interop.Seed`) on a free
-//! port, runs the built `aspace` binary against it (a Rust peer is dial-only and cannot be the
-//! seed), and checks what the Java `ReplicatedSpace` makes of each command:
+//! port, runs the built `aspace` binary against it (the command has no listening seed of its own
+//! yet), and checks what the Java `ReplicatedSpace` makes of each command:
 //!
 //! 1. `id` creates, then shows, the same identity, its key owner-only;
 //! 2. `write` then `read` (and a Java task read), through a fleet YAML file as well as variables;
@@ -84,8 +84,11 @@ const VISIT: Duration = Duration::from_secs(40);
 const DEADLINE: Duration = Duration::from_secs(30);
 
 /// Every variable the configuration reads, removed from each `aspace` run first.
-const CONFIG_VARIABLES: [&str; 10] = [
+const CONFIG_VARIABLES: [&str; 13] = [
     "ASPACE_SEEDS",
+    "ASPACE_INVITE",
+    "ASPACE_LISTEN",
+    "ASPACE_ADVERTISE",
     "ASPACE_GROUP",
     "ASPACE_JOIN",
     "ASPACE_KEYSTORE",

@@ -111,21 +111,28 @@ The tests that put the Rust peer, `aspace`, and the MCP gateway beside the
 Java reference node need more than Rust:
 
 - A JDK 21 or newer (`java` on the `PATH`, or `JAVA_HOME`) and Maven.
-- The seed's AgentSpaces 0.5.0 artifacts in your local Maven repository
-  (`~/.m2`), since the tests run Maven offline (`mvn -o`). They are on
-  Maven Central, so one online build of the seed fetches them:
+- The seed's AgentSpaces 0.6.0 artifacts in your local Maven repository
+  (`~/.m2`), since the tests run Maven offline (`mvn -o`). 0.6.0 is the
+  upcoming release: until it is on Maven Central, install it from a clone of
+  the [core repository](https://github.com/badmonkeyai/agentspaces) with
+  `mvn install -DskipTests`. Once it is published, one online build of the
+  seed fetches them:
 
   ```
   (cd interop/java-seed && mvn -q compile dependency:build-classpath -Dmdep.outputFile=target/classpath.txt)
   ```
 
-- For example 32: the `example-02-research-fleet` 0.5.0 jar, which is not
+- For example 32: the `example-02-research-fleet` 0.6.0 jar, which is not
   on Maven Central. Install it from a clone of the
   [core repository](https://github.com/badmonkeyai/agentspaces) with
   `mvn install -DskipTests`.
 - For the MCP client tests: Node with `@modelcontextprotocol/sdk`
   (point `ASPACE_MCP_NODE_SDK` at the package directory) and Ruby with the
   `mcp` gem.
+- For the Rust-seed test (`crates/aspace/tests/clients_seed.rs`): the
+  Python, TypeScript, and Ruby clients checked out beside this repository,
+  a Python holding the Python client's dependency, Node 22 or later, and
+  Ruby 3.3 or later, as [interop/clients](interop/clients/README.md) says.
 
 When one of these is missing, each such test prints why and passes. That is
 what happens in CI. Run them before you open a pull request that touches the

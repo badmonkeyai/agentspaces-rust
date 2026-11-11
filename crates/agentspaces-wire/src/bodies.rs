@@ -20,8 +20,10 @@
 //!
 //! Builders return the CBOR body (`Vec<u8>`) where `wire.py` returns bytes, and a [`Map`] where it
 //! returns a dict (a capability payload the caller encodes into a `PIPE_DATA` body). The parsers
-//! (`parse_*`) read what the Python peer reads from a received body; each returns `None` for a
-//! body of the wrong shape and never panics.
+//! (`parse_*`, [`decode_body`]) read a received body as the receiver's procedure of SPEC §9.1
+//! reads a carrier: the item rules, the body's record schema of annex I under rules P1 to P4,
+//! and the canonical-bytes check ([`crate::schema::decode`]). Each returns `None` for a body
+//! that fails any of them, and the frame that carries it is undecodable; none panics.
 //!
 //! The frame kinds are the variants of Java `Envelope.Kind` ([`FRAME_KINDS`]).
 #![warn(missing_docs)]
@@ -30,6 +32,7 @@ use crate::cbor::{self, Map, Value};
 use crate::crypto;
 use crate::envelope::envelope;
 use crate::ids;
+use crate::schema;
 use crate::util::encode_map;
 
 // ---------------------------------------------------------------------------------------------
@@ -103,10 +106,49 @@ pub const FRAME_KINDS: [&str; 20] = [
     KIND_GROUP_AD,
 ];
 
-/// Whether `kind` is one of [`FRAME_KINDS`]. A Java node refuses an envelope of any other kind; this
-/// client ignores and counts one.
+/// Whether `kind` is one of [`FRAME_KINDS`]. An envelope of any other kind does not decode
+/// (`Envelope.kind` is an enum of these names, SPEC §9.1 P2).
 pub fn is_known_kind(kind: &str) -> bool {
     FRAME_KINDS.contains(&kind)
+}
+
+/// The record schema (annex I) of the body each frame kind carries; `None` for
+/// `GROUP_AD_WANT`, whose body is empty.
+pub fn body_record(kind: &str) -> Option<&'static str> {
+    Some(match kind {
+        KIND_PING => "Bodies.Ping",
+        KIND_PING_REQ => "Bodies.PingReq",
+        KIND_ACK => "Bodies.Ack",
+        KIND_RUMOR => "Bodies.Rumor",
+        KIND_DIGEST => "Bodies.Digest",
+        KIND_PULL_RESP => "Bodies.PullResp",
+        KIND_QUERY => "DiscoveryService.AdQuery",
+        KIND_QUERY_HIT => "DiscoveryService.QueryHits",
+        KIND_BLOCK_WANT => "BlockExchange.Want",
+        KIND_BLOCK => "BlockExchange.Block",
+        KIND_PIPE_DATA => "CapabilityPipes.PipeFrame",
+        KIND_BATCH => "Bodies.Batch",
+        KIND_HAVE => "Bodies.Have",
+        KIND_GRAFT => "Bodies.Graft",
+        KIND_PRUNE => "Bodies.Prune",
+        KIND_RELAY_FRAME => "Bodies.RelayFrame",
+        KIND_CHANNEL_HELLO => "Bodies.ChannelHello",
+        KIND_SESSION_HELLO => "Bodies.SessionHello",
+        KIND_GROUP_AD => "SignedGroupAdvertisement",
+        _ => return None,
+    })
+}
+
+/// The body of a frame of `kind`, decoded under its record schema ([`body_record`],
+/// [`crate::schema::decode`]): `None` when the body breaks the wire encoding, its record rules,
+/// or the canonical-bytes check, and so makes its frame undecodable (SPEC §9.1). A
+/// `GROUP_AD_WANT` body must be empty and reads as the empty map; an unknown kind is `None`.
+pub fn decode_body(kind: &str, body: &[u8]) -> Option<Map> {
+    match body_record(kind) {
+        Some(record) => schema::decode_map(body, record),
+        None if kind == KIND_GROUP_AD_WANT && body.is_empty() => Some(Map::new()),
+        None => None,
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -142,15 +184,24 @@ pub fn ping_body(nonce: i64) -> Vec<u8> {
     encode_map(&body)
 }
 
-/// The nonce of a `PING` (or `ACK`) body: an integer `nonce`, 0 when absent or null (Jackson's
-/// default for the primitive `long`); `None` when the body is not a map or the nonce is not an
-/// `i64`.
+/// The nonce of a `PING` body (`Bodies.Ping`); `None` when the body does not decode
+/// ([`decode_body`]).
 pub fn parse_ping(body: &[u8]) -> Option<i64> {
-    let value = cbor::decode(body).ok()?;
-    match value.as_map()?.get("nonce") {
-        None | Some(Value::Null) => Some(0),
-        Some(nonce) => nonce.as_i64(),
-    }
+    decode_body(KIND_PING, body)?.get("nonce")?.as_i64()
+}
+
+/// The nonce of an `ACK` body (`Bodies.Ack`); `None` when the body does not decode
+/// ([`decode_body`]).
+pub fn parse_ack(body: &[u8]) -> Option<i64> {
+    decode_body(KIND_ACK, body)?.get("nonce")?.as_i64()
+}
+
+/// The `(target, nonce)` of a `PING_REQ` body (`Bodies.PingReq`); `None` when the body does not
+/// decode ([`decode_body`]).
+pub fn parse_ping_req(body: &[u8]) -> Option<(String, i64)> {
+    let mut request = decode_body(KIND_PING_REQ, body)?;
+    let nonce = request.get("nonce")?.as_i64()?;
+    Some((request.remove("target")?.into_text()?, nonce))
 }
 
 /// The `ACK` body `{nonce, onBehalf: null}` answering a `PING` with its nonce.
@@ -186,11 +237,11 @@ pub struct Rumor {
     pub payload: Vec<u8>,
 }
 
-/// The rumor a `RUMOR` body carries: `streamId` must be text; `itemId` text, `hopsRemaining` an
-/// `i64`, and `payload` bytes, each absent or null read as empty or 0. Any other shape is `None`.
+/// The rumor a `RUMOR` body carries (`Bodies.Rumor`, [`decode_body`]): `streamId` must be text;
+/// an `itemId` or `payload` written null reads as empty. `None` when the body does not decode.
 pub fn parse_rumor(body: &[u8]) -> Option<Rumor> {
-    let value = cbor::decode(body).ok()?;
-    let rumor = value.as_map()?;
+    let rumor = decode_body(KIND_RUMOR, body)?;
+    let rumor = &rumor;
     Some(Rumor {
         stream_id: rumor.get("streamId")?.as_str()?.to_owned(),
         item_id: optional(rumor, "itemId", Value::as_str)?
@@ -212,14 +263,13 @@ pub fn digest_body(digests: &Map) -> Vec<u8> {
     encode_map(&body)
 }
 
-/// The `digests` map of a `DIGEST` body, or `None` when the body is not a map or its `digests`
-/// is not a map. Values are not judged.
+/// The `digests` map of a `DIGEST` body (`Bodies.Digest`, [`decode_body`]); a null `digests`
+/// reads as the empty map. `None` when the body does not decode.
 pub fn parse_digest(body: &[u8]) -> Option<Map> {
-    cbor::decode(body)
-        .ok()?
-        .into_map()?
-        .remove("digests")?
-        .into_map()
+    match decode_body(KIND_DIGEST, body)?.remove("digests")? {
+        Value::Null => Some(Map::new()),
+        digests => digests.into_map(),
+    }
 }
 
 /// The `PULL_RESP` body `{deltas}` (`Bodies.PullResp`): the opaque delta bytes per stream the
@@ -230,13 +280,12 @@ pub fn pull_resp_body(deltas: &Map) -> Vec<u8> {
     encode_map(&body)
 }
 
-/// The `deltas` map of a `PULL_RESP` body; an absent or null `deltas` is the empty map (Python's
-/// `resp.get("deltas") or {}`). `None` when the body is not a map or `deltas` is not a map.
+/// The `deltas` map of a `PULL_RESP` body (`Bodies.PullResp`, [`decode_body`]); a null `deltas`
+/// is the empty map (Python's `resp.get("deltas") or {}`). `None` when the body does not decode.
 pub fn parse_pull_resp(body: &[u8]) -> Option<Map> {
-    let mut resp = cbor::decode(body).ok()?.into_map()?;
-    match resp.remove("deltas") {
-        None | Some(Value::Null) => Some(Map::new()),
-        Some(deltas) => deltas.into_map(),
+    match decode_body(KIND_PULL_RESP, body)?.remove("deltas")? {
+        Value::Null => Some(Map::new()),
+        deltas => deltas.into_map(),
     }
 }
 
@@ -260,11 +309,10 @@ pub struct ChannelHello {
     pub attested_remote: String,
 }
 
-/// The announcement a `CHANNEL_HELLO` body carries: a boolean `acceptsBare` and a text
-/// `attestedRemote`, or `None`.
+/// The announcement a `CHANNEL_HELLO` body carries (`Bodies.ChannelHello`, [`decode_body`]): a
+/// boolean `acceptsBare` and a text `attestedRemote`, or `None`.
 pub fn parse_channel_hello(body: &[u8]) -> Option<ChannelHello> {
-    let value = cbor::decode(body).ok()?;
-    let hello = value.as_map()?;
+    let hello = decode_body(KIND_CHANNEL_HELLO, body)?;
     Some(ChannelHello {
         accepts_bare: hello.get("acceptsBare")?.as_bool()?,
         attested_remote: hello.get("attestedRemote")?.as_str()?.to_owned(),
@@ -291,11 +339,11 @@ pub struct PipeData {
     pub payload: Vec<u8>,
 }
 
-/// The capability frame a `PIPE_DATA` body carries: a text `capability` and a byte `payload`
-/// (absent or null read as empty), or `None`.
+/// The capability frame a `PIPE_DATA` body carries (`CapabilityPipes.PipeFrame`,
+/// [`decode_body`]): a text `capability` and a byte `payload` (null read as empty), or `None`.
 pub fn parse_pipe_data(body: &[u8]) -> Option<PipeData> {
-    let value = cbor::decode(body).ok()?;
-    let pipe = value.as_map()?;
+    let pipe = decode_body(KIND_PIPE_DATA, body)?;
+    let pipe = &pipe;
     Some(PipeData {
         capability: pipe.get("capability")?.as_str()?.to_owned(),
         payload: optional(pipe, "payload", Value::as_bytes)?
@@ -359,12 +407,12 @@ impl RelayFrame {
     }
 }
 
-/// The relay frame a `RELAY_FRAME` body carries: a text `target`, a byte `frame`, and
-/// optionally a `path` of text and a non-negative `hop` (each absent or null read as `None`),
-/// or `None`.
+/// The relay frame a `RELAY_FRAME` body carries (`Bodies.RelayFrame`, [`decode_body`]): a text
+/// `target`, a byte `frame`, and optionally a `path` of PeerIDs and a non-negative `hop` (each
+/// absent read as `None`), or `None`.
 pub fn parse_relay_frame(body: &[u8]) -> Option<RelayFrame> {
-    let value = cbor::decode(body).ok()?;
-    let relay = value.as_map()?;
+    let relay = decode_body(KIND_RELAY_FRAME, body)?;
+    let relay = &relay;
     let path = match optional(relay, "path", Value::as_array)? {
         None => None,
         Some(items) => Some(
@@ -410,10 +458,11 @@ pub struct RelaySignal {
 }
 
 /// The signal a relay-signal payload (the `payload` of a [`RELAY_SIGNAL_CAPABILITY`] pipe frame)
-/// carries: text `target`, `failedHop`, and `reason`, or `None`.
+/// carries (`PeerNode.RelaySignal` under the wire encoding): text `target`, `failedHop`, and
+/// `reason`, or `None`.
 pub fn parse_relay_signal(payload: &[u8]) -> Option<RelaySignal> {
-    let value = cbor::decode(payload).ok()?;
-    let signal = value.as_map()?;
+    let signal = schema::decode_map(payload, "PeerNode.RelaySignal")?;
+    let signal = &signal;
     Some(RelaySignal {
         target: signal.get("target")?.as_str()?.to_owned(),
         failed_hop: signal.get("failedHop")?.as_str()?.to_owned(),
@@ -437,11 +486,10 @@ pub fn block_want_body(cid: &str) -> Vec<u8> {
     encode_map(&body)
 }
 
-/// The id a `BLOCK_WANT` body asks for: a text `cid`, or `None`.
+/// The id a `BLOCK_WANT` body asks for (`BlockExchange.Want`, [`decode_body`]): a text `cid`, or
+/// `None`.
 pub fn parse_block_want(body: &[u8]) -> Option<String> {
-    cbor::decode(body)
-        .ok()?
-        .into_map()?
+    decode_body(KIND_BLOCK_WANT, body)?
         .remove("cid")?
         .into_text()
 }
@@ -471,10 +519,10 @@ impl Block {
     }
 }
 
-/// The block a `BLOCK` body carries: a text `cid` and byte `bytes`, or `None`. The id is not
-/// checked here ([`Block::verifies`]).
+/// The block a `BLOCK` body carries (`BlockExchange.Block`, [`decode_body`]): a text `cid` and
+/// byte `bytes`, or `None`. The id is not checked here ([`Block::verifies`]).
 pub fn parse_block(body: &[u8]) -> Option<Block> {
-    let mut block = cbor::decode(body).ok()?.into_map()?;
+    let mut block = decode_body(KIND_BLOCK, body)?;
     Some(Block {
         cid: block.remove("cid")?.into_text()?,
         bytes: block.remove("bytes")?.into_bytes()?,
@@ -619,21 +667,23 @@ impl Aggregate {
         record
     }
 
-    /// The variant a decoded aggregate `Frame` carries: exactly one of `share`, `extremum`,
-    /// `histogram`, `roster` is a map of the right shape and the other three are absent or
-    /// null. Integers are accepted where a double is expected (Jackson reads them so). `None`
-    /// for any other shape.
+    /// The variant a decoded aggregate `Frame` carries (`PushSumAggregate.Frame` under rules
+    /// P1 to P4, SPEC §9.1): the four union fields are all present, each a record of its schema
+    /// or null, with a float64 wherever a double belongs and no field the schema does not name.
+    /// Of the variants whose `epochId` is not null, the first in field order is the one Java's
+    /// node acts on, and the one returned; `None` when there is none or the frame does not
+    /// conform. A caller that decodes the payload itself checks its canonical bytes with
+    /// [`crate::schema::decode`].
     pub fn from_frame(frame: &Value) -> Option<Aggregate> {
-        let frame = frame.as_map()?;
-        let mut chosen = None;
-        for field in AGGREGATE_FIELDS {
-            match frame.get(field) {
-                None | Some(Value::Null) => {}
-                Some(Value::Map(record)) if chosen.is_none() => chosen = Some((field, record)),
-                Some(_) => return None,
-            }
+        if !schema::conforms(frame, "PushSumAggregate.Frame") {
+            return None;
         }
-        let (field, record) = chosen?;
+        let frame = frame.as_map()?;
+        let (field, record) = AGGREGATE_FIELDS.into_iter().find_map(|field| {
+            let record = frame.get(field)?.as_map()?;
+            record.get("epochId")?.as_str()?;
+            Some((field, record))
+        })?;
         let epoch_id = record.get("epochId")?.as_str()?.to_owned();
         let double = |name: &str| record.get(name).and_then(Value::as_f64);
         Some(match field {

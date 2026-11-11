@@ -13,91 +13,96 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Hybrid logical clock stamps (SPEC §7.1, §9), a port of `wire.py`'s
-//! `hlc_now`, `hlc_observe`, and `hlc_physical`, with Java `HlcTimestamp` as the authority on what
-//! a stamp is and how stamps order.
+//! Hybrid logical clock stamps (SPEC §7.1, §9), a port of `wire.py`'s `parse_hlc`,
+//! `acceptable_hlc`, `hlc_now`, and `hlc_observe`, with Java `HlcTimestamp` and
+//! `HybridLogicalClock` as the authority on what a stamp is, how stamps order, and how a clock
+//! advances.
 //!
 //! A stamp is the text `physical:logical:node`: epoch milliseconds, a counter that orders stamps
 //! within one millisecond, and the id of the node (a PeerID, or an agent id) that issued it.
-//! Stamps order by physical time, then the counter, then the node in Java string order
-//! ([`Stamp`]'s [`Ord`]).
+//! Stamps order by physical time, then the counter, then the node in Java string order (UTF-16
+//! code units, [`Stamp`]'s [`Ord`]).
 //!
-//! # Two parsers, two sets of rules
+//! # The canonical stamp (SPEC §9, v0.1.30 and v0.1.31)
 //!
-//! The crate reads stamps two ways, on purpose, and each keeps the rules of the Java code it
-//! mirrors:
+//! A stamp has exactly one text, so the bytes a signer signed are always the re-encoding of the
+//! stamp a receiver decodes, and every implementation verifies a signature over the same bytes.
+//! [`Stamp::parse`] accepts exactly that text and refuses any other, wherever this crate decodes,
+//! merges, orders, or deduplicates a stamp:
 //!
-//! | input            | [`Stamp::parse`] (strict) | [`physical_lenient`] |
-//! |------------------|---------------------------|----------------------|
-//! | `5:0:n`, `+5:0:n` | 5, 0, `n`                | 5                    |
-//! | `-5:0:n`         | refused (negative)         | -5                   |
-//! | `5`, `5:x`       | refused (no logical/node)  | 5                    |
-//! | `5:-1:n`, `5:2147483648:n` | refused          | 5                    |
-//! | `5:0:`, `5:0:a:b` | refused (node empty / with `:`) | 5             |
-//! | ` 5:0:n`, `x:0:n`, `9223372036854775808:0:n` | refused | refused   |
+//! - the physical and logical parts are each `0` or a non-zero ASCII digit followed by ASCII
+//!   digits: no sign, no leading zero, no fraction, no exponent, no whitespace;
+//! - the physical part fits a signed 64-bit integer and the logical part a signed 32-bit one;
+//! - the node is non-empty and holds no `:` and no control character (U+0000 to U+001F, U+007F);
+//!   a Rust string cannot hold a lone surrogate, so that rule holds by construction;
+//! - the whole text holds at most [`MAX_STAMP_UNITS`] UTF-16 code units.
 //!
-//! - [`Stamp::parse`] is Java `HlcTimestamp.parse`: three parts split at the first two `:`, a
-//!   non-negative `long`, a non-negative `int`, and a non-empty node free of `:`. Records, states,
-//!   claims, and the space fold judge every stamp with it ([`crate::records`],
-//!   [`crate::fold`]), so a stamp Java could not decode never verifies, and the fold admits
-//!   exactly the stamps the verifiers accept.
-//! - [`Stamp::parse_canonical`] is [`Stamp::parse`] restricted to the text Java writes a stamp
-//!   back as (`5:0:n`, never `+5:0:n` or `05:0:n`). Java verifies a signature over its own
-//!   re-encoding of a stamp, so every stamp a signature covers (a record's `issued`, a claim's
-//!   `stamp`, a state's `leaseStamp` and `signedAt`, an envelope's `stamp`) is judged with it:
-//!   the bytes this crate verifies are then the bytes Java verifies.
-//! - [`physical_lenient`] reads only the physical milliseconds, as the Java frame filter and
-//!   `wire.hlc_physical` read them: `Long.parseLong` of the text before the first `:`. The frame
-//!   filter ([`crate::envelope::FrameFilter`]) judges a frame's age with it, and the fold reads
-//!   the signing time of a `signedAt` with it.
+//! | input                          | [`Stamp::parse`]          |
+//! |--------------------------------|---------------------------|
+//! | `5:0:n`, `5:65537:n`           | 5, 0 (65537), `n`         |
+//! | `+5:0:n`, `05:0:n`, `5:00:n`   | refused (not canonical)   |
+//! | `-5:0:n`, `5:-1:n`             | refused (a sign)          |
+//! | `5`, `5:x`, `5:0:`, `5:0:a:b`  | refused (parts)           |
+//! | `5:2147483648:n`               | refused (counter range)   |
+//! | `5:0:a\u{7}b`                  | refused (control in node) |
 //!
-//! Both read an optional sign and ASCII digits only, with no surrounding space, and never panic.
+//! A counter above [`LOGICAL_LIMIT`] that is otherwise canonical parses, so the carrier that holds
+//! it decodes and its signature verifies; every merge point then refuses it as not acceptable
+//! ([`Stamp::is_acceptable`]), which names the signer. A text outside the grammar makes its
+//! carrier undecodable before any signature check.
 //!
 //! # The clock
 //!
 //! [`Hlc`] is one node's clock. It has no global state and no clock of its own: the caller passes
 //! its wall time to [`Hlc::now`] and [`Hlc::observe`], so tests are deterministic and one process
 //! may run many nodes, each with its own `Hlc` (`wire.py` keys one global table by node instead).
+//! It validates its node when it is built ([`Hlc::new`]), so it never issues a stamp a receiver
+//! refuses for its node; it carries into the next millisecond where an increment would pass
+//! [`LOGICAL_LIMIT`], so it never issues the same stamp twice; and it clamps a merged remote
+//! physical part one millisecond inside the drift ceiling, so a carry after the merge lands at
+//! most on the ceiling.
 #![warn(missing_docs)]
 
 use std::cmp::Ordering;
 use std::fmt;
 
 use crate::cbor::Value;
-use crate::limits::MAX_HLC_SKEW_MILLIS;
+use crate::limits::{LOGICAL_LIMIT, MAX_DRIFT_MILLIS, MAX_NODE_UNITS, MAX_STAMP_UNITS};
 use crate::util::java_order;
 
 // ---------------------------------------------------------------------------------------------
 // Stamps
 
-/// A hybrid logical clock stamp, parsed as Java `HlcTimestamp.parse` parses one and ordered as
-/// `HlcTimestamp.compareTo` orders them (physical, logical, then node in Java string order).
+/// A hybrid logical clock stamp in its canonical text, parsed as Java `HlcTimestamp.parse` parses
+/// one and ordered as `HlcTimestamp.compareTo` orders them (physical, logical, then node in Java
+/// string order).
 ///
-/// The crate's one strict stamp parser: [`crate::records`] and [`crate::fold`] judge every stamp
-/// with [`Stamp::parse`]. A `Stamp` borrows its node from the text it was parsed from; its
-/// [`Display`](fmt::Display) form is that text again.
+/// The crate's one stamp parser: [`crate::records`], [`crate::fold`], [`crate::envelope`], and
+/// the schemas of [`crate::schema`] judge every stamp with [`Stamp::parse`]. A `Stamp` borrows its
+/// node from the text it was parsed from; its [`Display`](fmt::Display) form is that text again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Stamp<'a> {
     /// Epoch milliseconds, the signing time; never negative in a parsed stamp.
     pub physical: i64,
-    /// The logical counter; never negative in a parsed stamp.
+    /// The logical counter; never negative in a parsed stamp, and above [`LOGICAL_LIMIT`] only in
+    /// a stamp no merge point accepts.
     pub logical: i32,
-    /// The node id; non-empty and free of `:` in a parsed stamp.
+    /// The node id; non-empty and free of `:` and control characters in a parsed stamp.
     pub node: &'a str,
 }
 
 impl<'a> Stamp<'a> {
-    /// `physical:logical:node` with a non-negative `long`, a non-negative `int`, and a non-empty
-    /// node free of `:` (Java `HlcTimestamp.parse` and its constructor); `None` otherwise. Each
-    /// number is an optional sign and ASCII digits (Java `Long.parseLong` and
-    /// `Integer.parseInt`), with no surrounding space. Never panics.
+    /// The canonical stamp `physical:logical:node` (SPEC §9; see the module rules), or `None`
+    /// for any other text. Never panics.
     pub fn parse(text: &'a str) -> Option<Self> {
+        if !within_units(text, MAX_STAMP_UNITS) {
+            return None;
+        }
         let mut parts = text.splitn(3, ':');
-        let physical: i64 = parts.next()?.parse().ok()?;
-        let logical: i32 = parts.next()?.parse().ok()?;
+        let physical = canonical_digits(parts.next()?)?.parse().ok()?;
+        let logical = canonical_digits(parts.next()?)?.parse().ok()?;
         let node = parts.next()?;
-        let valid = physical >= 0 && logical >= 0 && !node.is_empty() && !node.contains(':');
-        valid.then_some(Self {
+        is_canonical_node(node).then_some(Self {
             physical,
             logical,
             node,
@@ -109,28 +114,27 @@ impl<'a> Stamp<'a> {
         value.and_then(Value::as_str).and_then(Self::parse)
     }
 
-    /// [`Stamp::parse`], and only when `text` is already the canonical form Java writes the stamp
-    /// back as (`HlcTimestamp.encoded`, this type's [`Display`](fmt::Display)): no `+` sign, no
-    /// leading zeros, no `-0`. `None` otherwise. Never panics.
-    ///
-    /// Java decodes a signed stamp into an `HlcTimestamp` and verifies the signature over its
-    /// re-encoding, so `+5:0:n` and `05:0:n` are signed as `5:0:n` there. A verifier here judges
-    /// the bytes it received, so it accepts a stamp only in that canonical form: then both
-    /// verify the same bytes ([`crate::records`], [`crate::envelope`]).
+    /// [`Stamp::parse`], kept under the name it had while the crate also read non-canonical
+    /// stamps: every stamp it parses is canonical now.
     pub fn parse_canonical(text: &'a str) -> Option<Self> {
-        let stamp = Self::parse(text)?;
-        let canonical = |part: &str| part == "0" || !(part.starts_with(['0', '+', '-']));
-        let mut parts = text.splitn(3, ':');
-        let physical = parts.next().is_some_and(canonical);
-        let logical = parts.next().is_some_and(canonical);
-        (physical && logical).then_some(stamp)
+        Self::parse(text)
     }
 
-    /// The stamp a field holds, when it is text that [`Stamp::parse_canonical`] accepts.
+    /// [`Stamp::of`], kept under the name it had while the crate also read non-canonical stamps.
     pub fn canonical_of(value: Option<&'a Value>) -> Option<Self> {
-        value
-            .and_then(Value::as_str)
-            .and_then(Self::parse_canonical)
+        Self::of(value)
+    }
+
+    /// The stamp `text` holds when it parses and is acceptable ([`Stamp::is_acceptable`]): what
+    /// every merge and ordering point takes from a remote party (`wire.acceptable_hlc`).
+    pub fn acceptable(text: &'a str) -> Option<Self> {
+        Self::parse(text).filter(Stamp::is_acceptable)
+    }
+
+    /// Whether a remote stamp may merge into a clock, order a claim, or date a state: its logical
+    /// counter is at most [`LOGICAL_LIMIT`] (Java `HybridLogicalClock.isAcceptable`, SPEC §9).
+    pub fn is_acceptable(&self) -> bool {
+        self.logical <= LOGICAL_LIMIT
     }
 }
 
@@ -156,13 +160,32 @@ impl fmt::Display for Stamp<'_> {
     }
 }
 
+/// Whether `node` may be a stamp's node part (SPEC §9, Java `HlcTimestamp.canonicalNode`):
+/// non-empty, with no `:` and no control character (U+0000 to U+001F, U+007F). A Rust string holds
+/// no lone surrogate, the grammar's last rule.
+pub fn is_canonical_node(node: &str) -> bool {
+    !node.is_empty() && !node.chars().any(|c| c == ':' || c < ' ' || c == '\u{7F}')
+}
+
+/// `part` when it is `0` or a non-zero ASCII digit followed by ASCII digits.
+fn canonical_digits(part: &str) -> Option<&str> {
+    let digits = !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    (digits && (part == "0" || !part.starts_with('0'))).then_some(part)
+}
+
+/// Whether `text` holds at most `limit` UTF-16 code units. A UTF-8 text never has more code units
+/// than bytes, so a short text is decided without counting.
+fn within_units(text: &str, limit: usize) -> bool {
+    text.len() <= limit || text.encode_utf16().count() <= limit
+}
+
 /// The physical milliseconds of a stamp, read leniently: the text before the first `:` (all of
 /// it when there is none) as a signed decimal `i64` (Java `Long.parseLong`, an optional sign then
 /// ASCII digits), or `None` when that part is not such a number. Nothing after the first `:` is
 /// looked at, and a negative physical time is returned as it is.
 ///
-/// These are the Java frame filter's rules and `wire.hlc_physical`'s; see the module table for
-/// how they differ from [`Stamp::parse`]. Never panics.
+/// No judgment in this crate reads a stamp this way any more: a stamp outside the canonical
+/// grammar is no stamp (SPEC §9). It stays for callers that display a stamp's time. Never panics.
 pub fn physical_lenient(stamp: &str) -> Option<i64> {
     stamp
         .split_once(':')
@@ -174,12 +197,23 @@ pub fn physical_lenient(stamp: &str) -> Option<i64> {
 // ---------------------------------------------------------------------------------------------
 // The clock
 
-/// One node's hybrid logical clock (`wire.py`'s `hlc_now` and `hlc_observe`, per node): stamps it
-/// issues never run backwards, two stamps it issues never collide, and a stamp issued after an
-/// observed remote stamp sorts after it.
-///
-/// The node should be a PeerID or an agent id (non-empty, free of `:`); otherwise the stamps it
-/// issues are not stamps [`Stamp::parse`] accepts.
+/// Why a clock could not be built for a node.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum HlcError {
+    /// The node is empty, or holds a `:` or a control character, so no stamp could carry it.
+    #[error("a stamp node is non-empty and holds no ':' and no control character: {0:?}")]
+    InvalidNode(String),
+    /// The node is longer than [`MAX_NODE_UNITS`] UTF-16 code units, so a stamp it issued could
+    /// pass [`MAX_STAMP_UNITS`].
+    #[error("a stamp node holds at most {MAX_NODE_UNITS} UTF-16 code units")]
+    NodeTooLong,
+}
+
+/// One node's hybrid logical clock (`wire.py`'s `hlc_now` and `hlc_observe`, per node, with Java
+/// `HybridLogicalClock` as the authority): stamps it issues never run backwards, never repeat,
+/// never carry a counter above [`LOGICAL_LIMIT`], and a stamp issued after an observed remote
+/// stamp sorts after it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hlc {
     node: String,
@@ -190,13 +224,23 @@ pub struct Hlc {
 }
 
 impl Hlc {
-    /// A clock for `node` that has issued and observed nothing.
-    pub fn new(node: impl Into<String>) -> Self {
-        Self {
-            node: node.into(),
+    /// A clock for `node` that has issued and observed nothing. Refuses a node no stamp can carry
+    /// ([`is_canonical_node`]) and one longer than [`MAX_NODE_UNITS`] UTF-16 code units, as Java's
+    /// `HybridLogicalClock` constructor does (SPEC §9: a node validates its own node part where it
+    /// builds a clock, so it never emits a stamp a receiver refuses for its node).
+    pub fn new(node: impl Into<String>) -> Result<Self, HlcError> {
+        let node = node.into();
+        if !is_canonical_node(&node) {
+            return Err(HlcError::InvalidNode(node));
+        }
+        if !within_units(&node, MAX_NODE_UNITS) {
+            return Err(HlcError::NodeTooLong);
+        }
+        Ok(Self {
+            node,
             physical: 0,
             logical: -1,
-        }
+        })
     }
 
     /// The node this clock stamps.
@@ -212,15 +256,20 @@ impl Hlc {
     /// A fresh stamp `physical:logical:node` at `now_ms` on the caller's clock (`wire.hlc_now`):
     /// when `now_ms` is past the clock's physical time the stamp takes it with counter 0;
     /// otherwise (a clock that stood still or ran backwards, or a merged remote stamp ahead of
-    /// it) the physical time stays and the counter advances by one. The counter saturates at
-    /// `i32::MAX` rather than overflow (Java `HybridLogicalClock.incrementLogical`), so a stamp
-    /// stays one Java can parse.
+    /// it) the physical time stays and the counter advances by one. Where the counter would pass
+    /// [`LOGICAL_LIMIT`] the clock carries instead: the physical time advances one millisecond and
+    /// the counter starts at 0 (SPEC §9, Java `HybridLogicalClock.advance`), so the clock never
+    /// returns the same stamp twice. Only a caller whose clock reads `i64::MAX` could exhaust the
+    /// carry; the physical time then stays there.
     pub fn now(&mut self, now_ms: i64) -> String {
         if now_ms > self.physical {
             self.physical = now_ms;
             self.logical = 0;
+        } else if self.logical < LOGICAL_LIMIT {
+            self.logical += 1;
         } else {
-            self.logical = self.logical.saturating_add(1);
+            self.physical = self.physical.saturating_add(1);
+            self.logical = 0;
         }
         format!("{}:{}:{}", self.physical, self.logical, self.node)
     }
@@ -228,20 +277,22 @@ impl Hlc {
     /// Merges a remote stamp observed at `now_ms` on the caller's clock (`wire.hlc_observe`), so
     /// later stamps from [`Hlc::now`] sort after it, and returns whether the clock advanced.
     ///
-    /// A stamp that [`Stamp::parse`] refuses is ignored, as is one whose physical time is more
-    /// than [`MAX_HLC_SKEW_MILLIS`] ahead of `now_ms`: a hostile far-future stamp cannot pin this
-    /// clock. Otherwise the clock takes the stamp's `(physical, logical)` when that
-    /// pair is later than its own. The arithmetic is exact, so no stamp can overflow it.
+    /// Only an acceptable stamp merges ([`Stamp::acceptable`]): one that does not parse, or
+    /// whose counter is above [`LOGICAL_LIMIT`], never reaches the clock. The remote physical
+    /// time is clamped to `now_ms + MAX_DRIFT_MILLIS - 1`, one millisecond inside the drift
+    /// ceiling (SPEC §9, v0.1.30), so a hostile far-future stamp cannot pin this clock and a
+    /// carry after the merge lands at most on the ceiling. The clock then takes the clamped
+    /// `(physical, logical)` pair when it is later than its own. The arithmetic saturates, so no
+    /// stamp can overflow it.
     pub fn observe(&mut self, stamp: &str, now_ms: i64) -> bool {
-        let Some(stamp) = Stamp::parse(stamp) else {
+        let Some(stamp) = Stamp::acceptable(stamp) else {
             return false;
         };
-        if i128::from(stamp.physical) > i128::from(now_ms) + i128::from(MAX_HLC_SKEW_MILLIS) {
-            return false;
-        }
-        let later = (stamp.physical, stamp.logical) > (self.physical, self.logical);
+        let ceiling = now_ms.saturating_add(MAX_DRIFT_MILLIS - 1);
+        let physical = stamp.physical.min(ceiling);
+        let later = (physical, stamp.logical) > (self.physical, self.logical);
         if later {
-            self.physical = stamp.physical;
+            self.physical = physical;
             self.logical = stamp.logical;
         }
         later
@@ -253,21 +304,93 @@ mod tests {
     use super::*;
 
     #[test]
-    fn canonical_stamps_are_what_java_writes_back() {
-        for text in ["5:0:n", "0:0:n", "1735689600000:3:zPeer", "5:0:a/b"] {
-            assert_eq!(Stamp::parse_canonical(text), Stamp::parse(text), "{text}");
-            assert!(Stamp::parse_canonical(text).is_some(), "{text}");
-        }
-        // Java's HlcTimestamp parses each of these and writes it back as `5:0:n` or `0:0:n`.
+    fn a_stamp_has_one_text() {
         for text in [
-            "+5:0:n", "05:0:n", "-0:0:n", "5:+0:n", "5:00:n", "5:-0:n", "00:0:n",
+            "5:0:n",
+            "0:0:n",
+            "1735689600000:3:zPeer",
+            "5:0:a/b",
+            "5:65537:n",
         ] {
             assert!(Stamp::parse(text).is_some(), "{text}");
-            assert_eq!(Stamp::parse_canonical(text), None, "{text}");
+            assert_eq!(Stamp::parse_canonical(text), Stamp::parse(text), "{text}");
+            assert_eq!(
+                Stamp::parse(text).map(|s| s.to_string()).as_deref(),
+                Some(text)
+            );
         }
-        assert_eq!(Stamp::parse_canonical("5:0:"), None);
+        // Java's HlcTimestamp refuses each of these since v0.1.30.
+        for text in [
+            "+5:0:n",
+            "05:0:n",
+            "-0:0:n",
+            "5:+0:n",
+            "5:00:n",
+            "5:-0:n",
+            "00:0:n",
+            "5:0:",
+            "5:0:a\u{1}b",
+            "5:0:a\u{7F}",
+            "5:0:a:b",
+            " 5:0:n",
+            "5:0 :n",
+            "5.0:0:n",
+            "5e1:0:n",
+        ] {
+            assert_eq!(Stamp::parse(text), None, "{text:?}");
+        }
         let value = Value::from("+5:0:n");
-        assert!(Stamp::of(Some(&value)).is_some());
+        assert_eq!(Stamp::of(Some(&value)), None);
         assert_eq!(Stamp::canonical_of(Some(&value)), None);
+    }
+
+    #[test]
+    fn a_stamp_fits_one_definite_text() {
+        let node = "n".repeat(MAX_STAMP_UNITS - 4);
+        let longest = format!("5:0:{node}");
+        assert_eq!(longest.encode_utf16().count(), MAX_STAMP_UNITS);
+        assert!(Stamp::parse(&longest).is_some());
+        assert_eq!(Stamp::parse(&format!("{longest}n")), None);
+        // A character past U+FFFF is two code units.
+        let wide = format!("5:0:{}{}", "n".repeat(MAX_STAMP_UNITS - 6), '\u{1F600}');
+        assert_eq!(wide.encode_utf16().count(), MAX_STAMP_UNITS);
+        assert!(Stamp::parse(&wide).is_some());
+        assert_eq!(Stamp::parse(&format!("{wide}n")), None);
+    }
+
+    #[test]
+    fn a_counter_above_the_limit_parses_and_is_not_acceptable() {
+        let limit = format!("5:{LOGICAL_LIMIT}:n");
+        let above = format!("5:{}:n", LOGICAL_LIMIT + 1);
+        assert!(Stamp::acceptable(&limit).is_some());
+        assert!(Stamp::parse(&above).is_some());
+        assert_eq!(Stamp::acceptable(&above), None);
+        assert_eq!(
+            Stamp::parse(&format!("5:{}:n", i64::from(i32::MAX) + 1)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_clock_refuses_a_node_no_stamp_carries() {
+        for node in ["", "a:b", "a\u{0}", "tab\t", "del\u{7F}"] {
+            assert_eq!(
+                Hlc::new(node),
+                Err(HlcError::InvalidNode(node.into())),
+                "{node:?}"
+            );
+        }
+        assert!(Hlc::new("n".repeat(MAX_NODE_UNITS)).is_ok());
+        assert_eq!(
+            Hlc::new("n".repeat(MAX_NODE_UNITS + 1)),
+            Err(HlcError::NodeTooLong)
+        );
+        // The longest node still issues a stamp that fits, whatever its parts grow to.
+        let mut hlc = Hlc::new("n".repeat(MAX_NODE_UNITS)).expect("a node");
+        let mut stamp = hlc.now(i64::MAX);
+        for _ in 0..3 {
+            stamp = hlc.now(i64::MAX);
+        }
+        assert!(Stamp::parse(&stamp).is_some());
     }
 }

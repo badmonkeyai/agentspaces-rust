@@ -144,12 +144,13 @@ pub fn hello_body(
     })
 }
 
-/// The hello a body decodes to, or `None` when it is not one: the body must be a CBOR map whose
-/// `ephemeralKey` is a 32-byte string, whose `nonce` is a byte string of [`MIN_NONCE_LENGTH`] to
-/// [`MAX_NONCE_LENGTH`] bytes, whose `remote` is text, and whose `echo` is absent, null, or a
-/// byte string. Other keys are ignored. Never panics.
+/// The hello a body decodes to, or `None` when it is not one: the body must be a
+/// `Bodies.SessionHello` record under the wire encoding (SPEC §9.1, annex I: the four fields in
+/// order and no other, with the canonical-bytes check) whose `ephemeralKey` is a 32-byte string,
+/// whose `nonce` is a byte string of [`MIN_NONCE_LENGTH`] to [`MAX_NONCE_LENGTH`] bytes, whose
+/// `remote` is text, and whose `echo` is null or a byte string. Never panics.
 pub fn parse_hello(body: &[u8]) -> Option<SessionHello> {
-    let value = cbor::decode(body).ok()?;
+    let value = crate::schema::decode(body, "Bodies.SessionHello")?;
     let hello = value.as_map()?;
     let ephemeral_key =
         <[u8; KEY_LENGTH]>::try_from(hello.get("ephemeralKey")?.as_bytes()?).ok()?;

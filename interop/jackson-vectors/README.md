@@ -55,7 +55,7 @@ The generator fails (exit 1) when a number's encoding does not read back through
 
 ## Regenerate
 
-Maven runs offline against `~/.m2` (the AgentSpaces 0.5.0 jars and Jackson 2.21.7 must be there):
+Maven runs offline against `~/.m2` (the AgentSpaces 0.6.0 jars and Jackson 2.21.7 must be there):
 
 ```sh
 cd interop/jackson-vectors

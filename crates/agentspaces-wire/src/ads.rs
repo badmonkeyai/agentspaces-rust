@@ -13,14 +13,33 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Advertisements (SPEC §5.1, §5.2, §6.1, §6.2), a port of `wire.py`'s `peer_advertisement`,
+//! Advertisements (SPEC §5.1, §5.2, §6.1 to §6.3), a port of `wire.py`'s `peer_advertisement`,
 //! `stored_ad`, `signed_peer_ad`, `agent_card`, `card_action`, `ui_declaration`, `ui_component`,
 //! and `app_card_host`, the TypeScript client's `spaceAdvertisement`, the checks of
-//! `Peer.accept_ad` and `Peer._accept_peer_ad`, and the Java `AppCard` record. Java's records
-//! are the authority on bytes: every builder writes its map in the record's field order, a field
-//! the record omits when absent is omitted here too (so older cards keep their bytes), and a
-//! map-valued field a signature covers (`resourceHints`, `costHints`, `spaceBindings`) is put in
-//! canonical order.
+//! `Peer.accept_ad` and `Peer._accept_peer_ad`, and the Java `AppCard`, `AgentCard`, and
+//! `CardSpill` records. Java's records are the authority on bytes: every builder writes its map
+//! in the record's field order, a field the record omits when absent is omitted here too (so
+//! older cards keep their bytes), and a map-valued field a signature covers (`resourceHints`,
+//! `costHints`, `spaceBindings`, `origin.attrs`) is put in canonical order.
+//!
+//! # The AppCard revision (SPEC v0.1.32, §6.1a.2 to §6.1a.6)
+//!
+//! - An `AppCard`'s `kind` says how the app connects and is closed to `peer`, `fed`, `gateway`,
+//!   and `assembled` ([`APP_KINDS`]); `host.signOn` is `idp` or `none` ([`HOST_SIGN_ONS`]). A
+//!   reader treats a card with any other closed value as undecodable (SPEC §6.1b).
+//! - `origin` ([`app_card_origin`]) and `formats` ([`formats_hold`]) are open values under a
+//!   grammar and bounds; a reader never refuses a value the registry lacks.
+//! - No card kind has a size cap: a card whose encoding passes 65,536 bytes travels as a stub
+//!   whose large parts sit in a content-swarm document it references (`spill`, [`card_spill`],
+//!   [`spill_card`]). A reader verifies the reference and its placeholders when it decodes the
+//!   card, and [`resolve_spill`] checks a fetched document against it. Fetching the document
+//!   needs the content swarm, which this peer does not run yet, so it keeps stubs as they are.
+//! - The member hint `wire.appcard=2` ([`HINT_APP_CARD`], [`app_card_level`]) gates `origin`,
+//!   `formats`, a `host` whose `signOn` is `idp`, and `spill` on the whole view
+//!   ([`app_card_at_level`]).
+//! - A content store advertises itself by an `AssetCard` ([`content_store_of`]).
+//! - Every advertisement cache holds a byte budget instead of the old 4 KiB card sentence
+//!   (SPEC §6.3; [`crate::limits::AD_CACHE_MAX_BYTES`]).
 //!
 //! An advertisement travels signed in one of two wrappers:
 //!
@@ -97,9 +116,23 @@ pub enum AdError {
     /// A host names no url.
     #[error("a host has a url")]
     EmptyUrl,
+    /// A card's agent local name is empty or holds `/` or `:` (Java `AgentId`, SPEC §9.2 R5).
+    #[error("an agent's local name is non-empty and holds no '/' and no ':': {0:?}")]
+    InvalidLocalName(String),
     /// A host's `signOn` is not one of [`HOST_SIGN_ONS`].
-    #[error("a host's signOn is tenant or none: {0:?}")]
+    #[error("a host's signOn is idp or none: {0:?}")]
     InvalidSignOn(String),
+    /// An app card's `origin` breaks a bound or a grammar of SPEC §6.1a.2.
+    #[error("an AppCard's origin breaks a bound or a grammar: {0}")]
+    InvalidOrigin(&'static str),
+    /// An app card's `formats` is not 1 to 16 distinct lower-case media types without a parameter
+    /// or vocabulary IRIs (SPEC §6.1a.2).
+    #[error("an AppCard's formats are 1 to 16 distinct media types or vocabulary IRIs: {0:?}")]
+    InvalidFormats(Vec<String>),
+    /// A card spill reference breaks a rule of SPEC §6.1a.5, or a stub holds a spill-set field
+    /// beyond its placeholder.
+    #[error("a card's spill reference or its placeholders break SPEC 6.1a.5: {0}")]
+    InvalidSpill(&'static str),
     /// A host's `status` is not one of [`HOST_STATUSES`].
     #[error("a host's status is serving or stopped: {0:?}")]
     InvalidStatus(String),
@@ -201,8 +234,8 @@ pub fn signed_peer_ad(ad: &Map, identity: &Identity) -> Vec<u8> {
 /// otherwise; never panics. The advertisement's lifetime is not judged (the caller keeps it
 /// under its issuer until a newer one replaces it).
 pub fn verify_signed_peer_ad(payload: &[u8]) -> Option<(Map, String)> {
-    let signed = cbor::decode(payload).ok()?;
-    let (ad, issuer) = verified_ad(signed.as_map()?)?;
+    let signed = crate::schema::decode(payload, "PeerNode.SignedPeerAd")?;
+    let (ad, issuer) = verified_ad(signed.as_map()?, AD_TYPE_PEER)?;
     Some((ad, issuer))
 }
 
@@ -219,9 +252,16 @@ pub fn stored_ad(ad_type: &str, ad: &Map, identity: &Identity) -> Map {
 /// `AdCache.accept`: the type tag, advertisement, and issuer of a stored advertisement admitted
 /// at `now_ms` on the receiver's clock, or `None`. The checks, every one of which must pass:
 ///
-/// - `stored` is a map with a text `adType` among [`AD_TYPES`], byte `adBytes`, a 32-byte
-///   `publicKey`, and a byte `signature` that verifies over `adBytes` under that key;
-/// - `adBytes` decode to a map whose `issuer` is the PeerID the key hashes to;
+/// - `stored` is an `AdCache.StoredAd` record (SPEC §9.1, annex I) whose `adType` is one of
+///   [`AD_TYPES`], with a 32-byte `publicKey` and a `signature` that verifies over `adBytes`
+///   under that key;
+/// - `adBytes` decode as the record its `adType` names, under the wire encoding with the
+///   canonical-bytes check (`CborCodec.fromWire`), and that record's value rules hold: for an
+///   `AppCard` the closed `kind`, `shape`, `ui.transport`, component roles, `host.signOn`
+///   (`idp` or `none`) and `host.status`, the grammars and bounds of `origin` and `formats`, and
+///   the spill reference with its placeholders (SPEC §6.1a.2 to §6.1a.5, §6.1b); for an
+///   `AgentCard` its actions, ui controls, certificate binding, and spill reference;
+/// - the record's `issuer` is the PeerID the key hashes to;
 /// - its `issued` and `ttl` parse, it has not expired (`now_ms < issued + ttl`), its `issued`
 ///   leads `now_ms` by at most [`MAX_AD_ISSUED_SKEW_MILLIS`], and its `ttl` is at most
 ///   [`MAX_AD_TTL_MILLIS`];
@@ -243,15 +283,18 @@ pub fn stored_ad(ad_type: &str, ad: &Map, identity: &Identity) -> Map {
 /// `EmbabelBinder`, and the examples build `identity.agent(name)` under the signing peer), so
 /// nothing Java sends is refused here.
 ///
-/// What needs state stays with the caller: the revocation registry, the cache bound, and
-/// last-writer-wins by `issued` per issuer and advertisement `id`. Never panics.
+/// What needs state stays with the caller: the revocation registry, the cache's entry bound and
+/// byte budget (SPEC §6.3), and last-writer-wins by `issued` per issuer and advertisement `id`.
+/// A stub (a card with `spill`) is admitted as it is: resolving its parts needs the content
+/// swarm ([`resolve_spill`]). Never panics.
 pub fn verify_stored_ad(stored: &Value, now_ms: i64) -> Option<(String, Map, String)> {
-    let stored = stored.as_map()?;
-    let ad_type = stored.get("adType")?.as_str()?;
-    if !AD_TYPES.contains(&ad_type) {
+    if !crate::schema::conforms(stored, "AdCache.StoredAd") {
         return None;
     }
-    let (ad, issuer) = verified_ad(stored)?;
+    let stored = stored.as_map()?;
+    let ad_type = stored.get("adType")?.as_str()?;
+    let ad_type = AD_TYPES.into_iter().find(|known| *known == ad_type)?;
+    let (ad, issuer) = verified_ad(stored, ad_type)?;
     let issued_ms = time::parse_instant_millis(ad.get("issued")?.as_str()?).ok()?;
     let ttl_ms = time::parse_duration_millis(ad.get("ttl")?.as_str()?).ok()?;
     let (now, issued, ttl) = (
@@ -309,8 +352,11 @@ fn signed_wrapper(ad_type: Option<&str>, ad: &Map, identity: &Identity) -> Map {
     signed
 }
 
-/// The shared signature and issuer checks of both wrappers.
-fn verified_ad(signed: &Map) -> Option<(Map, String)> {
+/// The shared signature and issuer checks of both wrappers: the `adBytes` decode as the record
+/// `record` under the wire encoding (SPEC §9.1, annex I), with its value rules (SPEC §6.1a.2 to
+/// §6.1a.5 for the cards), and the signature over them verifies under a key that hashes to the
+/// record's `issuer`.
+fn verified_ad(signed: &Map, record: &str) -> Option<(Map, String)> {
     let ad_bytes = signed.get("adBytes")?.as_bytes()?;
     let key = signed
         .get("publicKey")?
@@ -320,7 +366,7 @@ fn verified_ad(signed: &Map) -> Option<(Map, String)> {
     if !Identity::verify(key, ad_bytes, signature) {
         return None;
     }
-    let ad = cbor::decode(ad_bytes).ok()?.into_map()?;
+    let ad = crate::schema::decode_map(ad_bytes, record)?;
     let issuer = ids::derive_id(key);
     (ad.get("issuer").and_then(Value::as_str) == Some(issuer.as_str())).then_some((ad, issuer))
 }
@@ -346,7 +392,8 @@ fn names_own_agent(card: &Map, issuer: &str) -> bool {
 /// (`actions` when empty) so earlier cards keep their bytes.
 ///
 /// A certificate must certify `agent_public_raw` for this card's agent
-/// ([`AdError::CertificateMismatch`]).
+/// ([`AdError::CertificateMismatch`]), and the local name must be one Java's `AgentId` holds
+/// ([`AdError::InvalidLocalName`]).
 #[expect(
     clippy::too_many_arguments,
     reason = "mirrors wire.py's agent_card and the Java AgentCard record field for field"
@@ -368,6 +415,9 @@ pub fn agent_card(
     agent_certificate: Option<&Map>,
     ui: Option<&Map>,
 ) -> Result<Map, AdError> {
+    if !ids::is_local_name(local_name) {
+        return Err(AdError::InvalidLocalName(local_name.to_owned()));
+    }
     let agent = identity.agent(local_name);
     if let Some(certificate) = agent_certificate {
         let certifies_key = agent_public_raw.is_some_and(|key| {
@@ -467,7 +517,7 @@ pub const UI_PROTOCOL: &str = "a2ui";
 /// The A2UI version a declaration names by default.
 pub const UI_VERSION: &str = "v0.9.1";
 /// The roles a ui component may have: a self-standing block, an input, one line in a list.
-pub const UI_ROLES: [&str; 3] = ["panel", "control", "row"];
+pub use crate::schema::UI_ROLES;
 
 /// One component of a `UiDeclaration` (SPEC §6.1a.3) in Java field order: `id`, `catalogId`,
 /// `component`, `entry` (the standard entry type IRI behind it, empty when none), `controls`
@@ -530,26 +580,20 @@ pub fn ui_declaration(
 // ---------------------------------------------------------------------------------------------
 // App cards
 
-/// The kinds of app an `AppCard` advertises (`AppCard.KINDS`).
-pub const APP_KINDS: [&str; 5] = ["peer", "fed", "gateway", "realm", "assembled"];
-/// The shapes of app an `AppCard` advertises (`AppCard.SHAPES`).
-pub const APP_SHAPES: [&str; 4] = ["web", "desktop", "static", "a2ui"];
-/// The transports of an app card's surfaces (`AppCard.TRANSPORTS`).
-pub const APP_TRANSPORTS: [&str; 2] = ["views", "a2a"];
-/// The most terms an app card's lists carry (`AppCard.MAX_TERMS`).
-pub const APP_MAX_TERMS: usize = 64;
-/// The most components a ui carries (`UiDeclaration.MAX_COMPONENTS`).
-pub const UI_MAX_COMPONENTS: usize = 32;
-/// How a published app's host lets end users in: the tenant's identity provider, or no sign-on.
-pub const HOST_SIGN_ONS: [&str; 2] = ["tenant", "none"];
-/// Whether a published app's host serves it.
-pub const HOST_STATUSES: [&str; 2] = ["serving", "stopped"];
+pub use crate::schema::{
+    AGENT_CARD_SPILL_SET, APP_CARD_SPILL_SET, APP_KINDS, APP_MAX_FORMAT_UNITS, APP_MAX_FORMATS,
+    APP_MAX_TERMS, APP_SHAPES, APP_TRANSPORTS, CARD_MAX_ACTIONS, CONTENT_ROOT_LENGTH,
+    HOST_SIGN_ONS, HOST_STATUSES, SPILL_MAX_SIZE, UI_MAX_COMPONENTS, formats_hold, is_content_root,
+};
 
-/// The host group of a published `AppCard` (SPEC §6.1a.4, v0.1.28) in Java field order: `url`,
-/// `port` (0 when the url says it all), `hostAgent`, `path` (`"/"` when empty), `signOn` (one of
-/// [`HOST_SIGN_ONS`]), `publishedBy`, `publishedAt` (an ISO instant), `status` (one of
-/// [`HOST_STATUSES`]). Appended last on the card ([`AppCard::host`]); a card without it keeps its
-/// bytes. Refuses an empty url, an unknown sign-on, and an unknown status, as `wire.py` does.
+/// The host group of a published `AppCard` (SPEC §6.1a.4, v0.1.28; v0.1.32 sign-on values) in
+/// Java field order: `url`, `port` (0 when the url says it all), `hostAgent`, `path` (`"/"` when
+/// empty), `signOn` (one of [`HOST_SIGN_ONS`]: `idp`, the identity provider of whoever runs the
+/// host, or `none`; empty reads as `idp`), `publishedBy`, `publishedAt` (an ISO instant),
+/// `status` (one of [`HOST_STATUSES`]). Appended after `ui` on the card ([`AppCard::host`]); a
+/// card without it keeps its bytes. Refuses an empty url, an unknown sign-on (`tenant`, the value
+/// of v0.1.28 to v0.1.31, included), and an unknown status, as Java's `AppCard.Host` does. A
+/// host whose `signOn` is `idp` travels only under the AppCard level ([`app_card_at_level`]).
 #[expect(
     clippy::too_many_arguments,
     reason = "mirrors wire.py's app_card_host and the Java AppCard.Host record field for field"
@@ -567,6 +611,7 @@ pub fn app_card_host(
     if url.is_empty() {
         return Err(AdError::EmptyUrl);
     }
+    let sign_on = or_default(sign_on, "idp");
     if !HOST_SIGN_ONS.contains(&sign_on) {
         return Err(AdError::InvalidSignOn(sign_on.to_owned()));
     }
@@ -620,8 +665,62 @@ pub fn app_card_ui(
     Ok(ui)
 }
 
-/// An `AppCard` (SPEC §6.1a.2, v0.1.25): an application advertised in a fleet. Fill the fields
-/// (`..Default::default()` leaves the rest empty) and build the card with [`AppCard::to_map`].
+/// The origin of an `AppCard` (SPEC §6.1a.2, v0.1.32), `AppCard.Origin` in Java field order:
+/// `system` (1 to 64 of `[a-z0-9.-]`, starting and ending with a letter or digit), `ref` (the
+/// app's identifier in that system, 1 to 256 UTF-16 code units with no control character),
+/// `version` (0 to 64 code units with no control character), and `attrs`, omitted when `None` or
+/// empty (Java's builder), else 1 to 8 entries keyed `<system>.<[a-z0-9.-]+>` (at most 128 code
+/// units) with values of 0 to 256 code units and no control character, written in canonical
+/// order. The values are open: a system, key, or value the registry lacks is fine when it meets
+/// the grammar.
+pub fn app_card_origin(
+    system: &str,
+    reference: &str,
+    version: &str,
+    attrs: Option<&Map>,
+) -> Result<Map, AdError> {
+    let mut origin = Map::with_capacity(4);
+    origin.insert("system", system);
+    origin.insert("ref", reference);
+    origin.insert("version", version);
+    if let Some(attrs) = attrs.filter(|attrs| !attrs.is_empty()) {
+        origin.insert("attrs", cbor::canonical_map(attrs));
+    }
+    if !crate::schema::conforms(&Value::Map(origin.clone()), "AppCard.Origin") {
+        return Err(AdError::InvalidOrigin(
+            "system, ref, version, or attrs outside SPEC 6.1a.2",
+        ));
+    }
+    Ok(origin)
+}
+
+/// A card's spill reference, `CardSpill {root, size, parts}` (SPEC §6.1a.5, v0.1.32): the
+/// parts document's content root ([`is_content_root`], [`content_root`]), its length in bytes
+/// (1 to [`SPILL_MAX_SIZE`]), and the spill-set fields whose full value is non-empty, distinct
+/// and in the card's field order.
+pub fn card_spill(root: &str, size: u64, parts: &[&str]) -> Result<Map, AdError> {
+    if !is_content_root(root) {
+        return Err(AdError::InvalidSpill(
+            "root is no content root of codec raw over sha2-256",
+        ));
+    }
+    let size = i64::try_from(size)
+        .ok()
+        .filter(|size| (1..=SPILL_MAX_SIZE).contains(size))
+        .ok_or(AdError::InvalidSpill("size lies outside 1 to 2^53 - 1"))?;
+    let mut spill = Map::with_capacity(3);
+    spill.insert("root", root);
+    spill.insert("size", size);
+    spill.insert("parts", text_list(parts));
+    if !crate::schema::conforms(&Value::Map(spill.clone()), "CardSpill") {
+        return Err(AdError::InvalidSpill("parts are empty or repeat a name"));
+    }
+    Ok(spill)
+}
+
+/// An `AppCard` (SPEC §6.1a.2, v0.1.25; revised in v0.1.32): an application advertised in a
+/// fleet. Fill the fields (`..Default::default()` leaves the rest empty) and build the card with
+/// [`AppCard::to_map`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AppCard<'a> {
     /// The advertisement id, e.g. `aspace://<group>/app/<issuer>/<slug>`.
@@ -636,7 +735,8 @@ pub struct AppCard<'a> {
     pub ttl: &'a str,
     /// The app's name; must not be blank.
     pub name: &'a str,
-    /// One of [`APP_KINDS`]; blank reads as `"fed"`.
+    /// How the app connects, one of [`APP_KINDS`] (`peer`, `fed`, `gateway`, `assembled`); blank
+    /// reads as `"fed"`.
     pub kind: &'a str,
     /// One of [`APP_SHAPES`]; blank reads as `"web"`.
     pub shape: &'a str,
@@ -658,16 +758,29 @@ pub struct AppCard<'a> {
     pub views: &'a [&'a str],
     /// The surfaces it draws ([`app_card_ui`]); required for an `a2ui` app, omitted when `None`.
     pub ui: Option<&'a Map>,
-    /// Where it is served ([`app_card_host`]), appended last and omitted when `None`.
+    /// Where it is served ([`app_card_host`]), appended after `ui` and omitted when `None`.
     pub host: Option<&'a Map>,
+    /// The external system it came from ([`app_card_origin`], v0.1.32), omitted when `None`.
+    pub origin: Option<&'a Map>,
+    /// The media types and vocabulary IRIs it reads or renders (v0.1.32), in the issuer's order;
+    /// omitted when empty. A media type is lower-cased and a repeated entry dropped after its
+    /// first occurrence, as Java's `withFormats` does, then the list must meet
+    /// [`formats_hold`].
+    pub formats: &'a [&'a str],
+    /// The reference to its parts document when the card is a stub ([`card_spill`], v0.1.32),
+    /// appended last and omitted when `None`. A stub holds `[]` in `reads`, `actions`, and
+    /// `views` and no `ui`.
+    pub spill: Option<&'a Map>,
 }
 
 impl AppCard<'_> {
     /// The card in Java field order: `id`, `issuer`, `group`, `issued`, `ttl`, `name`, `kind`,
     /// `shape`, `owner`, `reads`, `actions`, `idpClient`, `url`, `pkg`, `version`, `views`, then
-    /// `ui` and `host` when present. Refuses what the Java record refuses: a blank name, an
-    /// unknown kind or shape, more than [`APP_MAX_TERMS`] reads, actions, or views, and an
-    /// `a2ui` app without a ui.
+    /// `ui`, `host`, `origin`, `formats`, and `spill` when present. Refuses what the Java record
+    /// refuses: a blank name, a kind or shape outside its closed set, more than
+    /// [`APP_MAX_TERMS`] reads, actions, or views, an `a2ui` app without a ui (unless its ui
+    /// spilled), formats outside their grammar, and a stub whose spill-set fields hold more than
+    /// their placeholders.
     pub fn to_map(&self) -> Result<Map, AdError> {
         if self.name.trim().is_empty() {
             return Err(AdError::EmptyName);
@@ -683,10 +796,36 @@ impl AppCard<'_> {
         bounded("reads", self.reads.len(), APP_MAX_TERMS)?;
         bounded("actions", self.actions.len(), APP_MAX_TERMS)?;
         bounded("views", self.views.len(), APP_MAX_TERMS)?;
-        if shape == "a2ui" && self.ui.is_none() {
+        let ui_spilled = self.spill.is_some_and(|spill| {
+            spill
+                .get("parts")
+                .and_then(Value::as_array)
+                .is_some_and(|parts| parts.contains(&Value::from("ui")))
+        });
+        if shape == "a2ui" && self.ui.is_none() && !ui_spilled {
             return Err(AdError::MissingUi);
         }
-        let mut card = Map::with_capacity(18);
+        let formats = normalized_formats(self.formats);
+        if !formats.is_empty()
+            && !formats_hold(&formats.iter().map(String::as_str).collect::<Vec<_>>())
+        {
+            return Err(AdError::InvalidFormats(formats));
+        }
+        if let Some(spill) = self.spill {
+            let placeholders = self.reads.is_empty()
+                && self.actions.is_empty()
+                && self.views.is_empty()
+                && self.ui.is_none();
+            if !placeholders {
+                return Err(AdError::InvalidSpill(
+                    "a stub holds [] in reads, actions, and views and no ui",
+                ));
+            }
+            if !crate::schema::conforms(&Value::Map(spill.clone()), "CardSpill") {
+                return Err(AdError::InvalidSpill("not a CardSpill"));
+            }
+        }
+        let mut card = Map::with_capacity(21);
         card.insert("id", self.id);
         card.insert("issuer", self.issuer);
         card.insert("group", self.group);
@@ -709,8 +848,478 @@ impl AppCard<'_> {
         if let Some(host) = self.host {
             card.insert("host", host.clone());
         }
+        if let Some(origin) = self.origin {
+            card.insert("origin", origin.clone());
+        }
+        if !formats.is_empty() {
+            card.insert(
+                "formats",
+                formats.into_iter().map(Value::from).collect::<Vec<_>>(),
+            );
+        }
+        if let Some(spill) = self.spill {
+            card.insert("spill", spill.clone());
+        }
         Ok(card)
     }
+}
+
+/// Java's `AppCard.withFormats`: a media type (an entry without `:`) lower-cased, a repeated entry
+/// dropped after its first occurrence, the issuer's order kept.
+fn normalized_formats(formats: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(formats.len());
+    for format in formats {
+        let format = if format.contains(':') {
+            (*format).to_owned()
+        } else {
+            format.to_lowercase()
+        };
+        if !out.contains(&format) {
+            out.push(format);
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------------------------
+// The card spill (SPEC §6.1a.5)
+
+/// The piece size of a parts document (Java `CardSpill.PIECE_SIZE`), so every implementation
+/// computes the same root for the same bytes.
+pub const SPILL_PIECE_SIZE: usize = 65_536;
+
+/// The default bound on a parts document a reader fetches (Java
+/// `CardSpill.DEFAULT_MAX_FETCH_BYTES`), 16 MiB.
+pub const SPILL_MAX_FETCH_BYTES: u64 = 16_777_216;
+
+/// The content root of `bytes` cut into [`SPILL_PIECE_SIZE`] pieces (SPEC §7.1): `b` and the
+/// lower-case unpadded base32 of the CIDv1 (codec raw 0x55, multihash sha2-256) of the
+/// concatenated sha2-256 hashes of the pieces. The root of a card's parts document.
+pub fn content_root(bytes: &[u8]) -> String {
+    let crypto = crate::crypto::port();
+    let mut table = Vec::with_capacity(bytes.len().div_ceil(SPILL_PIECE_SIZE).max(1) * 32);
+    for piece in bytes.chunks(SPILL_PIECE_SIZE) {
+        table.extend_from_slice(&crypto.sha256(piece));
+    }
+    let mut cid = vec![0x01, 0x55, 0x12, 0x20];
+    cid.extend_from_slice(&crypto.sha256(&table));
+    format!("b{}", crate::schema::base32_encode(&cid))
+}
+
+/// The spill set of a card kind ([`APP_CARD_SPILL_SET`], [`AGENT_CARD_SPILL_SET`]), and the name
+/// of its parts record; `None` for a kind that never spills.
+fn spill_kind(ad_type: &str) -> Option<(&'static [&'static str], &'static str)> {
+    match ad_type {
+        AD_TYPE_APP_CARD => Some((&APP_CARD_SPILL_SET, "AppCard.Parts")),
+        AD_TYPE_AGENT_CARD => Some((&AGENT_CARD_SPILL_SET, "AgentCard.Parts")),
+        _ => None,
+    }
+}
+
+/// Whether a spill-set field holds a full value: neither absent, null, nor an empty list.
+fn non_empty(value: Option<&Value>) -> bool {
+    match value {
+        None | Some(Value::Null) => false,
+        Some(Value::Array(items)) => !items.is_empty(),
+        Some(_) => true,
+    }
+}
+
+/// The parts document of a full card (SPEC §6.1a.5): the kind's parts record
+/// (`AppCard.Parts {reads, actions, views, ui}` or `AgentCard.Parts {actions, ui}`) holding the
+/// card's values of the spill set, its optional fields omitted when absent, and the names of the
+/// non-empty ones, in field order. `None` for a kind that never spills and for a stub.
+pub fn card_parts(ad_type: &str, card: &Map) -> Option<(Map, Vec<&'static str>)> {
+    let (spill_set, _) = spill_kind(ad_type)?;
+    if card.contains_key("spill") {
+        return None;
+    }
+    let mut parts = Map::with_capacity(spill_set.len());
+    let mut names = Vec::new();
+    for &name in spill_set {
+        let value = card.get(name).filter(|value| !value.is_null());
+        let always = ad_type == AD_TYPE_APP_CARD && name != "ui";
+        match value {
+            Some(value) => {
+                parts.insert(name, value.clone());
+            }
+            None if always => {
+                parts.insert(name, Vec::<Value>::new());
+            }
+            None => {}
+        }
+        if non_empty(value) {
+            names.push(name);
+        }
+    }
+    Some((parts, names))
+}
+
+/// A full card split into its stub and its parts document (SPEC §6.1a.5): the canonical bytes of
+/// the parts document ([`card_parts`]) and the stub, which holds each spill-set field at its
+/// placeholder (`[]` for an `AppCard`'s `reads`, `actions`, and `views`; absence for its `ui`
+/// and for an `AgentCard`'s `actions` and `ui`) and appends `spill` with the document's
+/// [`content_root`], length, and non-empty part names. A publisher spills only a card whose
+/// encoding passes [`crate::limits::CARD_SPILL_THRESHOLD_BYTES`], only under the AppCard level
+/// ([`app_card_at_level`]), and only where a content swarm serves the group: this peer runs no
+/// content swarm, so it never spills its own cards. `Err` for a kind that never spills, a stub,
+/// and a card whose spill set is empty.
+pub fn spill_card(ad_type: &str, card: &Map) -> Result<(Map, Vec<u8>), AdError> {
+    let (spill_set, _) =
+        spill_kind(ad_type).ok_or(AdError::InvalidSpill("only an AppCard or AgentCard spills"))?;
+    let (parts, names) =
+        card_parts(ad_type, card).ok_or(AdError::InvalidSpill("a stub spills nothing more"))?;
+    if names.is_empty() {
+        return Err(AdError::InvalidSpill("the spill set holds nothing to move"));
+    }
+    let document = encode_map(&parts);
+    let size = u64::try_from(document.len()).unwrap_or(u64::MAX);
+    let spill = card_spill(&content_root(&document), size, &names)?;
+    let mut stub = Map::with_capacity(card.len() + 1);
+    for (key, value) in card {
+        match key.as_str() {
+            // An AppCard's lists stay as []; its ui and an AgentCard's parts leave.
+            Some(name) if spill_set.contains(&name) => {
+                if ad_type == AD_TYPE_APP_CARD && name != "ui" {
+                    stub.insert(name, Vec::<Value>::new());
+                }
+            }
+            _ => {
+                stub.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    stub.insert("spill", spill);
+    Ok((stub, document))
+}
+
+/// Why a spilled card could not be resolved from a fetched parts document (SPEC §6.1a.5). Each
+/// fails the resolution; the reader keeps the stub, counts the case (`spillsRefused`, or
+/// `spillsOverLimit` for [`SpillError::OverLimit`]), and strikes nobody.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum SpillError {
+    /// The card carries no `spill`, or its kind never spills.
+    #[error("the card is no stub")]
+    NotAStub,
+    /// The stub's `size` passes the reader's fetch bound.
+    #[error("the parts document of {size} bytes passes the fetch bound of {limit}")]
+    OverLimit {
+        /// The stub's `size`.
+        size: u64,
+        /// The bound.
+        limit: u64,
+    },
+    /// The document's length is not the stub's `size`.
+    #[error("the parts document holds {got} bytes where the stub names {size}")]
+    Size {
+        /// The stub's `size`.
+        size: u64,
+        /// The fetched length.
+        got: usize,
+    },
+    /// The document's content root is not the stub's `root`.
+    #[error("the parts document's content root is not the stub's root")]
+    Root,
+    /// The document does not decode as the kind's parts record (SPEC §9.1).
+    #[error("the parts document is not the kind's parts record")]
+    Undecodable,
+    /// The document's non-empty fields are not exactly those `spill.parts` names.
+    #[error("the parts document's fields are not the ones spill.parts names")]
+    Parts,
+}
+
+/// A stub's spill reference, when `card` is an `AppCard` or `AgentCard` stub: its `root`, `size`,
+/// and `parts`.
+pub fn spill_of<'c>(ad_type: &str, card: &'c Map) -> Option<(&'c str, u64, Vec<&'c str>)> {
+    spill_kind(ad_type)?;
+    let spill = card.get("spill")?.as_map()?;
+    let root = spill.get("root")?.as_str()?;
+    let size = spill.get("size")?.as_u64()?;
+    let parts = spill
+        .get("parts")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    Some((root, size, parts))
+}
+
+/// `discovery.resolve(card)`'s checks on a fetched parts document (SPEC §6.1a.5): the full card
+/// of a stub, the stub with the document's values in its spill-set fields and no `spill`. The
+/// document's length must be `size` (and `size` at most `max_fetch_bytes`, which a reader checks
+/// before it fetches), its content root `root` ([`content_root`]), it must decode as the kind's
+/// parts record under the wire encoding, and its non-empty fields must be exactly those
+/// `spill.parts` names. The full card must then be the kind's record again.
+///
+/// Fetching the document needs the content swarm (`aspace:cap/content-swarm`), which this peer
+/// does not run yet: a reader without a content swarm keeps the stub, and discovery by every
+/// field that never spills reads the stub alone.
+pub fn resolve_spill(
+    ad_type: &str,
+    stub: &Map,
+    document: &[u8],
+    max_fetch_bytes: u64,
+) -> Result<Map, SpillError> {
+    let (spill_set, parts_record) = spill_kind(ad_type).ok_or(SpillError::NotAStub)?;
+    let (root, size, names) = spill_of(ad_type, stub).ok_or(SpillError::NotAStub)?;
+    if size > max_fetch_bytes {
+        return Err(SpillError::OverLimit {
+            size,
+            limit: max_fetch_bytes,
+        });
+    }
+    if u64::try_from(document.len()).ok() != Some(size) {
+        return Err(SpillError::Size {
+            size,
+            got: document.len(),
+        });
+    }
+    if content_root(document) != root {
+        return Err(SpillError::Root);
+    }
+    let parts = crate::schema::decode_map(document, parts_record).ok_or(SpillError::Undecodable)?;
+    let present: Vec<&str> = spill_set
+        .iter()
+        .copied()
+        .filter(|name| non_empty(parts.get(name)))
+        .collect();
+    if present != names {
+        return Err(SpillError::Parts);
+    }
+    let mut full = Map::with_capacity(stub.len() + parts.len());
+    for (key, value) in stub {
+        let Some(name) = key.as_str() else {
+            continue;
+        };
+        match name {
+            "spill" => {}
+            // A full AgentCard places actions after agentPublicKey and ui after
+            // agentCertificate, which the field order below restores.
+            _ => {
+                full.insert(name, value.clone());
+            }
+        }
+    }
+    for (key, value) in &parts {
+        if let Some(name) = key.as_str() {
+            full.insert(name, value.clone());
+        }
+    }
+    let ordered = in_record_order(ad_type, full);
+    if !crate::schema::conforms(&Value::Map(ordered.clone()), ad_type) {
+        return Err(SpillError::Undecodable);
+    }
+    Ok(ordered)
+}
+
+/// `card`'s fields in the field order of its record, an optional field omitted when absent or
+/// null; fields the record does not name are dropped.
+fn in_record_order(ad_type: &str, card: Map) -> Map {
+    let order: &[&str] = match ad_type {
+        AD_TYPE_APP_CARD => &[
+            "id",
+            "issuer",
+            "group",
+            "issued",
+            "ttl",
+            "name",
+            "kind",
+            "shape",
+            "owner",
+            "reads",
+            "actions",
+            "idpClient",
+            "url",
+            "pkg",
+            "version",
+            "views",
+            "ui",
+            "host",
+            "origin",
+            "formats",
+            "spill",
+        ],
+        _ => &[
+            "id",
+            "issuer",
+            "group",
+            "issued",
+            "ttl",
+            "agent",
+            "description",
+            "goals",
+            "consumes",
+            "produces",
+            "costHints",
+            "spaceBindings",
+            "agentPublicKey",
+            "actions",
+            "agentCertificate",
+            "ui",
+            "spill",
+        ],
+    };
+    let mut ordered = Map::with_capacity(card.len());
+    for name in order {
+        if let Some(value) = card.get(name) {
+            ordered.insert(*name, value.clone());
+        }
+    }
+    ordered
+}
+
+// ---------------------------------------------------------------------------------------------
+// The AppCard level (SPEC §6.1a.2, §9)
+
+/// The resource hint a member advertises once it reads the v0.1.32 schemas of the `AppCard` and
+/// the `AgentCard` with their value rules (SPEC §6.1a.2, §9).
+pub const HINT_APP_CARD: &str = "wire.appcard";
+
+/// The AppCard level this crate reads, the value of [`HINT_APP_CARD`] it advertises.
+pub const APP_CARD_LEVEL: i32 = 2;
+
+/// The AppCard level a hint's text states, as Java's `PeerNode.appCardLevelOf` reads it:
+/// canonical decimal text, so `2`, `10`, or a value past every `int` reads as at least that
+/// level; no hint, any other text, a leading zero, and `0` read as level 1.
+pub fn app_card_level(hint: Option<&str>) -> i32 {
+    let Some(text) = hint.filter(|text| {
+        !text.is_empty()
+            && text.bytes().all(|b| b.is_ascii_digit())
+            && (text.len() == 1 || !text.starts_with('0'))
+    }) else {
+        return 1;
+    };
+    if text.len() > 9 {
+        return i32::MAX;
+    }
+    text.parse::<i32>().map_or(1, |level| level.max(1))
+}
+
+/// The card an issuer writes into a view whose members are not all at the AppCard level
+/// (SPEC §6.1a.2): a full `AppCard` without `origin`, `formats`, a `host` whose `signOn` is
+/// `idp`, and `spill`; a full `AgentCard` without `spill`. Returns the card and whether the gate
+/// removed anything (what an issuer counts in `appCardsDowngraded`). A stub cannot be downgraded
+/// (its parts are elsewhere): issue the full card instead. A dial-only member cannot see every
+/// member's hints, so it issues every card this way; other kinds pass unchanged.
+pub fn app_card_at_level(ad_type: &str, card: &Map) -> (Map, bool) {
+    let gated = |name: &str, value: &Value| match ad_type {
+        AD_TYPE_APP_CARD => match name {
+            "origin" | "formats" | "spill" => true,
+            "host" => value.get("signOn").and_then(Value::as_str) == Some("idp"),
+            _ => false,
+        },
+        AD_TYPE_AGENT_CARD => name == "spill",
+        _ => false,
+    };
+    let mut out = Map::with_capacity(card.len());
+    let mut downgraded = false;
+    for (key, value) in card {
+        if key.as_str().is_some_and(|name| gated(name, value)) {
+            downgraded = true;
+        } else {
+            out.insert(key.clone(), value.clone());
+        }
+    }
+    (out, downgraded)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Content stores (SPEC §6.1a.6)
+
+/// The `access.kind` of an `AssetCard` that advertises a content store.
+pub const CONTENT_STORE_KIND: &str = "content-store";
+
+/// What a content store's `AssetCard` states (SPEC §6.1a.6, v0.1.32), read from its `access`
+/// map, whose values are all text. A reader ignores a key it does not know; this peer pins
+/// nothing in a store yet (the content swarm's `pdt` level is not built here), so it reads the
+/// card to list stores.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ContentStore {
+    /// The store's name, from `asset` = `content-store:<name>`.
+    pub name: String,
+    /// The store's URI, `aspace://<group>/store/<name>`.
+    pub uri: String,
+    /// The holding interval, the card's `freshness` (an ISO-8601 duration).
+    pub holding_interval: String,
+    /// Capacity in bytes, when stated as canonical decimal.
+    pub capacity: Option<u64>,
+    /// Free bytes, when stated; `0` on the last card of a closing store.
+    pub free: Option<u64>,
+    /// The largest object it takes, in bytes, when stated.
+    pub max_object: Option<u64>,
+    /// The codecs it holds (`dag-cbor`, `raw`).
+    pub codecs: Vec<String>,
+    /// The sealing modes it holds.
+    pub sealing: Vec<String>,
+    /// Whether it holds what it cannot read (`blind`).
+    pub blind: bool,
+    /// Whether it answers possession challenges.
+    pub challenge: bool,
+    /// `open` or `grant`.
+    pub policy: String,
+    /// `hot` or `cold`.
+    pub tier: String,
+    /// Present (`authorizer`) while a `grant` store waits for an authorizer and takes no pins.
+    pub waiting: Option<String>,
+    /// The price per GiB-month from `costHints`, when its owner sets one.
+    pub price_per_gib_month: Option<String>,
+}
+
+/// The content store an `AssetCard` advertises (SPEC §6.1a.6): `access.kind` is
+/// [`CONTENT_STORE_KIND`] and `asset` is `content-store:<name>`. `None` for any other card. The
+/// values are read as text (integers as canonical decimal, booleans as `true`); an unreadable
+/// number reads as absent.
+pub fn content_store_of(card: &Map) -> Option<ContentStore> {
+    let access = card.get("access")?.as_map()?;
+    let text = |key: &str| access.get(key).and_then(Value::as_str);
+    if text("kind") != Some(CONTENT_STORE_KIND) {
+        return None;
+    }
+    let name = card
+        .get("asset")?
+        .as_str()?
+        .strip_prefix("content-store:")?
+        .to_owned();
+    let number = |key: &str| {
+        text(key)
+            .filter(|digits| digits == &"0" || !digits.starts_with('0'))
+            .and_then(|digits| digits.parse().ok())
+    };
+    let list = |key: &str| {
+        text(key)
+            .filter(|list| !list.is_empty())
+            .map(|list| list.split(',').map(str::to_owned).collect())
+            .unwrap_or_default()
+    };
+    Some(ContentStore {
+        name,
+        uri: card
+            .get("uri")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        holding_interval: card
+            .get("freshness")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        capacity: number("capacity"),
+        free: number("free"),
+        max_object: number("maxObject"),
+        codecs: list("codecs"),
+        sealing: list("sealing"),
+        blind: text("blind") == Some("true"),
+        challenge: text("challenge") == Some("true"),
+        policy: text("policy").unwrap_or_default().to_owned(),
+        tier: text("tier").unwrap_or_default().to_owned(),
+        waiting: text("waiting").map(str::to_owned),
+        price_per_gib_month: card
+            .get("costHints")
+            .and_then(|hints| hints.get("pricePerGibMonth"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
 }
 
 // ---------------------------------------------------------------------------------------------

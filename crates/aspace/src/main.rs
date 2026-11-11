@@ -19,7 +19,9 @@
 //! leaves: `id`, `status`, `write`, `read`, `take`, `complete`, `watch`, `cards`, `call`,
 //! `doctor`; when an `aspace daemon` of the same configuration answers on the local socket, the
 //! command runs on its peer instead ([`session::through_daemon`]). `work` stays and
-//! runs a program per task, and `daemon` stays and serves the visitors. Results are JSON on
+//! runs a program per task, `daemon` stays and serves the visitors, and `seed` stays and
+//! listens, so members link to it and join its group ([`seed`]); `invite` prints an invite key
+//! of an `INVITE` group the keystore founded. Results are JSON on
 //! standard output (one object, or JSON Lines for streams), with wire names and the schema
 //! string; diagnostics go to standard error. Exit codes ([`exit`]): 0 success, 1 error, 2
 //! refused or not found, 3 timeout, 4 authentication or authorization.
@@ -67,6 +69,7 @@ mod exit;
 mod io;
 mod mcp;
 mod resident;
+mod seed;
 mod session;
 mod signals;
 mod work;
@@ -265,6 +268,34 @@ async fn run(mut cli: Cli) -> Result<(), Failure> {
             tokens,
             policy,
         } => doctor::doctor(global, json, tokens.as_deref(), policy.as_deref()).await,
+        Command::Seed {
+            listen,
+            advertise,
+            found,
+            membership,
+            replicate,
+            max_spaces,
+            require_attestation,
+        } => {
+            seed::seed(
+                global,
+                seed::SeedOptions {
+                    listen,
+                    advertise,
+                    found,
+                    membership,
+                    replicate,
+                    max_spaces,
+                    require_attestation,
+                },
+            )
+            .await
+        }
+        Command::Invite {
+            found,
+            label,
+            not_after,
+        } => seed::invite(global, &found, label.as_deref(), not_after),
         Command::Completions { shell } => commands::completions(shell),
         Command::Man { out_dir } => commands::man(out_dir.as_deref()),
     }

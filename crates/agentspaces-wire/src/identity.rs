@@ -54,8 +54,9 @@ pub enum IdentityError {
     /// An issue instant or a lifetime is not `java.time` text this wire carries.
     #[error(transparent)]
     Time(#[from] TimeError),
-    /// An agent's local name is empty or contains `/` (Java `AgentId` refuses both).
-    #[error("an agent's local name must be non-empty and contain no '/': {0:?}")]
+    /// An agent's local name is empty or contains `/` or `:` (Java `AgentId` refuses each; SPEC
+    /// §9.2, R5).
+    #[error("an agent's local name must be non-empty and contain no '/' and no ':': {0:?}")]
     InvalidLocalName(String),
     /// A peer was asked to certify an agent that belongs to another peer.
     #[error("certificate for {agent} cannot be issued by {peer}")]
@@ -151,7 +152,7 @@ impl Identity {
     /// `<peerId>/<local_name>` from `issued_iso` (`java.time.Instant` text) for `ttl_iso`
     /// (`java.time.Duration` text as Java prints it, "PT24H"). The identity does not renew.
     ///
-    /// Refuses a local name that is empty or contains `/`, an instant or duration that does not
+    /// Refuses a local name that is empty or contains `/` or `:`, an instant or duration that does not
     /// parse, and a failure of the random source.
     pub fn subordinate(
         &self,
@@ -213,7 +214,7 @@ impl Identity {
         encryption_public_raw: Option<[u8; 32]>,
         renewing: bool,
     ) -> Result<AgentIdentity, IdentityError> {
-        if local_name.is_empty() || local_name.contains('/') {
+        if !ids::is_local_name(local_name) {
             return Err(IdentityError::InvalidLocalName(local_name.to_owned()));
         }
         // A renewing identity re-reads both; refusing them here keeps renewal from failing later.
@@ -425,10 +426,12 @@ pub fn verify_agent_certificate(
 }
 
 /// Java `AgentCertificates.verifyAt` (SPEC §4.2, v0.1.13): a certificate judged at the signing
-/// time of what it certifies (a record's issue stamp, a claim's stamp, a state's `signedAt`), not
-/// at receipt. True only when its window covers `signing_ms`, `signing_ms` leads the receiver's
-/// `receiver_now_ms` by at most [`MAX_DRIFT_MILLIS`], and [`verify_agent_certificate`] passes at
-/// `signing_ms`. An agent's history therefore stays verifiable after its certificate lapses.
+/// time of what it certifies, not at receipt. True only when its window covers `signing_ms`,
+/// `signing_ms` leads the receiver's `receiver_now_ms` by at most [`MAX_DRIFT_MILLIS`], and
+/// [`verify_agent_certificate`] passes at `signing_ms`. An agent's history therefore stays
+/// verifiable after its certificate lapses. An agent card's attestation keeps this bound; a
+/// space's records, claims, and `signedAt` use [`verify_agent_certificate_covering`] since
+/// v0.1.30, and the far-future rule bounds their stamps instead.
 pub fn verify_agent_certificate_at(
     certificate: &Value,
     peer_public_raw: &[u8],
@@ -441,6 +444,24 @@ pub fn verify_agent_certificate_at(
     };
     certificate_covers(map, signing_ms)
         && i128::from(signing_ms) <= i128::from(receiver_now_ms) + i128::from(MAX_DRIFT_MILLIS)
+        && verify_agent_certificate(certificate, peer_public_raw, agent_id, signing_ms)
+}
+
+/// Java `AgentCertificates.verifyCovering` (SPEC §4.2, v0.1.30): a certificate for a space's
+/// record, take claim, or agent-signed state's `signedAt`, judged at the signing time of what it
+/// certifies. True only when its window covers `signing_ms` and [`verify_agent_certificate`]
+/// passes at `signing_ms`. Unlike [`verify_agent_certificate_at`] it sets no bound on how far the
+/// signing time leads the receiver's clock: the space judges that lead afterwards by the
+/// far-future rule of SPEC §7.3, as it judges a peer-signed carrier's stamp.
+pub fn verify_agent_certificate_covering(
+    certificate: &Value,
+    peer_public_raw: &[u8],
+    agent_id: &str,
+    signing_ms: i64,
+) -> bool {
+    certificate
+        .as_map()
+        .is_some_and(|map| certificate_covers(map, signing_ms))
         && verify_agent_certificate(certificate, peer_public_raw, agent_id, signing_ms)
 }
 

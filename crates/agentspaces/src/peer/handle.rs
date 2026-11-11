@@ -26,7 +26,10 @@ use agentspaces_wire::identity::AgentIdentity;
 use agentspaces_wire::ids;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
+use agentspaces_wire::seed::Seed;
+
 use super::actor::{self, Actor, Job, Settings, Start};
+use super::listen;
 use super::{LinkInfo, PeerConfig, PeerCounters, PeerError, PeerEvent, RelaySignal, SpaceStore};
 use crate::clock::SharedClock;
 use crate::group::GroupSpec;
@@ -37,9 +40,9 @@ use crate::space::{ClaimTicket, EntryId, EntryView, ResultWrite, Space, SpaceErr
 /// ([`broadcast::error::RecvError::Lagged`]).
 const EVENT_CAPACITY: usize = 1024;
 
-/// A running dial-only peer: a cheap, cloneable handle to the actor that owns its state (see the
-/// [module docs](super)). Every clone drives the same peer; the peer stops when the last clone is
-/// dropped, or for good at [`Peer::close`].
+/// A running peer, dial-only or listening: a cheap, cloneable handle to the actor that owns its
+/// state (see the [module docs](super)). Every clone drives the same peer; the peer stops when the
+/// last clone is dropped, or for good at [`Peer::close`].
 ///
 /// Reads (`members`, `counters`, `space_states`, ...) answer from what the peer holds, also after
 /// [`Peer::close`]. Verbs answer [`PeerError::Closed`] once the peer is closed.
@@ -52,6 +55,8 @@ pub struct Peer {
     link: watch::Receiver<Option<LinkInfo>>,
     folds: watch::Receiver<u64>,
     clock: SharedClock,
+    /// The addresses the listeners bound (none on a dial-only peer).
+    listen_addrs: Arc<[Seed]>,
 }
 
 impl fmt::Debug for Peer {
@@ -78,6 +83,18 @@ impl Peer {
     ///   [`PeerConfig::join_timeout`] for a GROUP_AD that verifies to exactly that GroupID,
     ///   ignoring every other answer, before it introduces itself. On timeout the peer is closed
     ///   and [`PeerError::JoinTimeout`] returned.
+    ///
+    /// # Listening
+    ///
+    /// With listeners in [`PeerConfig::listen`] the peer binds them first
+    /// ([`PeerError::Listen`] when one cannot be bound) and then accepts links as a hub (see
+    /// [`ListenConfig`](super::ListenConfig)). Its seeds are then optional: a listening peer
+    /// with none founds or holds its group alone, and one whose seeds do not answer at start
+    /// serves its own links and redials them in the background (a join by GroupID still needs a
+    /// seed that answers). [`Peer::listen_addrs`] names the bound addresses. With
+    /// [`ListenConfig::require_attestation`](super::ListenConfig::require_attestation) every
+    /// listener and seed must attest (`tls`): a `tcp` one is refused
+    /// ([`PeerError::InvalidArgument`]).
     pub async fn start(config: PeerConfig) -> Result<Peer, PeerError> {
         let PeerConfig {
             identity,
@@ -96,8 +113,27 @@ impl Peer {
             send_stall_timeout,
             space_max_entries,
             fetched_block_bytes,
+            space_max_bytes,
+            listen: listen_config,
         } = config;
         let (group_id, founding, joining) = resolve_group(&group)?;
+        let listening = !listen_config.listeners.is_empty();
+        if listen_config.require_attestation {
+            let plain = listen_config
+                .listeners
+                .iter()
+                .any(|spec| spec.scheme() == crate::transport::tcp::SCHEME)
+                || seeds
+                    .iter()
+                    .any(|seed| seed.scheme == crate::transport::tcp::SCHEME);
+            if plain {
+                return Err(PeerError::InvalidArgument(
+                    "required attestation allows attesting listeners and seeds only (tls), not \
+                     tcp"
+                    .to_owned(),
+                ));
+            }
+        }
         let settings = Settings::new(
             reconnect_interval,
             reconnect_window,
@@ -106,20 +142,38 @@ impl Peer {
             send_queue_bytes,
             send_stall_timeout,
         )
-        .with_bounds(space_max_entries, fetched_block_bytes);
+        .with_bounds(space_max_entries, fetched_block_bytes)
+        .with_listen(space_max_bytes, &listen_config);
+        let bound = listen::bind(&listen_config.listeners, &identity).await?;
+        let listen_addrs: Arc<[Seed]> = bound.iter().filter_map(listen::listen_seed).collect();
         let seeds = actor::expand_seeds(&seeds, &dialers, settings.dial_timeout).await;
-        if seeds.is_empty() {
+        if seeds.is_empty() && (!listening || joining) {
             return Err(PeerError::NoSeeds);
         }
-        let (channel, seed) =
-            actor::dial_first(&seeds, &dialers, &identity, settings.dial_timeout).await?;
+        let dialed = if seeds.is_empty() {
+            None
+        } else {
+            match actor::dial_first(&seeds, &dialers, &identity, settings.dial_timeout).await {
+                Ok(dialed) => Some(dialed),
+                Err(error) if listening && !joining => {
+                    tracing::warn!(%error, "agentspaces: no seed answered; listening and redialing");
+                    None
+                }
+                Err(error) => return Err(error),
+            }
+        };
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let (link_watch, link) = watch::channel(None);
         let (folds_tx, folds) = watch::channel(0);
         let peer_id: Arc<str> = Arc::from(identity.peer_id());
+        // SPEC §9: a node validates its own node where it builds its clock.
+        let hlc = agentspaces_wire::hlc::Hlc::new(identity.peer_id()).map_err(|error| {
+            PeerError::InvalidArgument(format!("the PeerID cannot stamp: {error}"))
+        })?;
         let jobs = actor::spawn(
             Start {
                 identity,
+                hlc,
                 group: group_id.clone(),
                 founder,
                 founding,
@@ -132,9 +186,10 @@ impl Peer {
                 events: events.clone(),
                 link_watch,
                 folds: folds_tx,
+                listeners: bound,
+                replicate: listen_config.replicate,
             },
-            channel,
-            seed,
+            dialed,
         );
         let peer = Peer {
             peer_id,
@@ -144,6 +199,7 @@ impl Peer {
             link,
             folds,
             clock,
+            listen_addrs,
         };
         if joining {
             let (waiter, ready) = oneshot::channel();
@@ -190,9 +246,57 @@ impl Peer {
         &self.group_id
     }
 
-    /// Whether the peer holds a link now.
+    /// Whether the peer holds a link to a seed now (a listening peer's accepted links do not
+    /// count: [`Peer::linked_members`]).
     pub fn is_connected(&self) -> bool {
         self.link.borrow().is_some()
+    }
+
+    /// Whether the peer listens (it was started with listeners).
+    pub fn is_listening(&self) -> bool {
+        !self.listen_addrs.is_empty()
+    }
+
+    /// The addresses the peer's listeners bound, as seeds a member dials: the port the OS chose
+    /// where a listener asked for port 0. Empty on a dial-only peer. A listener bound to a
+    /// wildcard address is named as bound (`0.0.0.0`); dial its host's own address.
+    pub fn listen_addrs(&self) -> Vec<Seed> {
+        self.listen_addrs.to_vec()
+    }
+
+    /// The members a listening peer admitted from their own introduction (SPEC §5.1), linked
+    /// or not, in PeerID order; empty on a dial-only peer.
+    pub async fn admitted_members(&self) -> Vec<String> {
+        self.call(|actor| actor.admitted_members())
+            .await
+            .unwrap_or_default()
+    }
+
+    /// The admitted members a listening peer holds an accepted link to, in PeerID order.
+    pub async fn linked_members(&self) -> Vec<String> {
+        self.call(|actor| actor.linked_members())
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Drains the peer before it closes: a listening peer stops accepting links (the ones it
+    /// holds stay up), and the call waits until every link has handed what it queued to its
+    /// transport, looking every 20 ms, or until `timeout` passes. Answers whether everything
+    /// went out. [`Peer::close`] then closes the links; a frame still queued at that point is
+    /// dropped and counted ([`PeerCounters::send_dropped`]).
+    pub async fn drain(&self, timeout: Duration) -> Result<bool, PeerError> {
+        self.call(|actor| actor.stop_accepting()).await?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.call(|actor| actor.pending_outbound()).await? == 0 {
+                return Ok(true);
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Ok(false);
+            }
+            tokio::time::sleep((deadline - now).min(Duration::from_millis(20))).await;
+        }
     }
 
     /// The link the peer holds now, if any.
@@ -222,8 +326,8 @@ impl Peer {
             .flatten()
     }
 
-    /// The members this peer's link reaches: those that signed a frame that arrived on it (not
-    /// inside a relay).
+    /// The members this peer's links reach: those that signed a frame that arrived on the dialed
+    /// link (not inside a relay), and the members a listening peer holds an accepted link to.
     pub async fn reachable(&self) -> Vec<String> {
         self.call(|actor| actor.reachable())
             .await

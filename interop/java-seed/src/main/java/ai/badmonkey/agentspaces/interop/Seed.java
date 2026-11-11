@@ -158,10 +158,17 @@ import java.util.concurrent.ConcurrentHashMap;
  * transitions with their actors, for {@code task-state}).
  *
  * Arguments: {@code port [--tls] [--require-attestation] [--channel-auth SIGNED|ATTESTED|SESSION]
- * [--founding TEXT] [--space NAME] [--settle-ms N] [--blocks]}. {@code --blocks} gives the space a
- * {@link BlockExchange}, as the Spring starter does: payloads over the inline limit (64 KiB) are
- * fetched from their writer in the background and held and served here. The first line printed is
+ * [--founding TEXT] [--space NAME] [--settle-ms N] [--blocks] [--dial HOST:PORT]}. {@code --blocks}
+ * gives the space a {@link BlockExchange}, as the Spring starter does: payloads over the inline
+ * limit (64 KiB) are fetched from their writer in the background and held and served here. The
+ * first line printed is
  * {@code {"event":"listening","port":..,"peer":"..","group":"..","space":".."}}.
+ *
+ * <p>With {@code --dial HOST:PORT} the node listens nowhere: it registers the {@code tcp} (or, with
+ * {@code --tls}, the {@code tls}) binding for dialing and joins the group through that seed, a
+ * listening member of another implementation, introducing itself there as a member does (the port
+ * argument is then ignored). Every command works the same. The first line printed is then
+ * {@code {"event":"dialing","seed":"HOST:PORT","peer":"..","group":"..","space":".."}}.
  */
 public final class Seed {
 
@@ -270,6 +277,7 @@ public final class Seed {
         String spaceName = "tasks";
         long settleMs = 200;
         boolean withBlocks = false;
+        String dial = null;
         for (int i = 1; i < args.length; i++) {
             switch (args[i]) {
                 case "--tls" -> tls = true;
@@ -279,12 +287,19 @@ public final class Seed {
                 case "--space" -> spaceName = args[++i];
                 case "--settle-ms" -> settleMs = Long.parseLong(args[++i]);
                 case "--blocks" -> withBlocks = true;
+                case "--dial" -> dial = args[++i];
                 default -> throw new IllegalArgumentException("unknown argument " + args[i]);
             }
         }
         PeerIdentity identity = PeerIdentity.generate();
         PeerNode node = PeerNode.builder(identity).requireAttestation(require).channelAuth(auth).build();
-        node.listen(tls ? new TlsTcpTransport(identity) : new TcpTransport(), "127.0.0.1:" + port);
+        List<PeerAdvertisement.Endpoint> seeds = List.of();
+        if (dial == null) {
+            node.listen(tls ? new TlsTcpTransport(identity) : new TcpTransport(), "127.0.0.1:" + port);
+        } else {
+            node.transport(tls ? new TlsTcpTransport(identity) : new TcpTransport());
+            seeds = List.of(new PeerAdvertisement.Endpoint(tls ? "tls" : "tcp", dial, 0));
+        }
         GroupId groupId = GroupId.fromFounding(founding.getBytes(StandardCharsets.UTF_8));
         GroupAdvertisement group = new GroupAdvertisement("aspace://" + groupId.value(),
                 identity.peerId(), groupId, Instant.EPOCH, Duration.ofDays(365), "rust-interop",
@@ -292,7 +307,7 @@ public final class Seed {
                 GroupAdvertisement.GossipParameters.defaults());
         GroupRuntime runtime = node.joinGroup(group,
                 new GroupMembership.Config(Duration.ofSeconds(30), Duration.ofSeconds(2), 2),
-                List.<PeerAdvertisement.Endpoint>of());
+                seeds);
         // The group's discovery service: it admits the AgentCards members publish on the ads
         // stream as every Java node does (AdCache.accept), for the cards command.
         DiscoveryService discovery = DiscoveryService.create(runtime, CborCodec.defaultCodec(),
@@ -324,8 +339,13 @@ public final class Seed {
                     .add(event.kind() + " by " + event.actor().encoded());
         }, Lease.of(Duration.ofDays(1)));
         node.startTicking(Duration.ofMillis(250));
-        System.out.println("{\"event\":\"listening\",\"port\":" + port + ",\"peer\":" + q(identity.peerId().value())
-                + ",\"group\":" + q(groupId.value()) + ",\"space\":" + q(spaceName) + ",\"tls\":" + tls + "}");
+        if (dial == null) {
+            System.out.println("{\"event\":\"listening\",\"port\":" + port + ",\"peer\":" + q(identity.peerId().value())
+                    + ",\"group\":" + q(groupId.value()) + ",\"space\":" + q(spaceName) + ",\"tls\":" + tls + "}");
+        } else {
+            System.out.println("{\"event\":\"dialing\",\"seed\":" + q(dial) + ",\"peer\":" + q(identity.peerId().value())
+                    + ",\"group\":" + q(groupId.value()) + ",\"space\":" + q(spaceName) + ",\"tls\":" + tls + "}");
+        }
         System.out.flush();
 
         BufferedReader in = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));

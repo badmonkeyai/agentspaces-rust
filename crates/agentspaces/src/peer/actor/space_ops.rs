@@ -536,7 +536,7 @@ impl Actor {
                 });
                 self.bump_folds();
             }
-            FoldOutcome::Unchanged => {}
+            FoldOutcome::Unchanged | FoldOutcome::Deferred => {}
         }
         Ok(outcome)
     }
@@ -592,7 +592,7 @@ impl Actor {
             let epoch = current.map_or(1, |claim| claim_epoch(claim).saturating_add(1));
             (slot.space_id.clone(), epoch)
         };
-        let stamp = self.issuer_stamp(&holder, now);
+        let stamp = self.issuer_stamp(&holder, now)?;
         let claim =
             records::take_claim(entry_id, &space_id, epoch, &stamp, &holder, 0.0, expires_at);
         let signed = records::signed_claim(&claim, &self.identity, agent.as_ref())
@@ -839,7 +839,9 @@ impl Actor {
             (state.clone(), slot.store.claim_proof(entry_id).cloned())
         };
         dto.insert("completed", true);
-        let signed_at = agent.map(|agent| self.issuer_stamp(agent.agent_id(), now));
+        let signed_at = agent
+            .map(|agent| self.issuer_stamp(agent.agent_id(), now))
+            .transpose()?;
         let signed = records::sign_state(&dto, &self.identity, agent.zip(signed_at.as_deref()))
             .map_err(PeerError::from)?;
         let delta = records::delta(Some(&signed), proof.as_ref().map(|proof| (entry_id, proof)));
@@ -909,7 +911,9 @@ impl Actor {
         item: &str,
         now: i64,
     ) -> Result<(), SpaceError> {
-        let signed_at = agent.map(|agent| self.issuer_stamp(agent.agent_id(), now));
+        let signed_at = agent
+            .map(|agent| self.issuer_stamp(agent.agent_id(), now))
+            .transpose()?;
         let signed = records::sign_state(dto, &self.identity, agent.zip(signed_at.as_deref()))
             .map_err(PeerError::from)?;
         let body = bodies::rumor_body(
@@ -951,7 +955,7 @@ impl Actor {
         let expires_at = now
             .checked_add(lease_millis)
             .ok_or_else(|| SpaceError::InvalidLease("the lease overflows".to_owned()))?;
-        let lease_stamp = self.issuer_stamp(&issuer, now);
+        let lease_stamp = self.issuer_stamp(&issuer, now)?;
         dto.insert("leaseStamp", lease_stamp.as_str());
         dto.insert(
             "leaseValue",
@@ -1093,12 +1097,14 @@ impl Actor {
                 if let Some(state) = slot.store.remove(&entry_id) {
                     released.extend(block_of(&state).map(str::to_owned));
                 }
+                slot.forget_size(&entry_id);
                 slot.fired.remove(&entry_id);
                 gone.insert((space.clone(), entry_id));
                 count = count.saturating_add(1);
             }
             for entry_id in orphans {
                 slot.store.remove(&entry_id);
+                slot.forget_size(&entry_id);
                 count = count.saturating_add(1);
             }
         }
@@ -1382,6 +1388,19 @@ impl Actor {
             .retain(|watcher| watcher.queue.closed().is_none());
         if self.watchers.iter().any(|watcher| watcher.space == space) {
             return false;
+        }
+        // The space's stamp counts outlive it (SPEC §9: a counter only grows).
+        if let Some(slot) = self.spaces.get(space) {
+            let counters = &mut self.counters;
+            counters.stamps_logical_refused = counters
+                .stamps_logical_refused
+                .saturating_add(slot.store.stamps_logical_refused());
+            counters.stamps_far_future_refused = counters
+                .stamps_far_future_refused
+                .saturating_add(slot.store.stamps_far_future_refused());
+            counters.stamps_far_future_deferred = counters
+                .stamps_far_future_deferred
+                .saturating_add(slot.store.stamps_far_future_deferred());
         }
         let closed = self.spaces.remove(space);
         self.pulled_spaces.remove(space);

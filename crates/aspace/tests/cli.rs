@@ -26,8 +26,11 @@ use std::time::{Duration, Instant};
 
 use agentspaces::wire::ids;
 
-const CONFIG_VARIABLES: [&str; 10] = [
+const CONFIG_VARIABLES: [&str; 13] = [
     "ASPACE_SEEDS",
+    "ASPACE_INVITE",
+    "ASPACE_LISTEN",
+    "ASPACE_ADVERTISE",
     "ASPACE_GROUP",
     "ASPACE_JOIN",
     "ASPACE_KEYSTORE",
@@ -82,18 +85,47 @@ fn run(scratch: &Scratch, args: &[&str]) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("aspace starts");
+    // Both pipes are drained while the command runs: an output larger than a pipe's buffer (a
+    // completion script) would otherwise block it until the deadline.
+    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = std::io::Read::read_to_end(&mut pipe, &mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>),
+    );
     let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if child.try_wait().expect("try_wait").is_some() {
-            return child.wait_with_output().expect("output");
+    let (status, finished) = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break (status, true);
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
-            let output = child.wait_with_output().expect("output");
-            panic!("aspace {args:?} did not finish: {output:?}");
+            break (child.wait().expect("wait"), false);
         }
         std::thread::sleep(Duration::from_millis(20));
-    }
+    };
+    let output = Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    };
+    assert!(finished, "aspace {args:?} did not finish: {output:?}");
+    output
 }
 
 fn stderr(output: &Output) -> String {

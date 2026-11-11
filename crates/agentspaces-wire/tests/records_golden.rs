@@ -317,26 +317,27 @@ fn subordinate_record_matches_java() {
         Some(&certificate),
         now
     ));
-    // Judged at the record's issue stamp: long after the certificate lapsed it still verifies,
-    // and a stamp may lead the receiver by the drift ceiling and no more.
+    // Judged at the record's issue stamp: long after the certificate lapsed it still verifies.
+    // Since v0.1.30 the certificate bounds the stamp by its window alone (SPEC §4.2): how far
+    // the stamp leads the receiver is the fold's far-future rule, not the signature's.
     assert!(verify_record(
         &record,
         identity.public_raw(),
         Some(&certificate),
         now + 30 * HOUR
     ));
-    assert!(verify_record(
-        &record,
-        identity.public_raw(),
-        Some(&certificate),
-        t0() - MAX_DRIFT_MILLIS
-    ));
-    assert!(!verify_record(
-        &record,
-        identity.public_raw(),
-        Some(&certificate),
-        t0() - MAX_DRIFT_MILLIS - 1
-    ));
+    for receiver in [
+        t0() - MAX_DRIFT_MILLIS,
+        t0() - MAX_DRIFT_MILLIS - 1,
+        t0() - 30 * HOUR,
+    ] {
+        assert!(verify_record(
+            &record,
+            identity.public_raw(),
+            Some(&certificate),
+            receiver
+        ));
+    }
     // A malformed issue stamp cannot be judged.
     let mut unstamped = record.clone();
     unstamped.insert("issued", "not-a-stamp");
@@ -602,11 +603,12 @@ fn agent_signed_claims_match_java() {
     let mut peer_signed = signed_claim(&claim, &identity, None).unwrap();
     peer_signed.insert("holderCertificate", agent.certificate().clone());
     assert!(!verify_claim_proof(&Value::Map(peer_signed), now));
-    // Judged at the claim's own stamp: after the certificate lapsed it still verifies; a stamp
-    // leading the receiver beyond the drift ceiling does not.
+    // Judged at the claim's own stamp: after the certificate lapsed it still verifies. A stamp
+    // leading the receiver beyond the drift ceiling verifies too since v0.1.30 (SPEC §4.2): the
+    // fold's far-future rule judges the lead.
     assert!(verify_claim_proof(&proof, now + 23 * HOUR));
     assert!(verify_claim_proof(&proof, t0() - MAX_DRIFT_MILLIS));
-    assert!(!verify_claim_proof(&proof, t0() - MAX_DRIFT_MILLIS - 1));
+    assert!(verify_claim_proof(&proof, t0() - MAX_DRIFT_MILLIS - 1));
     // The holder key must hash to the holder's peer.
     let mut foreign = signed.clone();
     foreign.insert("holderKey", agent.public_raw());
@@ -928,12 +930,13 @@ fn a_record_under_a_renewed_certificate_matches_java_and_is_judged_at_signing_ti
         hex("delta_renewed_certificate_cbor")
     );
 
-    // Receivers judge at the signing time: long after it the history stays valid, and a
-    // receiver whose clock lags beyond the drift ceiling refuses it.
+    // Receivers judge at the signing time: long after it the history stays valid, and since
+    // v0.1.30 the signatures verify at a receiver whose clock lags too (SPEC §4.2); the fold's
+    // far-future rule then defers or refuses the state (fold_golden.rs).
     let received = state_of("delta_renewed_certificate_cbor");
     assert!(issuer_accepts(&received, signed_at));
     assert!(issuer_accepts(&received, signed_at + 30 * HOUR));
-    assert!(!issuer_accepts(&received, verify_at));
+    assert!(issuer_accepts(&received, verify_at));
     // The first certificate does not cover the renewed record's stamp.
     let mut first = received.clone();
     first.insert("agentCertificate", decoded("agent_certificate_cbor"));
@@ -1160,9 +1163,15 @@ fn an_attested_entrys_state_must_be_signed_by_its_agent() {
 #[test]
 fn a_state_signed_outside_its_window_or_beyond_the_drift_ceiling_is_refused() {
     let now = verify_at();
-    for (name, offset) in [
-        ("adv_agent_state_out_of_window_delta", -HOUR),
-        ("adv_agent_state_drift_delta", MAX_DRIFT_MILLIS + 60_000),
+    for (name, offset, accepted) in [
+        ("adv_agent_state_out_of_window_delta", -HOUR, false),
+        // SPEC §9.2 F4: the certificate bounds signedAt by its window alone, so the drift
+        // vector's signatures verify; the fold defers it (fold_golden.rs).
+        (
+            "adv_agent_state_drift_delta",
+            MAX_DRIFT_MILLIS + 60_000,
+            true,
+        ),
     ] {
         let state = state_of(name);
         assert_eq!(
@@ -1170,7 +1179,7 @@ fn a_state_signed_outside_its_window_or_beyond_the_drift_ceiling_is_refused() {
             Some(stamp(offset, 0).as_str()),
             "{name}"
         );
-        assert!(!issuer_accepts(&state, now), "{name}");
+        assert_eq!(issuer_accepts(&state, now), accepted, "{name}");
     }
     // The drift vector is inside the window: a receiver whose clock has caught up accepts it.
     let drift = state_of("adv_agent_state_drift_delta");

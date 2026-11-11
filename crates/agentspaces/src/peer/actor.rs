@@ -25,9 +25,10 @@
 //!
 //! [`Peer`]: super::Peer
 
+mod serve;
 mod space_ops;
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -36,8 +37,8 @@ use std::time::Duration;
 use agentspaces_wire::ads as wire_ads;
 use agentspaces_wire::bodies::{
     self, KIND_ACK, KIND_BLOCK, KIND_BLOCK_WANT, KIND_CHANNEL_HELLO, KIND_DIGEST, KIND_GROUP_AD,
-    KIND_PING, KIND_PING_REQ, KIND_PIPE_DATA, KIND_PULL_RESP, KIND_RELAY_FRAME, KIND_RUMOR,
-    RELAY_SIGNAL_CAPABILITY, RUMOR_HOPS, RelaySignal, Rumor, STREAM_ADS, STREAM_PEERS,
+    KIND_GROUP_AD_WANT, KIND_PING, KIND_PING_REQ, KIND_PIPE_DATA, KIND_PULL_RESP, KIND_RELAY_FRAME,
+    KIND_RUMOR, RELAY_SIGNAL_CAPABILITY, RUMOR_HOPS, RelaySignal, Rumor, STREAM_ADS, STREAM_PEERS,
     STREAM_SPACE_PREFIX,
 };
 use agentspaces_wire::cbor::{self, Map, Value};
@@ -45,13 +46,16 @@ use agentspaces_wire::crypto;
 use agentspaces_wire::envelope::{self, Auth, FrameFilter};
 use agentspaces_wire::fold::{FoldContext, FoldOutcome, Refusal, SpaceStore};
 use agentspaces_wire::founding;
-use agentspaces_wire::hlc::{Hlc, Stamp};
+use agentspaces_wire::hlc::Hlc;
 use agentspaces_wire::identity::{AgentIdentity, Identity};
 use agentspaces_wire::ids;
-use agentspaces_wire::limits::{INLINE_PAYLOAD_LIMIT, MAX_FRAME_BYTES};
+use agentspaces_wire::limits::{
+    CARD_SPILL_THRESHOLD_BYTES, CARD_SPILL_WARN_BYTES, INLINE_PAYLOAD_LIMIT, MAX_FRAME_BYTES,
+};
 use agentspaces_wire::records::{self, EntryWrite, NULL_PAYLOAD, PayloadSource};
 use agentspaces_wire::revocation::{self, Registry};
 use agentspaces_wire::seed::Seed;
+use agentspaces_wire::serving;
 use agentspaces_wire::time;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -61,14 +65,16 @@ use super::ads::{AdCache, pulled_ads};
 use super::blocks::{
     BlockStore, MAX_FETCHED_BLOCK_BYTES, MAX_OWN_BLOCK_BYTES, MAX_SINGLE_BLOCK_BYTES, Refused,
 };
+use super::listen::{self, BoundListener, ListenConfig};
 use super::members::MemberView;
-use super::spaces::{Spaces, parse_delta, parse_sync, space_name};
+use super::spaces::{Spaces, space_name};
 use super::{
     DEFAULT_AGENT_NAME, FilterCounters, GROUP_AD_WANT_INTERVAL, LinkInfo, PeerCounters, PeerError,
     PeerEvent,
 };
 use crate::clock::SharedClock;
 use crate::transport::{Channel, Closer, Dialer, FrameReceiver, FrameSender, TransportError};
+use serve::{Hub, Via};
 use space_ops::{COLLECT_INTERVAL, Deferred, SWEEP_INTERVAL, Watcher};
 
 /// A call queued by a [`Peer`](super::Peer) handle: it runs on the actor and replies itself.
@@ -83,6 +89,12 @@ const INBOUND_QUEUE: usize = 1024;
 /// `FramePump.DEFAULT_CAP_BYTES`): past it the link's reader waits, so the transport stops
 /// reading the socket and a fast or hostile seed cannot grow the peer's memory.
 pub(super) const INBOUND_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+/// The bytes of verified frames one accepted link may have waiting for the actor: two frames at
+/// the frame cap. Every accepted link draws on a shared budget too ([`ACCEPTED_BUDGET_BYTES`]),
+/// so many links cannot pin many times the memory one may.
+const ACCEPTED_LINK_BUDGET_BYTES: usize = 16 * 1024 * 1024;
+/// The bytes of verified frames all accepted links together may have waiting for the actor.
+pub(super) const ACCEPTED_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 /// The most members (and reachable members) a peer remembers.
 const MAX_MEMBERS: usize = 1 << 16;
 /// The most frame kinds named in the ignored-kind counter.
@@ -101,11 +113,8 @@ const BLOCK_ASK_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_SERVED_BLOCKS: usize = 4096;
 /// The indirect probes (PING_REQ) a peer carries at once (Java `PeerNode` relays, 1024).
 const MAX_RELAYS: usize = 1024;
-/// The largest logical counter of a stamp this peer merges into its clock. Honest nodes never
-/// issue 65 536 stamps within one millisecond; a stamp near `i32::MAX` would pin the clock's
-/// counter and make every later stamp this peer issues the same, so receivers drop its frames
-/// as replays.
-const MAX_OBSERVED_LOGICAL: i32 = 1 << 16;
+/// The (card id, size) pairs a peer remembers warning about before it forgets them all.
+const MAX_WARNED_CARDS: usize = 1024;
 /// Java's default member TTL (`GroupMembership.Config.defaults().memberTtl`): a member not
 /// heard from for this long is dropped from a Java node's view.
 const MEMBER_TTL: Duration = Duration::from_secs(30);
@@ -133,6 +142,45 @@ pub(super) struct Settings {
     pub space_max_entries: usize,
     /// The fetched-block budget (`PeerConfig::fetched_block_bytes`).
     pub fetched_block_bytes: usize,
+    /// The bytes of states each space holds (`PeerConfig::space_max_bytes`).
+    pub space_max_bytes: usize,
+    /// The listening role's settings, clamped (`PeerConfig::listen`).
+    pub listen: ListenSettings,
+}
+
+/// The listening role's settings ([`ListenConfig`]), clamped to sane ranges.
+#[derive(Debug, Clone)]
+pub(super) struct ListenSettings {
+    pub require_attestation: bool,
+    pub replicate_heard: bool,
+    pub max_replicated_spaces: usize,
+    pub max_links: usize,
+    pub max_members: usize,
+    pub admission_burst: u32,
+    pub admissions_per_second: u32,
+    pub anti_entropy_period: Option<Duration>,
+    pub introduction_timeout: Duration,
+    pub link_idle_timeout: Duration,
+}
+
+impl ListenSettings {
+    /// The settings of `config`, every timer clamped to `1 ms ..= 365 days` and every bound to
+    /// at least one.
+    pub fn of(config: &ListenConfig) -> Self {
+        let clamp = |d: Duration| d.clamp(MIN_TIMER, MAX_TIMER);
+        Self {
+            require_attestation: config.require_attestation,
+            replicate_heard: config.replicate_heard,
+            max_replicated_spaces: config.max_replicated_spaces,
+            max_links: config.max_links.max(1),
+            max_members: config.max_members.max(1),
+            admission_burst: config.admission_burst.max(1),
+            admissions_per_second: config.admissions_per_second,
+            anti_entropy_period: config.anti_entropy_period.map(clamp),
+            introduction_timeout: clamp(config.introduction_timeout),
+            link_idle_timeout: clamp(config.link_idle_timeout),
+        }
+    }
 }
 
 impl Settings {
@@ -156,6 +204,8 @@ impl Settings {
             send_stall_timeout: clamp(send_stall_timeout),
             space_max_entries: agentspaces_wire::fold::DEFAULT_MAX_ENTRIES,
             fetched_block_bytes: MAX_FETCHED_BLOCK_BYTES,
+            space_max_bytes: super::DEFAULT_SPACE_MAX_BYTES,
+            listen: ListenSettings::of(&ListenConfig::default()),
         }
     }
 
@@ -165,6 +215,16 @@ impl Settings {
         Self {
             space_max_entries: space_max_entries.max(1),
             fetched_block_bytes,
+            ..self
+        }
+    }
+
+    /// These settings with the bound of bytes each space's states hold (at least 1) and the
+    /// listening role's settings.
+    pub fn with_listen(self, space_max_bytes: usize, listen: &ListenConfig) -> Self {
+        Self {
+            space_max_bytes: space_max_bytes.max(1),
+            listen: ListenSettings::of(listen),
             ..self
         }
     }
@@ -192,6 +252,9 @@ fn re_lease_period(interval: Duration, members: usize) -> Duration {
 /// What starts an actor.
 pub(super) struct Start {
     pub identity: Identity,
+    /// This peer's clock, built over its PeerID (which [`Hlc::new`] validates where the peer
+    /// starts).
+    pub hlc: Hlc,
     pub group: String,
     pub founder: Option<String>,
     pub founding: Option<Map>,
@@ -206,17 +269,24 @@ pub(super) struct Start {
     /// Counts the folds that were not refused (states and claims), so a waiting read or take
     /// wakes on the next one.
     pub folds: watch::Sender<u64>,
+    /// The listeners bound (none for a dial-only peer).
+    pub listeners: Vec<BoundListener>,
+    /// The spaces a listening peer replicates from the start.
+    pub replicate: Vec<String>,
 }
 
 /// What a link's reader and pump and the redial task tell the actor.
 pub(super) enum Inbound {
     /// A frame that verified on link `link`, with how it was authenticated, and its share of the
-    /// link's inbound byte budget ([`INBOUND_BUDGET_BYTES`]), given back once it is handled.
+    /// link's inbound byte budget ([`INBOUND_BUDGET_BYTES`]; an accepted link's is smaller and
+    /// it holds a share of the budget all accepted links share too), given back once it is
+    /// handled.
     Frame {
         link: u64,
         env: Map,
         auth: Auth,
         budget: OwnedSemaphorePermit,
+        shared: Option<OwnedSemaphorePermit>,
     },
     /// A frame that did not verify on link `link`.
     Malformed { link: u64 },
@@ -233,6 +303,8 @@ pub(super) enum Inbound {
     },
     /// Redial `attempt` ran out of its window.
     GaveUp { attempt: u64 },
+    /// A listener accepted a channel.
+    Accepted { channel: Box<Channel> },
 }
 
 /// A frame handler's verdict on a body it could not read: counted as malformed.
@@ -314,6 +386,17 @@ struct Link {
     /// When the link was installed: a redial after its loss waits until a
     /// `Settings::reconnect_interval` has passed since then.
     up_at: Instant,
+    /// When a verified frame last arrived on it (an accepted link's idle timer).
+    heard_at: Instant,
+    /// The member that introduced itself on it (an accepted link's owner, SPEC §5.2).
+    owner: Option<String>,
+    /// Frames a stranger sent on it before any member introduced itself (an accepted link).
+    strangers: u32,
+    /// Burst frames waiting for room in its queue (an accepted link; the dialed link keeps the
+    /// outbox instead), bounded by bytes and frames.
+    backlog: VecDeque<Vec<u8>>,
+    /// The bytes in `backlog`.
+    backlog_bytes: usize,
 }
 
 /// A redial in progress.
@@ -411,34 +494,63 @@ pub(super) struct Actor {
     last_collect: Instant,
     /// Transitions waiting for their payload's block.
     deferred: VecDeque<Deferred>,
+    /// The (card id, encoded size) pairs a size warning was logged for (SPEC §6.1a.5).
+    warned_cards: HashSet<(String, usize)>,
+    /// The listening role's state ([`serve`]); inert on a dial-only peer.
+    hub: Hub,
 }
 
-/// Starts an actor on `channel` (dialed to `seed`) and returns its job queue. The actor sends
-/// its first frames at once: the GROUP_AD_WANT of a join by id, else the introduction and the
-/// revocation pull.
-pub(super) fn spawn(start: Start, channel: Channel, seed: Seed) -> mpsc::Sender<Job> {
+/// Starts an actor, on `dialed` (a channel dialed to a seed) when there is one, and returns its
+/// job queue. The actor sends its first frames at once: the GROUP_AD_WANT of a join by id, else
+/// the introduction and the revocation pull. A listening peer starts accepting links on its
+/// listeners; one whose seeds did not answer at start redials them in the background.
+pub(super) fn spawn(mut start: Start, dialed: Option<(Channel, Seed)>) -> mpsc::Sender<Job> {
     let (jobs_tx, jobs_rx) = mpsc::channel(JOB_QUEUE);
     let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE);
-    let mut actor = Actor::new(start, inbound_tx);
-    actor.install_link(channel, seed);
-    if actor.joining {
-        actor.send_want();
-    } else {
-        actor.on_link_ready();
+    let listeners = std::mem::take(&mut start.listeners);
+    let replicate = std::mem::take(&mut start.replicate);
+    let mut actor = Actor::new(start, inbound_tx.clone(), &listeners);
+    for bound in listeners {
+        actor
+            .hub
+            .accept_tasks
+            .push(listen::spawn_accept(bound.listener, inbound_tx.clone()));
     }
+    match dialed {
+        Some((channel, seed)) => {
+            actor.install_link(channel, seed);
+            if actor.joining {
+                actor.send_want();
+            } else {
+                actor.on_link_ready();
+            }
+        }
+        None if !actor.seeds.is_empty() => {
+            // A listening peer whose seeds did not answer: it serves its own links meanwhile.
+            let now = Instant::now();
+            actor.outage_since = Some(now);
+            actor.start_redial(
+                now.checked_add(actor.settings.reconnect_window),
+                actor.settings.reconnect_interval,
+            );
+        }
+        None => {}
+    }
+    actor.start_listening(&replicate);
     tokio::spawn(actor.run(jobs_rx, inbound_rx));
     jobs_tx
 }
 
 impl Actor {
-    fn new(start: Start, inbound_tx: mpsc::Sender<Inbound>) -> Self {
+    fn new(start: Start, inbound_tx: mpsc::Sender<Inbound>, listeners: &[BoundListener]) -> Self {
         let peer_id = start.identity.peer_id().to_owned();
+        let hub = Hub::new(&start.settings.listen, listeners);
         let mut registry = Registry::new(start.founder, Some(start.group.clone()));
         if registry.founder().is_none() {
             registry.set_founder(start.founding.as_ref().and_then(founder_of));
         }
         Self {
-            hlc: Hlc::new(peer_id.clone()),
+            hlc: start.hlc,
             identity: Arc::new(start.identity),
             spaces: Spaces::new(&start.group, start.settings.space_max_entries),
             blocks: BlockStore::new(MAX_OWN_BLOCK_BYTES, start.settings.fetched_block_bytes),
@@ -454,7 +566,7 @@ impl Actor {
             members: MemberView::new(MAX_MEMBERS),
             reachable: BTreeSet::new(),
             seed_peer: None,
-            resource_hints: start.resource_hints,
+            resource_hints: with_app_card_level(start.resource_hints),
             counters: PeerCounters::default(),
             link: None,
             next_link_id: 0,
@@ -489,6 +601,8 @@ impl Actor {
             last_sweep: Instant::now(),
             last_collect: Instant::now(),
             deferred: VecDeque::new(),
+            warned_cards: HashSet::new(),
+            hub,
             peer_id,
         }
     }
@@ -513,6 +627,7 @@ impl Actor {
             } else {
                 self.last_collect.checked_add(COLLECT_INTERVAL)
             };
+            let tick_at = self.hub.next_tick;
             tokio::select! {
                 job = jobs.recv() => match job {
                     Some(job) => job(&mut self),
@@ -523,17 +638,17 @@ impl Actor {
                 () = wake_at(want_at) => self.on_want_tick(),
                 () = wake_at(sweep_at) => self.on_sweep(),
                 () = wake_at(collect_at) => self.on_collect(),
+                () = wake_at(tick_at) => self.on_listen_tick(),
             }
         }
         self.close();
     }
 
-    /// Merges a stamp into this peer's clock, unless its logical counter is over
-    /// [`MAX_OBSERVED_LOGICAL`] (a stamp that would pin the clock) or it does not parse.
+    /// Merges a remote stamp into this peer's clock ([`Hlc::observe`]): only an acceptable stamp
+    /// merges (SPEC §9: one whose logical counter is above 65536 never reaches the clock), with
+    /// its physical part clamped one millisecond inside the drift ceiling.
     fn observe_stamp(&mut self, stamp: &str, now: i64) {
-        if Stamp::parse(stamp).is_some_and(|parsed| parsed.logical <= MAX_OBSERVED_LOGICAL) {
-            self.hlc.observe(stamp, now);
-        }
+        self.hlc.observe(stamp, now);
     }
 
     // ------------------------------------------------------------------------- clocks
@@ -543,17 +658,25 @@ impl Actor {
     }
 
     /// A fresh stamp for an issuer (an agent id) that sorts after everything this peer has
-    /// stamped or observed, as `wire.hlc_now(issuer)` does per node.
-    fn issuer_stamp(&mut self, issuer: &str, now: i64) -> String {
+    /// stamped or observed, as `wire.hlc_now(issuer)` does per node. The issuer's clock validates
+    /// its node when it is first built (SPEC §9: a node never emits a stamp a receiver refuses
+    /// for its node), so an agent id holding a control character or past the node bound is
+    /// refused here, before anything is signed.
+    fn issuer_stamp(&mut self, issuer: &str, now: i64) -> Result<String, PeerError> {
         let base = self.hlc.last();
-        let clock = self
-            .issuer_clocks
-            .entry(issuer.to_owned())
-            .or_insert_with(|| Hlc::new(issuer));
+        let clock = match self.issuer_clocks.entry(issuer.to_owned()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let clock = Hlc::new(issuer).map_err(|error| {
+                    PeerError::InvalidArgument(format!("{issuer} cannot stamp: {error}"))
+                })?;
+                entry.insert(clock)
+            }
+        };
         if let Some((physical, logical)) = base {
             clock.observe(&format!("{physical}:{logical}:{issuer}"), now);
         }
-        clock.now(now)
+        Ok(clock.now(now))
     }
 
     fn emit(&self, event: PeerEvent) {
@@ -571,6 +694,22 @@ impl Actor {
     /// Takes `channel` as the current link: spawns its reader and its pump, re-derives the relay
     /// this peer names for it, and publishes it. Returns the link's id.
     fn install_link(&mut self, channel: Channel, seed: Seed) -> u64 {
+        let link = self.open_link(channel, false);
+        let id = link.id;
+        self.relay_for_link(link.info.attested.as_deref(), &seed);
+        let info = link.info.clone();
+        tracing::debug!(peer = %self.peer_id, remote = %info.remote, "agentspaces: link up");
+        self.link = Some(link);
+        self.current_seed = Some(seed);
+        self.link_watch.send_replace(Some(info.clone()));
+        self.emit(PeerEvent::Connected(info));
+        id
+    }
+
+    /// Spawns `channel`'s reader and pump under a fresh link id and returns the link, not yet
+    /// held anywhere. An `accepted` link reads within the smaller budget of accepted links and
+    /// the budget they share.
+    fn open_link(&mut self, channel: Channel, accepted: bool) -> Link {
         let Channel {
             scheme,
             remote,
@@ -596,32 +735,43 @@ impl Actor {
                 dropped: Arc::clone(&self.send_dropped),
             },
         ));
+        let (own, shared_budget) = if accepted {
+            (
+                ACCEPTED_LINK_BUDGET_BYTES,
+                Some(Arc::clone(&self.hub.inbound_budget)),
+            )
+        } else {
+            (INBOUND_BUDGET_BYTES, None)
+        };
         tokio::spawn(read_link(
             receiver,
             attested.clone(),
             id,
             self.inbound_tx.clone(),
-            Arc::new(Semaphore::new(INBOUND_BUDGET_BYTES)),
+            Budgets {
+                own: Arc::new(Semaphore::new(own)),
+                own_bytes: own,
+                shared: shared_budget,
+            },
         ));
-        self.relay_for_link(attested.as_deref(), &seed);
-        let info = LinkInfo {
-            scheme,
-            remote,
-            attested,
-        };
-        tracing::debug!(peer = %self.peer_id, remote = %info.remote, "agentspaces: link up");
-        self.link = Some(Link {
+        let now = Instant::now();
+        Link {
             id,
-            info: info.clone(),
+            info: LinkInfo {
+                scheme,
+                remote,
+                attested,
+            },
             queue: SendQueue { tx, shared },
             closer,
             hello_sent: false,
-            up_at: Instant::now(),
-        });
-        self.current_seed = Some(seed);
-        self.link_watch.send_replace(Some(info.clone()));
-        self.emit(PeerEvent::Connected(info));
-        id
+            up_at: now,
+            heard_at: now,
+            owner: None,
+            strangers: 0,
+            backlog: VecDeque::new(),
+            backlog_bytes: 0,
+        }
     }
 
     /// The relay this peer names (`relay.via`) and wraps addressed frames through, re-derived for a
@@ -726,34 +876,46 @@ impl Actor {
                 env,
                 auth,
                 budget,
+                shared,
             } => {
                 if self.is_current(link) {
                     // A verified frame: the far end speaks the protocol, so the link is a
                     // working one and a later loss starts a new reconnect window.
                     self.outage_since = None;
                     bump(&mut self.counters.frames_received);
-                    if self.handle(env, Some(auth), false).is_err() {
+                    if self.handle(env, Some(auth), Via::Dialed).is_err() {
                         bump(&mut self.counters.malformed);
                     }
+                } else if self.hub.accepted.contains_key(&link) {
+                    self.on_accepted_frame(link, env, auth);
                 }
                 // The frame's bytes leave the link's inbound budget once it is handled.
                 drop(budget);
+                drop(shared);
             }
             Inbound::Malformed { link } => {
-                if self.is_current(link) {
+                if self.is_current(link) || self.hub.accepted.contains_key(&link) {
                     bump(&mut self.counters.malformed);
                 }
             }
             Inbound::Relief { link } => {
-                if self.is_current(link) && !self.joining {
-                    self.flush_outbox();
+                if self.is_current(link) {
+                    if !self.joining {
+                        self.flush_outbox();
+                        self.flush_dialed_backlog();
+                    }
+                } else {
+                    self.flush_backlog(link);
                 }
             }
             Inbound::Lost { link } => {
                 if self.is_current(link) {
                     self.lose_link();
+                } else {
+                    self.drop_accepted(link);
                 }
             }
+            Inbound::Accepted { channel } => self.accept_link(*channel),
             Inbound::Dialed {
                 channel,
                 seed,
@@ -822,6 +984,7 @@ impl Actor {
             let _ = self.send_space_digest(&space);
         }
         self.flush_outbox();
+        self.flush_dialed_backlog();
     }
 
     /// The re-lease is due: introduce again (which also re-arms it), and send any writes still
@@ -832,7 +995,7 @@ impl Actor {
         // even when none arrive (SPEC §6.2).
         let now = self.now();
         self.ads.expire(now);
-        if !self.closed && !self.joining && self.link.is_some() {
+        if !self.closed && !self.joining && (self.link.is_some() || self.hub.listening) {
             self.introduce();
             self.flush_outbox();
         }
@@ -959,6 +1122,20 @@ impl Actor {
         to: &str,
         budget: Budget,
     ) -> Result<(), PeerError> {
+        // A listening peer reaches a member on the link it introduced itself on, or through the
+        // relay its advertisement declares when that relay holds a link here.
+        if let Some((id, relay)) = self.accepted_route(to) {
+            return match relay {
+                None => self.send_accepted(id, kind, body, Some(to), budget),
+                Some(relay) => {
+                    let inner = self.signed_frame(kind, body, Some(to));
+                    let outer = bodies::relay_frame_body(to, &inner, None, None);
+                    self.send_accepted(id, KIND_RELAY_FRAME, &outer, Some(&relay), budget)?;
+                    bump(&mut self.counters.relayed_out);
+                    Ok(())
+                }
+            };
+        }
         let Some(relay) = self.relay_for(to) else {
             return self.send_with(kind, body, Some(to), budget);
         };
@@ -975,6 +1152,13 @@ impl Actor {
     /// Rumors one of this peer's own items (a write, an advertisement), or keeps it in the outbox
     /// until the peer has a link with room again.
     fn send_or_hold(&mut self, body: Vec<u8>) {
+        if self.hub.listening && !self.joining {
+            // Every accepted link hears it at once; the dialed link (if any) below.
+            self.publish_accepted(&body);
+            if self.link.is_none() && self.seeds.is_empty() {
+                return; // no seed to hold it for
+            }
+        }
         if self.link.is_some() && !self.joining {
             self.flush_outbox();
             if self.outbox.is_empty()
@@ -1029,21 +1213,42 @@ impl Actor {
     /// so a re-introduction within one millisecond is not taken for the same item.
     fn introduce(&mut self) {
         let now = self.now();
-        let issued = time::instant_iso(now.div_euclid(1000).saturating_mul(1000));
-        let ad = wire_ads::peer_advertisement(
-            &self.group,
-            &self.identity,
-            &issued,
-            Some(&self.resource_hints),
-        );
-        let payload = wire_ads::signed_peer_ad(&ad, &self.identity);
+        let payload = self.self_ad_payload(now);
         self.last_lease = Instant::now();
         let item_ms = now.max(self.last_intro_ms.saturating_add(1));
         self.last_intro_ms = item_ms;
         let item = format!("peer:{}:{item_ms}", self.peer_id);
         let body = bodies::rumor_body(STREAM_PEERS, &item, RUMOR_HOPS, &payload);
-        let _ = self.send(KIND_RUMOR, &body, None);
-        self.announce_channel();
+        if self.link.is_some() {
+            let _ = self.send(KIND_RUMOR, &body, None);
+            self.announce_channel();
+        }
+        // A listening peer refreshes its advertisement directly to each member it holds a link
+        // to, unforwarded (SPEC §5.2).
+        self.introduce_accepted(&item, &payload);
+        self.hub.own_ad = Some(payload);
+    }
+
+    /// This peer's signed self-advertisement as of `now` (SPEC §5.2): its resource hints and, on
+    /// a listening peer, the endpoints of its listeners and the RELAY role (SPEC §5.4). A peer
+    /// that advertises endpoints is dialed directly, so it names no `relay.via`.
+    fn self_ad_payload(&self, now: i64) -> Vec<u8> {
+        let issued = time::instant_iso(now.div_euclid(1000).saturating_mul(1000));
+        let mut hints = self.resource_hints.clone();
+        if !self.hub.endpoints.is_empty() {
+            hints.remove("relay.via");
+        }
+        let mut ad =
+            wire_ads::peer_advertisement(&self.group, &self.identity, &issued, Some(&hints));
+        if !self.hub.endpoints.is_empty() {
+            let endpoints: Vec<Value> =
+                self.hub.endpoints.iter().cloned().map(Value::Map).collect();
+            ad.insert("endpoints", Value::Array(endpoints));
+        }
+        if self.hub.listening {
+            ad.insert("roles", Value::Array(vec![Value::from(serve::ROLE_RELAY)]));
+        }
+        wire_ads::signed_peer_ad(&ad, &self.identity)
     }
 
     /// On a link the transport attested, announces once that this peer accepts channel-attested
@@ -1103,9 +1308,11 @@ impl Actor {
     // ------------------------------------------------------------------------- receiving
 
     /// Handles one verified envelope (`Peer._handle`): the reader filter, the sender's
-    /// revocation, the frame filter, the clock, membership, then the kind. An `Err` is a body
-    /// that does not parse, counted as malformed by the caller; nothing here ends the reader.
-    fn handle(&mut self, mut env: Map, auth: Option<Auth>, relayed: bool) -> Result<(), Malformed> {
+    /// revocation, the frame filter, on an accepted link the admission gate ([`Actor::gate`]),
+    /// the clock, membership, then the kind. `via` says which link the frame came on, and so
+    /// where an answer goes. An `Err` is a body that does not parse, counted as malformed by the
+    /// caller; nothing here ends the reader.
+    fn handle(&mut self, mut env: Map, auth: Option<Auth>, via: Via) -> Result<(), Malformed> {
         if !envelope::accepts(&env, &self.group, &self.peer_id) {
             return Ok(());
         }
@@ -1129,7 +1336,25 @@ impl Actor {
             Some(Auth::Session) => bump(&mut self.counters.session_frames),
             _ => {}
         }
-        if let Some(stamp) = env.get("stamp").and_then(Value::as_str) {
+        // Frames that arrive on (or through) an accepted link pass the admission gate before any
+        // side effect, the clock merge included (SPEC §5.1).
+        let gated = via.gate();
+        if gated.is_none() && self.hub.settings.require_attestation {
+            // SPEC §5.6's required attestation holds on the dialed link too: only the seed its
+            // transport attested speaks there, and no relayed inner frame is taken.
+            let attested = self
+                .link
+                .as_ref()
+                .and_then(|link| link.info.attested.as_deref());
+            let from = env.get("from").and_then(Value::as_str);
+            if via.is_relayed() || attested.is_none() || attested != from {
+                bump(&mut self.hub.counters.unattested_frames);
+                return Ok(());
+            }
+        }
+        if gated.is_none()
+            && let Some(stamp) = env.get("stamp").and_then(Value::as_str)
+        {
             self.observe_stamp(stamp, now);
         }
         let to_us = env.get("to").and_then(Value::as_str) == Some(self.peer_id.as_str());
@@ -1146,8 +1371,24 @@ impl Actor {
             None | Some(Value::Null) => Vec::new(),
             Some(_) => return Err(Malformed),
         };
+        if let Some(link) = gated {
+            match self.gate(link, &sender, via) {
+                serve::Gate::Member => {
+                    if let Some(stamp) = env.get("stamp").and_then(Value::as_str) {
+                        self.observe_stamp(stamp, now);
+                    }
+                }
+                serve::Gate::Stranger => return self.on_stranger(link, sender, &kind, &body),
+                serve::Gate::Drop => return Ok(()),
+            }
+        }
         if sender != self.peer_id {
-            self.heard_from(&sender, relayed, to_us);
+            self.heard_from(&sender, via, to_us);
+        }
+        if let Via::Accepted(id) = via {
+            // A member speaking on a link nobody introduced itself on yet (it came back on a new
+            // one): the link is its, and it hears this peer's introduction there.
+            self.bind_link(id, &sender);
         }
         match kind.as_str() {
             KIND_PING => {
@@ -1156,22 +1397,18 @@ impl Actor {
                 // Java answers `send(group, from, ACK)`: addressed to the prober, and back through
                 // the relay when the PING came inside a RELAY_FRAME, else the seed takes an ACK it
                 // never asked for and the prober evicts this peer.
-                let _ = if relayed {
-                    self.send_addressed_frame(KIND_ACK, &ack, &sender)
-                } else {
-                    self.send(KIND_ACK, &ack, Some(&sender))
-                };
+                let _ = self.reply(via, KIND_ACK, &ack, &sender);
             }
             KIND_PING_REQ => {
-                let (target, nonce) = parse_ping_req(&body).ok_or(Malformed)?;
+                let (target, nonce) = bodies::parse_ping_req(&body).ok_or(Malformed)?;
                 self.on_ping_req(sender, target, nonce);
             }
             KIND_ACK => {
-                let nonce = bodies::parse_ping(&body).ok_or(Malformed)?;
+                let nonce = bodies::parse_ack(&body).ok_or(Malformed)?;
                 self.on_ack(&sender, nonce);
             }
             KIND_PIPE_DATA => self.on_pipe(sender, &body)?,
-            KIND_RELAY_FRAME => return self.on_relay_frame(&body, relayed),
+            KIND_RELAY_FRAME => return self.on_relay_frame(&body, via, &sender),
             KIND_BLOCK_WANT => {
                 let cid = bodies::parse_block_want(&body).ok_or(Malformed)?;
                 self.serve_block(&sender, &cid);
@@ -1182,6 +1419,7 @@ impl Actor {
                     self.block_asked.remove(&block.cid);
                     let cid = block.cid.clone();
                     if self.blocks.hold_fetched(block.cid, block.bytes) {
+                        self.fetched(&cid);
                         self.emit(PeerEvent::Block { cid });
                         self.retry_deferred();
                     }
@@ -1200,9 +1438,19 @@ impl Actor {
                 }
             }
             KIND_GROUP_AD => self.on_group_ad(&body)?,
-            KIND_RUMOR => self.on_rumor(bodies::parse_rumor(&body).ok_or(Malformed)?)?,
+            KIND_RUMOR => self.on_rumor(bodies::parse_rumor(&body).ok_or(Malformed)?, via)?,
             KIND_PULL_RESP => {
-                self.on_pull_resp(bodies::parse_pull_resp(&body).ok_or(Malformed)?)?;
+                let deltas = bodies::parse_pull_resp(&body).ok_or(Malformed)?;
+                if self.pull_resp_wanted(&sender, via) {
+                    self.on_pull_resp(deltas)?;
+                }
+            }
+            // A dial-only peer serves no digests and no foundings; a listening one answers both.
+            KIND_DIGEST if self.hub.listening => self.on_digest(&sender, &body, via)?,
+            KIND_GROUP_AD_WANT if self.hub.listening => {
+                if let Some(link) = via.direct_link(self.link.as_ref().map(|link| link.id)) {
+                    self.serve_founding(link, &sender);
+                }
             }
             _ => self.ignore_kind(kind),
         }
@@ -1212,9 +1460,9 @@ impl Actor {
     /// A verified frame is a member heard from, and (unless a relay carried it) one this peer's
     /// link reaches. The first frame the seed addresses to this peer names the seed: it is the
     /// relay this peer declares (`relay.via`), so the peer introduces itself again.
-    fn heard_from(&mut self, sender: &str, relayed: bool, to_us: bool) {
+    fn heard_from(&mut self, sender: &str, via: Via, to_us: bool) {
         self.members.hear(sender);
-        if relayed {
+        if via != Via::Dialed {
             return;
         }
         if !self.reachable.contains(sender) && self.reachable.len() < MAX_MEMBERS {
@@ -1303,9 +1551,15 @@ impl Actor {
             bump(&mut self.counters.replies_skipped);
             return;
         }
-        // The answer, and the RELAY_FRAME around it when the seed carries it.
+        // The answer, and the RELAY_FRAME around it when the seed carries it, on the link that
+        // carries it: a member's accepted link (with nothing waiting in its backlog), else the
+        // dialed one.
         let estimate = length.saturating_add(FRAME_OVERHEAD.saturating_mul(2));
-        if !self.has_room(estimate, Budget::Half) {
+        let room = match self.accepted_route(requester) {
+            Some((id, _)) => self.accepted_has_room(id, estimate),
+            None => self.has_room(estimate, Budget::Half),
+        };
+        if !room {
             bump(&mut self.counters.replies_skipped);
             return;
         }
@@ -1367,10 +1621,17 @@ impl Actor {
     }
 
     /// A RELAY_FRAME addressed to this peer: the inner frame, fully signed, handled as relayed
-    /// when it is for this peer and not itself a relay. A dial-only peer forwards nothing.
-    fn on_relay_frame(&mut self, body: &[u8], relayed: bool) -> Result<(), Malformed> {
+    /// when it is for this peer and not itself a relay. A dial-only peer forwards nothing; a
+    /// listening one carries a frame for a member on to it ([`Actor::relay_onward`]).
+    fn on_relay_frame(&mut self, body: &[u8], via: Via, sender: &str) -> Result<(), Malformed> {
         let relay = bodies::parse_relay_frame(body).ok_or(Malformed)?;
-        if relay.target != self.peer_id || relayed {
+        if via.is_relayed() {
+            return Ok(());
+        }
+        if relay.target != self.peer_id {
+            if self.hub.listening {
+                self.relay_onward(relay, sender);
+            }
             return Ok(());
         }
         let inner = envelope::decode_frame(&relay.frame).ok_or(Malformed)?;
@@ -1378,7 +1639,11 @@ impl Actor {
             return Ok(());
         }
         bump(&mut self.counters.relayed_in);
-        self.handle(inner, None, true)
+        let outer = match via {
+            Via::Accepted(id) => Some(id),
+            _ => None,
+        };
+        self.handle(inner, None, Via::Relayed(outer))
     }
 
     /// A GROUP_AD (SPEC §9): taken only while a join by GroupID waits, and only when it passes
@@ -1388,7 +1653,7 @@ impl Actor {
         if !self.joining || self.closed {
             return Ok(());
         }
-        let signed = cbor::decode(body).map_err(|_| Malformed)?;
+        let signed = Value::Map(bodies::decode_body(KIND_GROUP_AD, body).ok_or(Malformed)?);
         if founding::verify_signed_group_ad(&signed).as_deref() != Some(self.group.as_str()) {
             return Ok(());
         }
@@ -1408,11 +1673,36 @@ impl Actor {
         Ok(())
     }
 
-    fn on_rumor(&mut self, rumor: Rumor) -> Result<(), Malformed> {
-        let stream = rumor.stream_id.as_str();
+    /// A RUMOR: its item handled by stream. A listening peer first drops a rumor it has seen
+    /// (by stream and payload hash, SPEC §5.3), then forwards one that decoded and verified to
+    /// its other links ([`Actor::forward_rumor`]).
+    fn on_rumor(&mut self, rumor: Rumor, via: Via) -> Result<(), Malformed> {
         if rumor.payload.is_empty() {
             return Ok(());
         }
+        let listening = self.hub.listening;
+        if listening && !self.hub.seen.insert(&rumor.stream_id, &rumor.payload) {
+            bump(&mut self.hub.counters.rumors_duplicate);
+            return Ok(());
+        }
+        let verdict = self.rumor_item(&rumor);
+        if listening {
+            if rumor.stream_id != STREAM_PEERS {
+                self.hub.activity = true;
+            }
+            if matches!(verdict, Ok(true)) {
+                self.forward_rumor(&rumor, via);
+            } else {
+                bump(&mut self.hub.counters.rumors_unforwarded);
+            }
+        }
+        verdict.map(|_| ())
+    }
+
+    /// Handles one rumor item by stream; `Ok(true)` when it decoded and verified, so a listening
+    /// peer may forward it (an item of a stream this peer does not read is forwarded as it is).
+    fn rumor_item(&mut self, rumor: &Rumor) -> Result<bool, Malformed> {
+        let stream = rumor.stream_id.as_str();
         if revocation::STREAMS.contains(&stream) {
             let now = self.now();
             if self.registry.accept(stream, &rumor.payload, now) {
@@ -1420,24 +1710,38 @@ impl Actor {
                 self.ads.purge(&self.registry);
                 if stream == revocation::PEER_STREAM {
                     self.enforce_peer_revocations();
+                } else {
+                    self.enforce_credential_revocations();
                 }
+                return Ok(true);
             }
+            Ok(serve::signed_revocation_verifies(&rumor.payload))
         } else if stream == STREAM_PEERS {
-            self.accept_peer_ad(&rumor.payload);
+            Ok(self.accept_peer_ad(&rumor.payload))
         } else if stream == STREAM_ADS {
-            let stored = cbor::decode(&rumor.payload).map_err(|_| Malformed)?;
-            self.accept_ad(&stored);
+            let stored = agentspaces_wire::schema::decode(&rumor.payload, "AdCache.StoredAd")
+                .ok_or(Malformed)?;
+            Ok(self.accept_ad(&stored))
         } else if let Some(space) = space_name(stream) {
-            let (claim, state) = parse_delta(&rumor.payload).ok_or(Malformed)?;
+            // SPEC §9.1: a delta outside the wire encoding (a stamp that is no canonical stamp
+            // item among them) is dropped whole, counted, and strikes nobody.
+            let Some(delta) = records::decode_delta(&rumor.payload) else {
+                bump(&mut self.counters.deltas_undecodable);
+                return Ok(false);
+            };
+            self.replicate_space(space);
+            let mut verified = true;
             // Claim before state: a completion authenticates against the holder's claim.
-            if let Some((entry_id, signed)) = claim {
-                self.fold_claim(space, &entry_id, &signed);
+            if let Some((entry_id, signed)) = delta.claim {
+                verified &= serve::forwardable(self.fold_claim(space, &entry_id, &signed));
             }
-            if let Some(state) = state {
-                self.fold_remote_state(space, &state);
+            if let Some(state) = delta.state {
+                verified &= serve::forwardable(self.fold_remote_state(space, &state));
             }
+            Ok(verified)
+        } else {
+            Ok(true)
         }
-        Ok(())
     }
 
     /// A PULL_RESP, applied in Java's registration order, not in the order its streams arrived
@@ -1462,8 +1766,9 @@ impl Actor {
             let Some(bytes) = delta_of(stream) else {
                 continue;
             };
-            match cbor::decode(bytes) {
-                Ok(Value::Array(items)) => {
+            // Java reads the delta as `SignedRevocation[]` under the wire encoding (SPEC §9.1).
+            match agentspaces_wire::schema::load_canonical(bytes) {
+                Some(Value::Array(items)) => {
                     for signed in &items {
                         if self.registry.accept_signed(stream, signed, now) {
                             revoked_any = true;
@@ -1471,7 +1776,7 @@ impl Actor {
                         }
                     }
                 }
-                Ok(Value::Null) => {}
+                Some(Value::Null) => {}
                 _ => malformed = true,
             }
         }
@@ -1481,10 +1786,29 @@ impl Actor {
         if revoked_peers {
             self.enforce_peer_revocations();
         }
+        if revoked_any {
+            self.enforce_credential_revocations();
+        }
         if let Some(bytes) = delta_of(STREAM_ADS) {
             match pulled_ads(bytes) {
-                Some(stored) => stored.iter().for_each(|ad| self.accept_ad(ad)),
+                Some(stored) => stored.iter().for_each(|ad| {
+                    self.accept_ad(ad);
+                }),
                 None => malformed = true,
+            }
+        }
+        if self.hub.listening {
+            // The membership view (SPEC §5.2): a copy of a member's advertisement refreshes a
+            // member already admitted and admits nobody.
+            if let Some(payloads) =
+                delta_of(serving::STREAM_VIEW).and_then(serving::parse_view_delta)
+            {
+                for payload in &payloads {
+                    self.accept_peer_ad(payload);
+                }
+            }
+            if !deltas.is_empty() {
+                self.hub.activity = true;
             }
         }
         for (stream, delta) in &deltas {
@@ -1494,16 +1818,17 @@ impl Actor {
             let Some(space) = space_name(stream).filter(|_| !bytes.is_empty()) else {
                 continue;
             };
-            match parse_sync(bytes) {
-                Some((claims, states)) => {
-                    for (entry_id, signed) in &claims {
+            match records::decode_sync_delta(bytes) {
+                Some(sync) => {
+                    for (entry_id, signed) in &sync.claims {
                         self.fold_claim(space, entry_id, signed);
                     }
-                    for state in &states {
+                    for state in &sync.states {
                         self.fold_remote_state(space, state);
                     }
                 }
-                None => malformed = true,
+                // Counted as an undecodable delta; the other streams still apply.
+                None => bump(&mut self.counters.deltas_undecodable),
             }
         }
         if malformed { Err(Malformed) } else { Ok(()) }
@@ -1538,6 +1863,18 @@ impl Actor {
             tracing::warn!(peer = %self.peer_id, "agentspaces: the seed is revoked; leaving it");
             self.lose_link();
         }
+        // A listening peer evicts every revoked member and closes its link (Java
+        // `onPeerRevoked`).
+        let revoked: Vec<String> = self
+            .hub
+            .admitted
+            .keys()
+            .filter(|peer| self.registry.peer_revoked(peer))
+            .cloned()
+            .collect();
+        for peer in revoked {
+            self.evict(&peer);
+        }
     }
 
     /// A `peers` stream item: the signed advertisement, kept under its issuer when the signature
@@ -1545,25 +1882,31 @@ impl Actor {
     /// `admitAdvertisement`, and `hold` judge it: it names this group, has not expired, was issued
     /// no more than [`wire_ads::MAX_AD_ISSUED_SKEW_MILLIS`] ahead, its issuer is not revoked, and
     /// it is not older than the one held (the newest wins; an equal one replaces).
-    fn accept_peer_ad(&mut self, payload: &[u8]) {
+    ///
+    /// Answers whether the advertisement verified for this group (a listening peer forwards only
+    /// such). On a listening peer it also refreshes an admitted member's advertisement, whoever
+    /// carried it; it admits nobody ([`Actor::admit`] does, from a newcomer's own introduction).
+    fn accept_peer_ad(&mut self, payload: &[u8]) -> bool {
         let Some((ad, issuer)) = wire_ads::verify_signed_peer_ad(payload) else {
-            return;
+            return false;
         };
-        if issuer == self.peer_id
-            || self.registry.peer_revoked(&issuer)
+        if issuer == self.peer_id {
+            return true; // this peer's own, echoed: verified, held nowhere
+        }
+        if self.registry.peer_revoked(&issuer)
             || ad.get("group").and_then(Value::as_str) != Some(self.group.as_str())
         {
-            return;
+            return false;
         }
         let now = self.now();
         let Some(issued) = issued_millis(&ad) else {
-            return;
+            return false;
         };
         let live = wire_ads::ad_expires_at_millis(&ad).is_some_and(|expires| expires > now);
         let ahead =
             i128::from(issued) > i128::from(now) + i128::from(wire_ads::MAX_AD_ISSUED_SKEW_MILLIS);
         if !live || ahead {
-            return;
+            return false;
         }
         if self
             .members
@@ -1571,22 +1914,27 @@ impl Actor {
             .and_then(issued_millis)
             .is_some_and(|held| held > issued)
         {
-            return;
+            return true;
         }
+        self.refresh_member(&issuer, &ad, payload, issued);
         self.members.hold_ad(issuer, ad);
+        true
     }
 
-    /// A stored advertisement from the `ads` stream or a pull (`Peer.accept_ad`).
-    fn accept_ad(&mut self, stored: &Value) {
+    /// A stored advertisement from the `ads` stream or a pull (`Peer.accept_ad`); whether the
+    /// cache admitted it (or holds a newer one of its issuer under its id).
+    fn accept_ad(&mut self, stored: &Value) -> bool {
         let now = self.now();
-        if let Some(admitted) = self.ads.admit(stored, now, &self.registry)
-            && admitted.changed
-        {
+        let Some(admitted) = self.ads.admit(stored, now, &self.registry) else {
+            return false;
+        };
+        if admitted.changed {
             self.emit(PeerEvent::AdAccepted {
                 ad_type: admitted.ad_type,
                 id: admitted.id,
             });
         }
+        true
     }
 
     /// Folds one state into space `space`, feeds the clock with its stamps when it applied, and
@@ -1608,11 +1956,27 @@ impl Actor {
             .unwrap_or_default()
             .to_owned();
         let known = slot.store.state(&entry_id).is_some();
+        let size = serve::state_size(dto);
+        if !known && slot.bytes.saturating_add(size) > self.settings.space_max_bytes {
+            // A new entry past the space's byte bound: refused as a full space is.
+            bump(&mut self.counters.space_bytes_refused);
+            let outcome = FoldOutcome::Refused(Refusal::Full);
+            self.emit(PeerEvent::StateFolded {
+                space: space.to_owned(),
+                entry_id,
+                outcome,
+            });
+            return Some(outcome);
+        }
         let ctx = FoldContext::new(now, &self.registry).with_space(&slot.space_id);
         let outcome = slot.store.fold_state(dto, &ctx);
-        if !outcome.is_refused()
-            && let Some(span) = space_ops::state_lease_span(dto)
-        {
+        if outcome.is_applied() {
+            let held = slot.sizes.insert(entry_id.clone(), size).unwrap_or(0);
+            slot.bytes = slot.bytes.saturating_sub(held).saturating_add(size);
+        }
+        // A deferred state (SPEC §7.3) merged nothing: no lease to observe, no fold to wake on.
+        let merged = matches!(outcome, FoldOutcome::Applied | FoldOutcome::Unchanged);
+        if merged && let Some(span) = space_ops::state_lease_span(dto) {
             // Authentic and admitted: its lease counts for the collection horizon (Java
             // `observeLease` after the verification).
             slot.observe_lease(span);
@@ -1634,11 +1998,14 @@ impl Actor {
             entry_id: entry_id.clone(),
             outcome,
         });
-        if !outcome.is_refused() {
+        if merged {
             self.bump_folds();
         }
         if outcome.is_applied() {
             self.after_state(space, &entry_id, !known);
+            if self.hub.listening {
+                self.fetch_payload(space, &entry_id);
+            }
         }
         Some(outcome)
     }
@@ -1672,7 +2039,7 @@ impl Actor {
                 entry_id: entry_id.to_owned(),
             });
         }
-        if !outcome.is_refused() {
+        if matches!(outcome, FoldOutcome::Applied | FoldOutcome::Unchanged) {
             self.bump_folds();
         }
         if outcome.is_applied() {
@@ -1743,7 +2110,9 @@ impl Actor {
     }
 
     pub(super) fn reachable(&self) -> Vec<String> {
-        self.reachable.iter().cloned().collect()
+        let mut reachable = self.reachable.clone();
+        reachable.extend(self.hub.routes.keys().cloned());
+        reachable.into_iter().collect()
     }
 
     pub(super) fn seed_peer(&self) -> Option<String> {
@@ -1777,8 +2146,25 @@ impl Actor {
             stale: self.filter.stale(),
             ahead: self.filter.ahead(),
             replayed: self.filter.replayed(),
+            far_future: self.filter.far_future(),
+            far_future_skewed: self.filter.far_future_skewed(),
+            logical_refused: self.filter.logical_refused(),
         };
+        counters.ads_refused_cache_full = self.ads.refused_cache_full();
+        // What each open store counted, beside what the closed ones counted before they closed.
+        for slot in self.spaces.iter() {
+            counters.stamps_logical_refused = counters
+                .stamps_logical_refused
+                .saturating_add(slot.store.stamps_logical_refused());
+            counters.stamps_far_future_refused = counters
+                .stamps_far_future_refused
+                .saturating_add(slot.store.stamps_far_future_refused());
+            counters.stamps_far_future_deferred = counters
+                .stamps_far_future_deferred
+                .saturating_add(slot.store.stamps_far_future_deferred());
+        }
         counters.send_dropped = self.send_dropped.load(Ordering::Relaxed);
+        counters.listen = self.hub.counters.clone();
         // This peer's own writes refused for room, and what each store refused.
         counters.space_refused_inserts = self
             .spaces
@@ -1958,10 +2344,11 @@ impl Actor {
             Some(cid) => (None, Some(cid.as_str())),
             None => (Some(encoded.as_slice()), None),
         };
-        let issued = self.issuer_stamp(&issuer, now);
+        let issued = self.issuer_stamp(&issuer, now)?;
         let signed_at = agent
             .as_ref()
-            .map(|agent| self.issuer_stamp(agent.agent_id(), now));
+            .map(|agent| self.issuer_stamp(agent.agent_id(), now))
+            .transpose()?;
         let write = EntryWrite {
             entry_id: &entry_id,
             space_id: &space_id,
@@ -2094,12 +2481,44 @@ impl Actor {
                 PeerError::InvalidArgument("an advertisement has an issued instant".to_owned())
             })?;
         let item = format!("{id}:{issued}");
+        // SPEC §6.1a.2: a dial-only member cannot see every member's AppCard level, so it writes
+        // none of the gated fields (origin, formats, a host whose signOn is idp, spill).
+        let (ad, downgraded) = wire_ads::app_card_at_level(ad_type, ad);
+        if downgraded {
+            bump(&mut self.counters.app_cards_downgraded);
+        }
+        let ad = &ad;
+        self.note_card_size(ad_type, id, ad);
         let stored = Value::Map(wire_ads::stored_ad(ad_type, ad, &self.identity));
         let body = bodies::rumor_body(STREAM_ADS, &item, RUMOR_HOPS, &cbor::encode(&stored));
         fits_a_frame(&body)?;
         self.accept_ad(&stored);
         self.send_or_hold(body);
         Ok(())
+    }
+
+    /// SPEC §6.1a.5: a card whose encoding passes the spill threshold would travel as a stub,
+    /// but only where a content swarm serves the group, which this peer does not run; it goes
+    /// inline and counts (`cardsOversizeInline`). A card past 56 KiB logs a warning once per id
+    /// and encoded size, so an operator sees a card approach the threshold.
+    fn note_card_size(&mut self, ad_type: &str, id: &str, ad: &Map) {
+        if ad_type != wire_ads::AD_TYPE_AGENT_CARD && ad_type != wire_ads::AD_TYPE_APP_CARD {
+            return;
+        }
+        let size = cbor::encode(&Value::Map(ad.clone())).len();
+        if size > CARD_SPILL_THRESHOLD_BYTES {
+            bump(&mut self.counters.cards_oversize_inline);
+        }
+        if size > CARD_SPILL_WARN_BYTES && self.warned_cards.insert((id.to_owned(), size)) {
+            tracing::warn!(
+                card = %id,
+                bytes = size,
+                "agentspaces: a card approaches or passes the 65,536-byte spill threshold"
+            );
+            if self.warned_cards.len() > MAX_WARNED_CARDS {
+                self.warned_cards.clear();
+            }
+        }
     }
 
     pub(super) fn send_addressed(
@@ -2197,8 +2616,10 @@ impl Actor {
             redial.task.abort();
         }
         self.lose_link();
+        self.stop_listening();
         self.next_want = None;
         self.outbox.clear();
+        self.clear_dialed_backlog();
         for waiter in self.ready.drain(..) {
             let _ = waiter.send(Err(PeerError::Closed));
         }
@@ -2255,17 +2676,6 @@ fn issued_millis(ad: &Map) -> Option<i64> {
 
 /// A PING_REQ body `{target, nonce}` (Java `Bodies.PingReq`): the PeerID to probe and the
 /// asker's nonce, 0 when absent or null (Jackson's default for the primitive `long`).
-fn parse_ping_req(body: &[u8]) -> Option<(String, i64)> {
-    let value = cbor::decode(body).ok()?;
-    let request = value.as_map()?;
-    let target = request.get("target")?.as_str()?.to_owned();
-    let nonce = match request.get("nonce") {
-        None | Some(Value::Null) => 0,
-        Some(nonce) => nonce.as_i64()?,
-    };
-    Some((target, nonce))
-}
-
 /// The ACK `{nonce, onBehalf}` a relay sends the origin of a PING_REQ once the target answered
 /// (Java `new Bodies.Ack(originNonce, target)`).
 fn ack_on_behalf_body(nonce: i64, target: &str) -> Vec<u8> {
@@ -2291,6 +2701,19 @@ fn fits_a_frame(body: &[u8]) -> Result<(), PeerError> {
     } else {
         Ok(())
     }
+}
+
+/// The resource hints a peer advertises, with the AppCard level it reads (SPEC §6.1a.2, §9:
+/// `wire.appcard=2`, since this crate decodes the v0.1.32 schemas of the `AppCard` and the
+/// `AgentCard` with their value rules) unless the configuration set the hint itself.
+fn with_app_card_level(mut hints: Map) -> Map {
+    if !hints.contains_key(wire_ads::HINT_APP_CARD) {
+        hints.insert(
+            wire_ads::HINT_APP_CARD,
+            wire_ads::APP_CARD_LEVEL.to_string(),
+        );
+    }
+    hints
 }
 
 fn bump(counter: &mut u64) {
@@ -2337,20 +2760,36 @@ async fn until_closed(closed: &mut watch::Receiver<bool>) {
 
 // ----------------------------------------------------------------------------- link tasks
 
+/// The inbound byte budgets a link's reader draws on: its own, and (an accepted link) the one
+/// all accepted links share.
+struct Budgets {
+    own: Arc<Semaphore>,
+    /// The permits `own` was created with: no frame takes more.
+    own_bytes: usize,
+    shared: Option<Arc<Semaphore>>,
+}
+
 /// Drains a link, verifies each frame with the link's attestation, and forwards it to the actor
-/// with its share of `budget` (one permit per byte); tells the actor when the link ends. Once
-/// the budget is spent this task waits, so the transport stops reading.
+/// with its share of the link's budgets (one permit per byte); tells the actor when the link
+/// ends. Once a budget is spent this task waits, so the transport stops reading.
 async fn read_link(
     mut receiver: FrameReceiver,
     attested: Option<String>,
     link: u64,
     inbound: mpsc::Sender<Inbound>,
-    budget: Arc<Semaphore>,
+    budgets: Budgets,
 ) {
     while let Some(frame) = receiver.recv().await {
-        let share = u32::try_from(frame.len().min(INBOUND_BUDGET_BYTES)).unwrap_or(u32::MAX);
-        let Ok(permit) = Arc::clone(&budget).acquire_many_owned(share).await else {
+        let share = u32::try_from(frame.len().min(budgets.own_bytes)).unwrap_or(u32::MAX);
+        let Ok(permit) = Arc::clone(&budgets.own).acquire_many_owned(share).await else {
             return;
+        };
+        let shared = match &budgets.shared {
+            Some(shared) => match Arc::clone(shared).acquire_many_owned(share).await {
+                Ok(permit) => Some(permit),
+                Err(_) => return,
+            },
+            None => None,
         };
         let message = match envelope::decode_frame_detailed(&frame, attested.as_deref(), None) {
             Some((env, auth)) => Inbound::Frame {
@@ -2358,6 +2797,7 @@ async fn read_link(
                 env,
                 auth,
                 budget: permit,
+                shared,
             },
             None => Inbound::Malformed { link },
         };
@@ -2763,7 +3203,11 @@ mod tests {
             None,
             1,
             tx,
-            Arc::new(Semaphore::new(BUDGET)),
+            Budgets {
+                own: Arc::new(Semaphore::new(BUDGET)),
+                own_bytes: BUDGET,
+                shared: None,
+            },
         ));
         let identity = Identity::generate().expect("identity");
         let body = vec![7u8; 100 * 1024];
@@ -2802,7 +3246,7 @@ mod tests {
 
     /// An actor for unit tests: a fresh identity in a text-founded group, no dialers, and the
     /// event stream it tells.
-    fn test_actor() -> (
+    pub(super) fn test_actor() -> (
         Actor,
         broadcast::Receiver<PeerEvent>,
         mpsc::Receiver<Inbound>,
@@ -2811,8 +3255,10 @@ mod tests {
         let (events, subscriber) = broadcast::channel(64);
         let (link_watch, link) = watch::channel(None);
         let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE);
+        let identity = Identity::generate().expect("identity");
         let start = Start {
-            identity: Identity::generate().expect("identity"),
+            hlc: Hlc::new(identity.peer_id()).expect("a PeerID is a stamp node"),
+            identity,
             group: "zGroup".to_owned(),
             founder: None,
             founding: None,
@@ -2832,8 +3278,15 @@ mod tests {
             events,
             link_watch,
             folds: watch::channel(0).0,
+            listeners: Vec::new(),
+            replicate: Vec::new(),
         };
-        (Actor::new(start, inbound_tx), subscriber, inbound_rx, link)
+        (
+            Actor::new(start, inbound_tx, &[]),
+            subscriber,
+            inbound_rx,
+            link,
+        )
     }
 
     /// An actor dropped without its close (a panic unwinding it, say) still closes: the link is
@@ -2897,6 +3350,83 @@ mod tests {
         );
     }
 
+    /// A burst to an accepted link whose far end stopped reading waits in the link's backlog,
+    /// bounded by half the queue's bytes, and what the bound pushes out is counted; the actor
+    /// never waits.
+    #[tokio::test]
+    async fn an_accepted_link_s_backlog_is_bounded_and_counts_what_it_drops() {
+        use crate::transport::memory;
+
+        let (mut actor, _events, _inbound, _link) = test_actor();
+        let (mine, _theirs) = memory::pair("mem", "member", "hub", None, None);
+        let link = actor.open_link(mine, true);
+        let id = link.id;
+        actor.hub.accepted.insert(id, link);
+        let frame = vec![7u8; 16 * 1024];
+        for _ in 0..200 {
+            actor
+                .offer_accepted(id, frame.clone(), Budget::Half)
+                .expect("a burst frame is taken");
+        }
+        let (frames, bytes) = actor
+            .hub
+            .accepted
+            .get(&id)
+            .map(|link| (link.backlog.len(), link.backlog_bytes))
+            .expect("the link is held");
+        let bound = actor.settings.send_queue_bytes / 2;
+        assert!(
+            frames > 0 && bytes <= bound,
+            "{frames} frames, {bytes} bytes"
+        );
+        assert!(actor.hub.counters.backlog_dropped > 0);
+        assert!(matches!(
+            actor.offer_accepted(id, vec![0u8; MAX_FRAME_BYTES + 1], Budget::Half),
+            Err(PeerError::FrameTooLarge(_))
+        ));
+        actor.drop_accepted(id);
+        assert!(actor.hub.accepted.is_empty());
+        assert_eq!(actor.hub.counters.links_closed, 1);
+    }
+
+    /// A listening peer's forwards to its seed, while the seed's link has no room, wait within a
+    /// bound of bytes (half the queue, as an accepted link's backlog), and never push this peer's
+    /// own held writes out of the outbox: a member's flood of rumors pins no more of this peer's
+    /// memory than one link's backlog, and costs it none of its own writes.
+    #[tokio::test]
+    async fn forwards_to_the_seed_wait_within_a_byte_bound_and_spare_own_writes() {
+        use crate::transport::memory;
+
+        let (mut actor, _events, _inbound, _link) = test_actor();
+        actor.hub.listening = true;
+        // The seed's end never reads: the link's queue fills and stays full.
+        let (mine, _theirs) = memory::pair("mem", "seed", "peer", None, None);
+        actor.install_link(mine, Seed::new("127.0.0.1", 7000, "tcp"));
+        let own = bodies::rumor_body("space:own", "own-1", RUMOR_HOPS, b"own write");
+        actor.outbox.push_back(own.clone());
+        let payload = vec![7u8; 64 * 1024];
+        for n in 0..1100 {
+            let rumor = Rumor {
+                stream_id: "junk".to_owned(),
+                item_id: format!("j{n}"),
+                hops_remaining: i64::from(RUMOR_HOPS),
+                payload: payload.clone(),
+            };
+            actor.forward_rumor(&rumor, Via::Accepted(999));
+        }
+        assert!(
+            actor.outbox.contains(&own),
+            "a forwarded rumor pushed this peer's own write out"
+        );
+        let held = actor.pending_outbound();
+        assert!(
+            held <= actor.settings.send_queue_bytes.saturating_mul(2),
+            "{held} bytes held for a link whose queue is {} bytes",
+            actor.settings.send_queue_bytes
+        );
+        assert!(actor.hub.counters.backlog_dropped > 0);
+    }
+
     /// A dialer that counts its dials and refuses them all.
     #[derive(Debug, Default)]
     struct Refusing(AtomicUsize);
@@ -2952,6 +3482,53 @@ mod tests {
         assert_eq!(refusing.0.load(Ordering::SeqCst), 0);
     }
 
+    /// SPEC §6.1a.2: the peer advertises the AppCard level it reads, unless configured
+    /// otherwise, and, dial-only, publishes its own cards without the fields the level gates.
+    #[tokio::test]
+    async fn the_app_card_level_is_advertised_and_own_cards_carry_no_gated_field() {
+        let hints = with_app_card_level(Map::new());
+        assert_eq!(
+            hints.get(wire_ads::HINT_APP_CARD).and_then(Value::as_str),
+            Some("2")
+        );
+        let mut configured = Map::new();
+        configured.insert(wire_ads::HINT_APP_CARD, "1");
+        assert_eq!(
+            with_app_card_level(configured)
+                .get(wire_ads::HINT_APP_CARD)
+                .and_then(Value::as_str),
+            Some("1")
+        );
+        let (mut actor, _events, _inbound, _link) = test_actor();
+        let now = actor.now();
+        let issued = time::instant_iso(now.div_euclid(1000).saturating_mul(1000));
+        let peer_id = actor.peer_id.clone();
+        let id = format!("aspace://zGroup/app/{peer_id}/board");
+        let origin = wire_ads::app_card_origin("console", "c/board", "", None).expect("origin");
+        let card = wire_ads::AppCard {
+            id: &id,
+            issuer: &peer_id,
+            group: "zGroup",
+            issued: &issued,
+            ttl: "PT15M",
+            name: "board",
+            origin: Some(&origin),
+            formats: &["text/html"],
+            ..wire_ads::AppCard::default()
+        }
+        .to_map()
+        .expect("a card");
+        actor
+            .publish_ad(wire_ads::AD_TYPE_APP_CARD, &card)
+            .expect("published");
+        assert_eq!(actor.counters().app_cards_downgraded, 1);
+        let held = actor
+            .ads
+            .live(wire_ads::AD_TYPE_APP_CARD, now, &actor.registry);
+        assert_eq!(held.len(), 1);
+        assert!(!held[0].contains_key("origin") && !held[0].contains_key("formats"));
+    }
+
     #[test]
     fn ping_requests_parse_as_java_writes_them() {
         let request = |target: Value, nonce: Value| {
@@ -2960,13 +3537,15 @@ mod tests {
             body.insert("nonce", nonce);
             cbor::encode(&Value::Map(body))
         };
+        let parse_ping_req = bodies::parse_ping_req;
         assert_eq!(
             parse_ping_req(&request(Value::from("zTarget"), Value::from(42))),
             Some(("zTarget".to_owned(), 42))
         );
+        // The primitive nonce is never null (SPEC §9.1 P4): such a body does not decode.
         assert_eq!(
             parse_ping_req(&request(Value::from("zTarget"), Value::Null)),
-            Some(("zTarget".to_owned(), 0))
+            None
         );
         assert_eq!(parse_ping_req(&request(Value::Null, Value::from(1))), None);
         assert_eq!(

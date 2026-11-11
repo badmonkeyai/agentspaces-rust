@@ -156,6 +156,40 @@ impl Fleet {
         })
     }
 
+    /// Starts a listening peer from `config` ([`Peer::start`] with its listeners,
+    /// [`PeerConfig::listen`]) and wraps it: a hub that admits members, forwards their rumors,
+    /// answers their pulls, relays their frames, and holds the spaces it replicates. Its own
+    /// spaces work as any member's. [`Peer::listen_addrs`] names the addresses it bound.
+    ///
+    /// ```no_run
+    /// # async fn run() -> Result<(), agentspaces::peer::PeerError> {
+    /// use agentspaces::group::GroupSpec;
+    /// use agentspaces::peer::{ListenerSpec, PeerConfig};
+    /// use agentspaces::space::Fleet;
+    /// use agentspaces::wire::identity::Identity;
+    ///
+    /// let identity = Identity::generate().expect("identity");
+    /// let config = PeerConfig::new(identity, GroupSpec::FoundingText("crew".into()))
+    ///     .listen_on(ListenerSpec::tcp("0.0.0.0:7711").advertise("10.0.0.5:7711"));
+    /// let hub = Fleet::listen(config).await?;
+    /// println!("{} listens on {:?}", hub.peer().peer_id(), hub.peer().listen_addrs());
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`PeerError::InvalidArgument`] when `config` names no listener, and the errors of
+    /// [`Peer::start`].
+    pub async fn listen(config: PeerConfig) -> Result<Fleet, PeerError> {
+        if !config.is_listening() {
+            return Err(PeerError::InvalidArgument(
+                "a listening fleet needs at least one listener".to_owned(),
+            ));
+        }
+        Self::join(config).await
+    }
+
     /// Starts a peer from the process's configuration (the `ASPACE_*` variables over the fleet
     /// YAML, [`Peer::join_from_env`]) and wraps it.
     pub async fn join_from_env() -> Result<Fleet, PeerError> {

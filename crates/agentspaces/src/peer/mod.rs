@@ -13,12 +13,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The dial-only fleet member (SPEC §5.4): a [`Peer`] joins a group through a seed, stays a live
-//! member by answering probes (back through the seed when a relay carried them), carrying the
-//! indirect probes (PING_REQ) other members ask of it, and re-leasing its self-advertisement,
-//! folds replicated state into the spaces it opened, verifies every signature, refuses every
-//! frame of a revoked peer, and reconnects after a lost link. The Python peer (`peer.py`) and
-//! the Ruby peer (`peer.rb`) are its behavioural references; the Java node is the authority.
+//! The fleet member: a [`Peer`] joins a group through a seed, stays a live member by answering
+//! probes (back through the seed when a relay carried them), carrying the indirect probes
+//! (PING_REQ) other members ask of it, and re-leasing its self-advertisement, folds replicated
+//! state into the spaces it opened, verifies every signature, refuses every frame of a revoked
+//! peer, and reconnects after a lost link. Started with listeners ([`ListenConfig`]) it is also a
+//! listening member, a hub other members link to (see [Listening](#listening)); without any it is
+//! dial-only (SPEC §5.4). The Python peer (`peer.py`) and the Ruby peer (`peer.rb`) are the
+//! dial-only role's behavioural references, the TypeScript service host the listening role's; the
+//! Java node is the authority.
 //!
 //! # Starting
 //!
@@ -27,7 +30,41 @@
 //!   system clock; [`Peer::join_config`] from a [`Config`] resolved in code.
 //! - [`Peer::join`] and [`Peer::join_as`]: the same from [`PeerSettings`] built in code.
 //! - [`Peer::start`]: from a [`PeerConfig`] built by hand (other dialers, a manual clock, test
-//!   timings) or with [`PeerConfig::from_settings`].
+//!   timings, listeners) or with [`PeerConfig::from_settings`].
+//! - [`Fleet::listen`](crate::space::Fleet::listen): a listening peer from a [`PeerConfig`] with
+//!   listeners ([`PeerConfig::listen_on`]), wrapped for the Space API.
+//!
+//! # Listening
+//!
+//! A peer started with listeners ([`ListenerSpec::tcp`], [`ListenerSpec::tls`], or a listener the
+//! caller bound) accepts links and serves the members on them as a hub, so Rust peers form a
+//! group with no other implementation in it:
+//!
+//! - *Admission* (SPEC §5.1, §5.2): a newcomer introduces itself with its own signed
+//!   advertisement; the group's membership policy decides (`OPEN`, or `INVITE` with a
+//!   founder-issued or delegated credential, refused once revoked), and the hub answers with its
+//!   own introduction and the live members' advertisements on that link. A third party's copy of
+//!   an advertisement refreshes a member and admits nobody. Admissions are rate-limited and
+//!   bounded ([`ListenConfig::max_members`]); with [`ListenConfig::require_attestation`] a link
+//!   must attest its member (SPEC §5.6).
+//! - *Gossip* (SPEC §5.3): a rumor one link brings is handled once (duplicates by stream and
+//!   payload hash are dropped) and forwarded to the other links with its hop budget clamped to 6
+//!   and decremented; the hub's own rumors go to every link.
+//! - *Anti-entropy* (SPEC §5.3, §7, §9): DIGESTs are answered with PULL_RESPs in Java's formats
+//!   for the view, the advertisements, the revocations, and every space the hub replicates (the
+//!   configured ones and, by default, every space it hears of, bounded: see [`ListenConfig`]);
+//!   the hub runs rounds of its own with members that run anti-entropy, backing off while idle.
+//! - *Blocks*: the payload block of a replicated entry is fetched from its writer (or another
+//!   member) with retries and backoff, and served to whoever asks, so a writer may leave once the
+//!   hub holds it ([`Peer::probe_block`]).
+//! - *Relay* (SPEC §5.4): a RELAY_FRAME for a member on one of the hub's links is delivered, in
+//!   the one-hop and the path form; one for a stranger is refused and counted.
+//! - *Founding* (SPEC §4.4, §5.1): a hub started with a signed founding document
+//!   ([`crate::group::found_or_load`]) serves it as GROUP_AD, so `aspace://<group id>` joins work;
+//!   a group known only from a founding text serves none.
+//!
+//! What it counts is in [`PeerCounters::listen`]. A full mesh, in which every member dials every
+//! other, is not this role: the hub's members reach one another through it.
 //!
 //! [`PeerSettings`]: crate::config::PeerSettings
 //! [`Config`]: crate::config::Config
@@ -85,6 +122,7 @@ mod ads;
 mod blocks;
 mod handle;
 mod join;
+mod listen;
 mod members;
 mod spaces;
 
@@ -102,12 +140,13 @@ use crate::clock::{SharedClock, SystemClock};
 use crate::config::ConfigError;
 use crate::group::GroupSpec;
 use crate::keystore::KeystoreError;
-use crate::transport::Dialer;
+use crate::transport::{Dialer, TransportError};
 
 pub use agentspaces_wire::bodies::RelaySignal;
 pub use agentspaces_wire::fold::SpaceStore;
 pub use handle::Peer;
 pub use join::{default_dialers, settings_identity};
+pub use listen::{AdmissionRefusals, ListenConfig, ListenCounters, ListenerSpec};
 
 /// The agent name a peer writes under when no agent identity is given (`<peerId>/rust`), as the
 /// Python peer writes under `python` and the Ruby peer under `ruby`.
@@ -187,6 +226,15 @@ pub struct PeerConfig {
     /// own (256 MiB) and are never evicted; a block an entry pinned is released when the entry is
     /// collected.
     pub fetched_block_bytes: usize,
+    /// The bytes of entry states each space holds (default 256 MiB, at least 1), counted as the
+    /// encoded size of each entry's signed state; a new entry past it is refused as for
+    /// [`PeerConfig::space_max_entries`] and counted ([`PeerCounters::space_bytes_refused`]).
+    /// Payloads over the inline limit travel as blocks and count against the block budgets
+    /// instead.
+    pub space_max_bytes: usize,
+    /// The listening role: listeners, required attestation, replicated spaces, bounds, and
+    /// timers ([`ListenConfig`]). Without listeners the peer is dial-only.
+    pub listen: ListenConfig,
 }
 
 impl PeerConfig {
@@ -210,9 +258,27 @@ impl PeerConfig {
             send_stall_timeout: Duration::from_secs(30),
             space_max_entries: agentspaces_wire::fold::DEFAULT_MAX_ENTRIES,
             fetched_block_bytes: blocks::MAX_FETCHED_BLOCK_BYTES,
+            space_max_bytes: DEFAULT_SPACE_MAX_BYTES,
+            listen: ListenConfig::default(),
         }
     }
+
+    /// This configuration with one more listener ([`ListenConfig::listeners`]): the peer then
+    /// accepts links and serves as a hub ([`Peer::start`]).
+    #[must_use]
+    pub fn listen_on(mut self, listener: ListenerSpec) -> Self {
+        self.listen.listeners.push(listener);
+        self
+    }
+
+    /// Whether the peer listens ([`ListenConfig::listeners`] is not empty).
+    pub fn is_listening(&self) -> bool {
+        !self.listen.listeners.is_empty()
+    }
 }
+
+/// The default of [`PeerConfig::space_max_bytes`].
+pub const DEFAULT_SPACE_MAX_BYTES: usize = 256 * 1024 * 1024;
 
 /// Why a peer could not start, or a call could not be carried out.
 #[derive(Debug, thiserror::Error)]
@@ -301,6 +367,9 @@ pub enum PeerError {
     /// The keystore could not be loaded or written ([`Peer::join`]).
     #[error(transparent)]
     Keystore(#[from] KeystoreError),
+    /// A listener could not be bound ([`ListenConfig::listeners`]).
+    #[error("cannot listen: {0}")]
+    Listen(#[from] TransportError),
 }
 
 /// The link a peer currently holds: how it was opened and what its handshake proved.
@@ -314,15 +383,22 @@ pub struct LinkInfo {
     pub attested: Option<String>,
 }
 
-/// How many frames the frame filter dropped.
+/// How many frames the frame filter dropped, under the names of SPEC §9's counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FilterCounters {
-    /// Older than the frame age bound.
+    /// Older than the frame age bound (`framesStale`).
     pub stale: u64,
-    /// Further ahead than the clock skew bound.
+    /// Past the far-future ceiling, skewed or not: `far_future` plus `far_future_skewed`.
     pub ahead: u64,
-    /// A `(from, stamp)` pair already seen.
+    /// A `(from, stamp)` pair already seen (`framesReplayed`).
     pub replayed: u64,
+    /// Past `wall + MAX_DRIFT` by more than the 5-second skew margin (`framesFarFuture`).
+    pub far_future: u64,
+    /// Past `wall + MAX_DRIFT` by at most the skew margin (`framesFarFutureSkewed`).
+    pub far_future_skewed: u64,
+    /// A stamp whose logical counter is above 65536 (`framesLogicalRefused`).
+    pub logical_refused: u64,
 }
 
 /// What a peer has counted: the frames it dropped and why, and the life of its links.
@@ -384,6 +460,34 @@ pub struct PeerCounters {
     /// Received states refused at the door because they were already past the collection
     /// horizon: a member re-offering a tombstone this peer collects (SPEC §7.3).
     pub space_reoffers_refused: u64,
+    /// Space deltas and pulled sync deltas that did not decode under the wire encoding (SPEC
+    /// §9.1), a stamp outside the canonical grammar included (`deltasUndecodable`). Each is
+    /// dropped whole and strikes nobody.
+    pub deltas_undecodable: u64,
+    /// Distinct verified states and claims refused for a stamp whose logical counter is above
+    /// 65536 (`stampsLogicalRefused`, SPEC §7.3, §7.4), over every space.
+    pub stamps_logical_refused: u64,
+    /// Distinct verified states and claims refused for a stamp more than an hour past the
+    /// far-future margin (`stampsFarFutureRefused`).
+    pub stamps_far_future_refused: u64,
+    /// Distinct verified states and claims deferred for a stamp past the far-future margin
+    /// (`stampsFarFutureDeferred`): no misbehavior, a skewed or dragged peer.
+    pub stamps_far_future_deferred: u64,
+    /// Advertisements the cache refused under its entry bound or its byte budget
+    /// (`adsRefusedCacheFull`, SPEC §6.3).
+    pub ads_refused_cache_full: u64,
+    /// Cards this peer published without a field the AppCard level gates (`appCardsDowngraded`,
+    /// SPEC §6.1a.2): a dial-only member cannot see every member's hint, so it writes none.
+    pub app_cards_downgraded: u64,
+    /// Cards this peer published inline although their encoding passes the spill threshold of
+    /// 65,536 bytes (`cardsOversizeInline`, SPEC §6.1a.5): this peer runs no content swarm, so it
+    /// never spills.
+    pub cards_oversize_inline: u64,
+    /// New entries a space refused because its states held [`PeerConfig::space_max_bytes`]
+    /// bytes, received or this peer's own, over every space.
+    pub space_bytes_refused: u64,
+    /// What the listening role counted (all zero on a dial-only peer).
+    pub listen: ListenCounters,
 }
 
 impl PeerCounters {
@@ -454,5 +558,10 @@ pub enum PeerEvent {
         cid: String,
         /// The member that holds it.
         by: String,
+    },
+    /// A listening peer admitted a member from its own introduction on an accepted link.
+    Admitted {
+        /// The member's PeerID.
+        peer: String,
     },
 }

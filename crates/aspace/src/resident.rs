@@ -13,7 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The residents, `aspace work`, `aspace daemon`, and `aspace mcp`: what they share.
+//! The residents, `aspace work`, `aspace daemon`, `aspace mcp`, and `aspace seed`: what they
+//! share.
 //!
 //! One keystore is one PeerID, and a seed takes every link of one PeerID for one member: a
 //! visitor (or a second resident) that runs from the keystore of a running resident joins as
@@ -121,7 +122,9 @@ fn marker_body(path: &Path) -> (String, Vec<(String, String)>) {
     let mut lines = body.lines();
     let line = lines.next().unwrap_or_default().trim();
     let command = match line {
-        "aspace work" | "aspace daemon" | "aspace mcp" if read.is_ok() => line.to_owned(),
+        "aspace work" | "aspace daemon" | "aspace mcp" | "aspace seed" if read.is_ok() => {
+            line.to_owned()
+        }
         _ => "aspace work".to_owned(),
     };
     let details = lines

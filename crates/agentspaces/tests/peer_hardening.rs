@@ -99,9 +99,7 @@ async fn wait_ack(seed: &FakeSeed, link: usize, nonce: i64) -> Received {
 }
 
 fn is_ack(frame: &Received, link: usize, nonce: i64) -> bool {
-    frame.link == link
-        && frame.kind() == KIND_ACK
-        && bodies::parse_ping(frame.body()) == Some(nonce)
+    frame.link == link && frame.kind() == KIND_ACK && bodies::parse_ack(frame.body()) == Some(nonce)
 }
 
 /// A probe that the peer has handled everything the seed sent before it.
@@ -183,13 +181,16 @@ fn hint(ad: &Map, name: &str) -> Option<String> {
 
 /// The founder's signed revocation of peer `revoked` (the `revocations` stream).
 fn peer_revocation(founder: &Identity, revoked: &str) -> Value {
-    let mut ad = Map::new();
-    ad.insert("issuer", founder.peer_id());
-    ad.insert("group", group_id());
-    ad.insert("issued", time::instant_iso(now() - 1000));
-    ad.insert("revoked", revoked);
-    ad.insert("reason", revocation::KEY_COMPROMISE);
-    Value::Map(revocation::sign_revocation(&ad, founder))
+    let ad = agentspaces_wire::revocation::peer_revocation(
+        founder.peer_id(),
+        &group_id(),
+        &time::instant_iso(now() - 1000),
+        "PT1H",
+        revoked,
+        agentspaces_wire::revocation::KEY_COMPROMISE,
+        None,
+    );
+    Value::Map(agentspaces_wire::revocation::sign_revocation(&ad, founder))
 }
 
 /// The key-compromise revocation of `agent` by its own peer `issuer`.
@@ -244,7 +245,8 @@ fn pull_resp(space: &str, states: Vec<Map>, extra: &[(&str, Vec<u8>)]) -> Vec<u8
     let mut deltas = Map::new();
     deltas.insert(
         format!("space:{space}"),
-        cbor::encode(&cbor_map! { "states" => states }),
+        // Both fields of a SyncDelta are always written (SPEC §9.1 P1).
+        cbor::encode(&cbor_map! { "states" => states, "claims" => cbor_map! {} }),
     );
     for (stream, delta) in extra {
         deltas.insert(*stream, delta.clone());
@@ -382,11 +384,11 @@ async fn a_relayed_ping_is_answered_back_through_the_relay() {
         Some(prober.peer_id())
     );
     let body = inner.get("body").and_then(Value::as_bytes).expect("a body");
-    assert_eq!(bodies::parse_ping(body), Some(4242));
+    assert_eq!(bodies::parse_ack(body), Some(4242));
     assert!(
         seed.of_kind(0, KIND_ACK)
             .iter()
-            .all(|ack| bodies::parse_ping(ack.body()) != Some(4242)),
+            .all(|ack| bodies::parse_ack(ack.body()) != Some(4242)),
         "no unaddressed ACK reaches the seed"
     );
     assert_eq!(peer.counters().await.relayed_out, 1);
@@ -775,7 +777,7 @@ async fn a_ping_req_is_carried_to_its_target_and_vouched_for_once() {
     let vouches = seed
         .of_kind(0, KIND_ACK)
         .iter()
-        .filter(|ack| bodies::parse_ping(ack.body()) == Some(77))
+        .filter(|ack| bodies::parse_ack(ack.body()) == Some(77))
         .count();
     assert_eq!(vouches, 1);
 
@@ -946,12 +948,20 @@ async fn block_answers_to_a_stalled_link_stay_within_half_its_queue() {
 #[tokio::test]
 async fn junk_space_rumors_never_lock_the_peer_out_of_its_own_spaces() {
     let (_network, seed, peer) = joined().await;
+    // Junk that is no space delta does not decode (SPEC §9.1): dropped and counted.
     let junk = cbor::encode(&cbor_map! { "state" => cbor_map! { "x" => 1 } });
     for n in 0..1100 {
         let body = bodies::rumor_body(&format!("space:junk-{n}"), "w:x", 6, &junk);
         seed.send(0, KIND_RUMOR, &body, None).await;
     }
+    // A well-formed delta for spaces this peer never opened is not folded and opens nothing.
+    let delta = support::hex("delta_cbor");
+    for n in 0..1100 {
+        let body = bodies::rumor_body(&format!("space:junk-{n}"), "w:y", 6, &delta);
+        seed.send(0, KIND_RUMOR, &body, None).await;
+    }
     fence(&seed, 0, &peer, 1).await;
+    assert_eq!(peer.counters().await.deltas_undecodable, 1100);
     peer.pull_space("mine").await.expect("its own space opens");
     peer.write_entry("mine2", TASK_TYPE, Value::Null, 60_000, Map::new(), None)
         .await
@@ -1052,7 +1062,7 @@ async fn reconnected_is_only_told_for_a_link_that_is_up() {
 fn ack_stamps(seed: &FakeSeed, link: usize, nonces: std::ops::Range<i64>) -> Vec<String> {
     seed.of_kind(link, KIND_ACK)
         .iter()
-        .filter(|ack| bodies::parse_ping(ack.body()).is_some_and(|n| nonces.contains(&n)))
+        .filter(|ack| bodies::parse_ack(ack.body()).is_some_and(|n| nonces.contains(&n)))
         .filter_map(|ack| ack.text("stamp").map(str::to_owned))
         .collect()
 }
@@ -1066,7 +1076,10 @@ fn all_distinct(stamps: &[String]) -> bool {
 
 /// One frame (or one folded state) stamped near the HLC ceiling with the logical counter at
 /// `i32::MAX` would pin every stamp this peer issues, so receivers would drop its frames as
-/// replays. Such a stamp is not merged.
+/// replays. Since v0.1.30 (SPEC §9, §7.3) such a stamp is not acceptable: the frame is dropped
+/// and counted (`framesLogicalRefused`) and never answered, the state is refused after its
+/// signatures verify and counted once (`stampsLogicalRefused`), and neither reaches the clock.
+/// A stamp at the limit itself is acceptable and merges, and the clock carries past it.
 #[tokio::test]
 async fn a_pinned_stamp_never_freezes_this_peers_clock() {
     let (_network, seed, peer) = joined().await;
@@ -1079,15 +1092,19 @@ async fn a_pinned_stamp_never_freezes_this_peers_clock() {
         &seed.stamp_at(ahead, i32::MAX),
     );
     seed.send_raw(0, pinned).await;
-    wait_ack(&seed, 0, 1).await;
     for nonce in 2..6 {
         fence(&seed, 0, &peer, nonce).await;
     }
-    let stamps = ack_stamps(&seed, 0, 1..6);
-    assert_eq!(stamps.len(), 5);
+    assert!(
+        ack_stamps(&seed, 0, 1..2).is_empty(),
+        "the pinned PING is not answered"
+    );
+    assert_eq!(peer.counters().await.filter.logical_refused, 1);
+    let stamps = ack_stamps(&seed, 0, 2..6);
+    assert_eq!(stamps.len(), 4);
     assert!(all_distinct(&stamps), "frame path: {stamps:?}");
 
-    // A validly signed write whose `issued` (and lease stamp) is pinned.
+    // A validly signed write whose `issued` (and lease stamp) is pinned: refused, counted once.
     let issued = format!("{ahead}:{}:{}", i32::MAX, seed.identity.agent("rust"));
     let state = state_issued(&seed.identity, "rust", "tasks", "pinned", &issued);
     let body = bodies::rumor_body(
@@ -1096,15 +1113,32 @@ async fn a_pinned_stamp_never_freezes_this_peers_clock() {
         6,
         &records::delta(Some(&state), None),
     );
-    seed.send(0, KIND_RUMOR, &body, None).await;
-    eventually("the pinned write to fold", || async {
-        peer.space_states("tasks").await.len() == 1
-    })
-    .await;
+    for _ in 0..3 {
+        seed.send(0, KIND_RUMOR, &body, None).await;
+    }
     for nonce in 10..14 {
         fence(&seed, 0, &peer, nonce).await;
     }
-    let stamps = ack_stamps(&seed, 0, 10..14);
+    assert!(peer.space_states("tasks").await.is_empty());
+    assert_eq!(peer.counters().await.stamps_logical_refused, 1);
+    // A write stamped at the limit itself merges, and the clock carries past it.
+    let at_limit = format!("{}:65536:{}", now() + 1000, seed.identity.agent("rust"));
+    let state = state_issued(&seed.identity, "rust", "tasks", "at-limit", &at_limit);
+    let body = bodies::rumor_body(
+        "space:tasks",
+        "w:at-limit",
+        6,
+        &records::delta(Some(&state), None),
+    );
+    seed.send(0, KIND_RUMOR, &body, None).await;
+    eventually("the write at the limit to fold", || async {
+        peer.space_states("tasks").await.len() == 1
+    })
+    .await;
+    for nonce in 20..24 {
+        fence(&seed, 0, &peer, nonce).await;
+    }
+    let stamps = ack_stamps(&seed, 0, 20..24);
     assert!(all_distinct(&stamps), "state path: {stamps:?}");
     for _ in 0..2 {
         peer.write_entry("tasks", TASK_TYPE, Value::Null, 60_000, Map::new(), None)
@@ -1126,12 +1160,10 @@ async fn a_pinned_stamp_never_freezes_this_peers_clock() {
         .filter_map(|r| r.text("stamp").map(str::to_owned))
         .collect();
     assert!(all_distinct(&stamps), "writes: {stamps:?}");
-    assert!(
-        stamps
-            .iter()
-            .all(|stamp| !stamp.contains(&i32::MAX.to_string())),
-        "{stamps:?}"
-    );
+    for stamp in &stamps {
+        let parsed = agentspaces_wire::hlc::Stamp::parse(stamp).expect("a stamp");
+        assert!(parsed.is_acceptable(), "{stamp}");
+    }
 }
 
 // ------------------------------------------------------------------------------- peer ads
@@ -1219,9 +1251,9 @@ fn stamp_in_chunks(bytes: &[u8], key: &str, text: &str, chunks: usize) -> Vec<u8
 
 /// A stamp that arrives as chunked text is undecodable where a stamp belongs (SPEC §9), at this
 /// peer as in Java, Python, TypeScript, and Ruby. A frame whose envelope stamp is chunked is
-/// counted malformed and never answered; a space rumor whose record `issued` or whose claim `stamp`
-/// is chunked is counted malformed and folds nothing. The same carriers with the stamp in its one
-/// form fold.
+/// counted malformed and never answered; a space delta whose record `issued` or whose claim
+/// `stamp` is chunked is counted as an undecodable delta (`deltasUndecodable`) and folds nothing.
+/// The same carriers with the stamp in its one form fold.
 #[tokio::test]
 async fn a_stamp_in_chunks_is_refused_in_a_frame_a_record_and_a_claim() {
     let (_network, seed, peer) = joined().await;
@@ -1245,7 +1277,7 @@ async fn a_stamp_in_chunks_is_refused_in_a_frame_a_record_and_a_claim() {
     let acked: Vec<i64> = seed
         .of_kind(0, KIND_ACK)
         .iter()
-        .filter_map(|frame| bodies::parse_ping(frame.body()))
+        .filter_map(|frame| bodies::parse_ack(frame.body()))
         .collect();
     assert!(!acked.contains(&101) && !acked.contains(&102), "{acked:?}");
     assert_eq!(peer.counters().await.malformed, before + 2);
@@ -1264,7 +1296,8 @@ async fn a_stamp_in_chunks_is_refused_in_a_frame_a_record_and_a_claim() {
     }
     fence(&seed, 0, &peer, 104).await;
     assert!(entry_ids(&peer, "work").await.is_empty());
-    assert_eq!(peer.counters().await.malformed, before + 4);
+    assert_eq!(peer.counters().await.malformed, before + 2);
+    assert_eq!(peer.counters().await.deltas_undecodable, 2);
     let body = bodies::rumor_body("space:work", "w:chunked", 6, &honest);
     seed.send(0, KIND_RUMOR, &body, None).await;
     fence(&seed, 0, &peer, 105).await;
@@ -1292,11 +1325,12 @@ async fn a_stamp_in_chunks_is_refused_in_a_frame_a_record_and_a_claim() {
     }
     fence(&seed, 0, &peer, 106).await;
     assert!(peer.space_claims("work").await.is_empty());
-    assert_eq!(peer.counters().await.malformed, before + 6);
+    assert_eq!(peer.counters().await.deltas_undecodable, 4);
     let body = bodies::rumor_body("space:work", &format!("c:chunked:{stamp}"), 6, &honest);
     seed.send(0, KIND_RUMOR, &body, None).await;
     fence(&seed, 0, &peer, 107).await;
     let claims = peer.space_claims("work").await;
     assert_eq!(claims.len(), 1, "{claims:?}");
-    assert_eq!(peer.counters().await.malformed, before + 6);
+    assert_eq!(peer.counters().await.malformed, before + 2);
+    assert_eq!(peer.counters().await.deltas_undecodable, 4);
 }

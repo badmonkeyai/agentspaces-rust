@@ -107,6 +107,27 @@ pub fn resolve(global: &Global) -> Result<Config, Failure> {
     Ok(config)
 }
 
+/// The keystore directory a command that needs a lasting identity runs with: `--keystore`,
+/// `ASPACE_KEYSTORE`, the fleet file's `keystore`, else `~/.config/agentspaces/keys`; refused
+/// (exit 2) when none is named and there is no `HOME`.
+pub fn keystore_dir(global: &Global) -> Result<std::path::PathBuf, Failure> {
+    keystore_with_origin(global).map(|(dir, _)| dir)
+}
+
+/// [`keystore_dir`] with where it was read.
+pub fn keystore_with_origin(global: &Global) -> Result<(std::path::PathBuf, Origin), Failure> {
+    match Config::keystore_from_vars(&global.overrides(), env)? {
+        Some(found) => Ok(found),
+        None => match config::default_keystore(&env) {
+            Some(dir) => Ok((dir, Origin::Default)),
+            None => Err(Failure::refused(
+                "no keystore named and no HOME for the default ~/.config/agentspaces/keys; \
+                 pass --keystore <dir> or set ASPACE_KEYSTORE",
+            )),
+        },
+    }
+}
+
 /// The identity in `keystore` (loaded, or minted there), or a fresh one. A private key
 /// readable by its group or others is refused (exit 4) unless `allow_readable`
 /// (`--allow-readable-key`) or `ASPACE_ALLOW_READABLE_KEY` accepts it.
@@ -202,6 +223,17 @@ impl Session {
             }
         };
         tracing::debug!(peer = peer.peer_id(), group = peer.group_id(), "joined");
+        if config.invite.is_none()
+            && let Some(founder) = invite_only(&peer).await
+            && founder != peer.peer_id()
+        {
+            let _ = peer.close().await;
+            return Err(Failure::auth(format!(
+                "{} admits only invited peers (INVITE), and no invite was given: pass the invite \
+                 key its founder printed (aspace invite) with --invite or ASPACE_INVITE",
+                describe_group(&config)
+            )));
+        }
         Ok(Session {
             fleet: Fleet::from_peer(peer),
             config,
@@ -255,6 +287,20 @@ impl Session {
     }
 }
 
+/// The founder of the group `peer` joined when its verified founding admits only invited peers
+/// (`INVITE`); `None` for an open group, or one founded from a text.
+async fn invite_only(peer: &Peer) -> Option<String> {
+    let founding = peer.founding().await?;
+    let ad = founding.get("advertisement")?;
+    (ad.get("membershipPolicy")?.as_str()? == "INVITE")
+        .then(|| {
+            ad.get("issuer")
+                .and_then(|issuer| issuer.as_str())
+                .map(str::to_owned)
+        })
+        .flatten()
+}
+
 /// [`Session::pull_and_settle`] on any peer: pulls `space` and waits until its states stop
 /// arriving, before `deadline`. Silence counts as an empty space only once the seed has spoken
 /// ([`heard_from_seed`]): a seed that accepted the connection and never answered is a timeout
@@ -297,8 +343,9 @@ pub async fn heard_from_seed(peer: &Peer, deadline: Instant) -> Result<(), Failu
                 .unwrap_or_default();
             return Err(Failure::timeout(format!(
                 "the seed{at} accepted the connection but sent nothing before the join timeout \
-                 ran out, so nothing can be said of what the group holds; check it with aspace \
-                 doctor, or give it longer with --join-timeout"
+                 ran out, so nothing can be said of what the group holds (a seed of an INVITE \
+                 group sends nothing to a peer it did not admit: pass an invite with --invite); \
+                 check it with aspace doctor, or give it longer with --join-timeout"
             )));
         }
         tokio::time::sleep(SEED_POLL.min(deadline - now)).await;

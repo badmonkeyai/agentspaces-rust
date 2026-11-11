@@ -40,7 +40,8 @@ use agentspaces_wire::envelope::{
 use agentspaces_wire::founding::{found_group, verify_signed_group_ad};
 use agentspaces_wire::identity::Identity;
 use agentspaces_wire::limits::{
-    FRAME_FILTER_CAPACITY, MAX_FRAME_AGE_MILLIS, MAX_HLC_SKEW_MILLIS, WIRE_VERSION,
+    FRAME_FILTER_CAPACITY, LOGICAL_LIMIT, MAX_FRAME_AGE_MILLIS, MAX_HLC_SKEW_MILLIS,
+    SKEW_MARGIN_MILLIS, WIRE_VERSION,
 };
 use agentspaces_wire::session::{self, HELLO_KINDS};
 use common::{golden, hex, s};
@@ -244,10 +245,18 @@ fn a_frame_whose_key_is_not_its_sender_is_refused() {
 fn a_bare_frame_is_accepted_only_from_the_attested_sender() {
     let env = ping_envelope();
     let bare = encode_bare_frame(&env);
+    // A bare frame carries the envelope with a null key and a null signature: the wrapper's
+    // fields are always present (SPEC §9.1 P1), as Java's encodeBare writes them.
+    let wrapper = map_of(&bare);
+    assert_eq!(wrapper.len(), 3);
+    assert_eq!(wrapper.get("senderPublicKey"), Some(&Value::Null));
+    assert_eq!(wrapper.get("signature"), Some(&Value::Null));
+    // A wrapper that omits them breaks P1 and does not decode, whoever attested it.
+    let mut envelope_alone = Map::new();
+    envelope_alone.insert("envelope", Value::Map(env.clone()));
     assert_eq!(
-        map_of(&bare).len(),
-        1,
-        "a bare frame carries the envelope alone"
+        decode_frame_detailed(&bytes_of(&envelope_alone), Some(s("peer_id")), None),
+        None
     );
     let (decoded, auth) =
         decode_frame_detailed(&bare, Some(s("peer_id")), None).expect("attested sender");
@@ -438,7 +447,10 @@ fn stale_and_far_ahead_frames_are_dropped_quietly() {
         (filter.stale(), filter.ahead(), filter.replayed()),
         (1, 1, 0)
     );
-    assert!(filter.is_empty(), "a dropped frame is not remembered");
+    assert_eq!((filter.far_future(), filter.far_future_skewed()), (1, 0));
+    // SPEC §9 (v0.1.30): the replay filter runs before the far-future checks, so a stale frame
+    // is not remembered and a fresh far-future one is.
+    assert_eq!(filter.len(), 1);
     // Within the bounds either way, and exactly at them, admitted.
     for (nonce, physical) in [
         (3, now - MAX_FRAME_AGE_MILLIS / 2),
@@ -455,8 +467,33 @@ fn stale_and_far_ahead_frames_are_dropped_quietly() {
         );
     }
     assert_eq!((filter.stale(), filter.ahead()), (1, 1));
+    // Past the ceiling by at most the skew margin: dropped and counted apart, as an honest peer
+    // a hostile member dragged to its ceiling stamps its frames; further past: far-future.
+    for (nonce, physical, skewed, far) in [
+        (10, now + MAX_HLC_SKEW_MILLIS + 1, 1, 1),
+        (11, now + MAX_HLC_SKEW_MILLIS + SKEW_MARGIN_MILLIS, 2, 1),
+        (12, now + MAX_HLC_SKEW_MILLIS + SKEW_MARGIN_MILLIS + 1, 2, 2),
+    ] {
+        assert!(!filter.admit(
+            &filtered(&other, nonce, &format!("{physical}:0:other")),
+            now
+        ));
+        assert_eq!(
+            (filter.far_future_skewed(), filter.far_future()),
+            (skewed, far),
+            "{nonce}"
+        );
+    }
+    // A counter above the logical limit, after every time check (SPEC §9).
+    let above = format!("{now}:{}:other", LOGICAL_LIMIT + 1);
+    assert!(!filter.admit(&filtered(&other, 13, &above), now));
+    assert_eq!(filter.logical_refused(), 1);
+    assert!(filter.admit(
+        &filtered(&other, 14, &format!("{now}:{LOGICAL_LIMIT}:other")),
+        now
+    ));
     // Hostile extremes neither overflow nor pass.
-    let (stale, ahead) = (filter.stale(), filter.ahead());
+    let (stale, ahead, replayed) = (filter.stale(), filter.ahead(), filter.replayed());
     for (physical, clock) in [
         (i64::MIN, now),
         (i64::MIN, i64::MAX),
@@ -467,7 +504,15 @@ fn stale_and_far_ahead_frames_are_dropped_quietly() {
         env.insert("stamp", format!("{physical}:0:other"));
         assert!(!filter.admit(&env, clock), "{physical} at {clock}");
     }
-    assert_eq!((filter.stale(), filter.ahead()), (stale + 2, ahead + 2));
+    // A negative physical part is no stamp (refused uncounted), and the second far-future frame
+    // repeats the first's (from, stamp) pair: a replay.
+    assert_eq!(
+        (filter.stale(), filter.ahead(), filter.replayed()),
+        (stale, ahead + 1, replayed + 1)
+    );
+    let ancient = filtered(&other, 15, "0:0:other");
+    assert!(!filter.admit(&ancient, now));
+    assert_eq!(filter.stale(), stale + 1);
 }
 
 #[test]
@@ -492,9 +537,22 @@ fn an_unreadable_stamp_is_refused_uncounted() {
         (filter.stale(), filter.ahead(), filter.replayed()),
         (0, 0, 0)
     );
-    // A leading plus is a number, as Java's Long.parseLong reads it.
+    // Since v0.1.30 a stamp has one text: a leading plus or zero is no stamp, refused uncounted
+    // (a decoded frame never carries one).
     env.insert("from", "zX");
-    env.insert("stamp", format!("+{now}:0:x"));
+    for odd in [
+        format!("+{now}:0:x"),
+        format!("0{now}:0:x"),
+        format!("{now}:00:x"),
+    ] {
+        env.insert("stamp", odd.as_str());
+        assert!(!filter.admit(&env, now), "{odd}");
+    }
+    assert_eq!(
+        (filter.stale(), filter.ahead(), filter.replayed()),
+        (0, 0, 0)
+    );
+    env.insert("stamp", format!("{now}:0:x"));
     assert!(filter.admit(&env, now));
 }
 
@@ -556,8 +614,16 @@ fn digest_body_matches_java() {
 fn small_bodies_round_trip_through_their_parsers() {
     let ack = cbor::decode(&bodies::ack_body(42)).unwrap();
     assert_eq!(ack, cbor_map! { "nonce" => 42, "onBehalf" => Value::Null });
-    assert_eq!(parse_ping(&bodies::ack_body(-7)), Some(-7));
-    assert_eq!(parse_ping(&cbor::encode(&cbor_map! {})), Some(0));
+    // Each body reads under its own record (SPEC §9.1, annex I): an ACK is no PING.
+    assert_eq!(bodies::parse_ack(&bodies::ack_body(-7)), Some(-7));
+    assert_eq!(parse_ping(&bodies::ack_body(-7)), None);
+    assert_eq!(parse_ping(&bodies::ping_body(-7)), Some(-7));
+    // The primitive nonce is never absent and never null (P4), and never text (P2).
+    assert_eq!(parse_ping(&cbor::encode(&cbor_map! {})), None);
+    assert_eq!(
+        parse_ping(&cbor::encode(&cbor_map! { "nonce" => Value::Null })),
+        None
+    );
     assert_eq!(
         parse_ping(&cbor::encode(&cbor_map! { "nonce" => "x" })),
         None
@@ -574,11 +640,22 @@ fn small_bodies_round_trip_through_their_parsers() {
         ("ads", "item", 6)
     );
     assert_eq!(rumor.payload, b"payload");
-    let bare = parse_rumor(&cbor::encode(
-        &cbor_map! { "streamId" => "peers", "payload" => Value::Null },
-    ))
+    // Every field of the rumor is written; an item id or payload written null reads as empty.
+    let bare = parse_rumor(&cbor::encode(&cbor_map! {
+        "streamId" => "peers",
+        "itemId" => Value::Null,
+        "hopsRemaining" => 0,
+        "payload" => Value::Null,
+    }))
     .unwrap();
     assert!(bare.payload.is_empty() && bare.item_id.is_empty() && bare.hops_remaining == 0);
+    assert_eq!(
+        parse_rumor(&cbor::encode(
+            &cbor_map! { "streamId" => "peers", "payload" => Value::Null },
+        )),
+        None,
+        "P1: a rumor that omits a field"
+    );
     assert_eq!(
         parse_rumor(&cbor::encode(&cbor_map! { "itemId" => "x" })),
         None
@@ -618,9 +695,10 @@ fn small_bodies_round_trip_through_their_parsers() {
     let parsed = parse_pull_resp(&pull_resp_body(&deltas)).unwrap();
     assert_eq!(parsed, cbor::canonical_map(&deltas));
     assert_eq!(
-        parse_pull_resp(&cbor::encode(&cbor_map! {})),
+        parse_pull_resp(&cbor::encode(&cbor_map! { "deltas" => Value::Null })),
         Some(Map::new())
     );
+    assert_eq!(parse_pull_resp(&cbor::encode(&cbor_map! {})), None);
     assert_eq!(
         parse_pull_resp(&cbor::encode(&cbor_map! { "deltas" => 1 })),
         None
@@ -844,17 +922,45 @@ fn aggregate_frames_and_the_roster_token_match_java() {
         let parsed = Aggregate::from_frame(&cbor::decode(&hex(name)).unwrap());
         assert_eq!(parsed.as_ref(), Some(variant), "{name}");
     }
-    // Not exactly one variant: refused.
+    // Two variants: Java's node acts on the first in field order (the share), and so does
+    // this reader (SPEC §9.2: Java decides a point no rule covers).
     let mut two = aggregate_frame(&share);
     two.insert(
         "roster",
         aggregate_frame(&roster).get("roster").unwrap().clone(),
     );
-    assert_eq!(Aggregate::from_frame(&Value::Map(two)), None);
+    assert_eq!(Aggregate::from_frame(&Value::Map(two)), Some(share.clone()));
+    // A variant whose epochId is null decodes, and Java passes it over for the next one.
+    let mut unnamed = aggregate_frame(&share);
+    unnamed
+        .get_mut("share")
+        .and_then(Value::as_map_mut)
+        .unwrap()
+        .insert("epochId", Value::Null);
+    unnamed.insert(
+        "roster",
+        aggregate_frame(&roster).get("roster").unwrap().clone(),
+    );
+    assert_eq!(
+        Aggregate::from_frame(&Value::Map(unnamed)),
+        Some(roster.clone())
+    );
+    // A frame that omits a union field, adds one, or holds an integer where a double belongs
+    // breaks the record rules (SPEC §9.1 P1, P2).
     let none = cbor_map! { "share" => Value::Null, "extremum" => Value::Null };
     assert_eq!(Aggregate::from_frame(&none), None);
     let wrong = cbor_map! { "share" => 5 };
     assert_eq!(Aggregate::from_frame(&wrong), None);
+    let mut extra = aggregate_frame(&share);
+    extra.insert("other", Value::Null);
+    assert_eq!(Aggregate::from_frame(&Value::Map(extra)), None);
+    let mut integral = aggregate_frame(&share);
+    integral
+        .get_mut("share")
+        .and_then(Value::as_map_mut)
+        .unwrap()
+        .insert("value", 4);
+    assert_eq!(Aggregate::from_frame(&Value::Map(integral)), None);
 }
 
 #[test]

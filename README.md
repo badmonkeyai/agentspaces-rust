@@ -15,7 +15,7 @@ A Rust program joins a fleet as a full member. It holds its own Ed25519 identity
 - **Fleet**: the groups, peers, and agents that work together through AgentSpaces.
 - **Peer**: one running AgentSpaces process. Its PeerID is the hash of its public key.
 - **Group**: the peers that share spaces. A group is founded once, here from the text `shop-v1`.
-- **Seed**: a peer that listens, so others can dial it to join a group. A Rust peer only dials out today, so the quick start starts a seed first.
+- **Seed**: a peer that listens, so others can dial it to join a group. The quick start starts one first, with `aspace seed`.
 - **Space**: a shared, replicated collection of entries, such as `orders`. Each member that uses it holds a copy.
 - **Entry**: one typed record in a space, such as an `Order`. In Rust, a plain struct with `#[derive(Entry)]`.
 - **Lease**: how long an entry, a take, or a card lasts before it lapses.
@@ -26,8 +26,7 @@ A Rust program joins a fleet as a full member. It holds its own Ed25519 identity
 
 You need:
 
-- Linux or macOS, and Rust through [rustup](https://rustup.rs). The repository pins its toolchain (Rust 1.99) in `rust-toolchain.toml`; rustup installs it on first use.
-- A JDK 21 or newer and Maven, for the seed.
+- Linux or macOS, and Rust through [rustup](https://rustup.rs). The repository pins its toolchain (Rust 1.99) in `rust-toolchain.toml`; rustup installs it on first use. No JDK: the seed is the `aspace` command too.
 - A clone of this repository:
 
 ```sh
@@ -43,7 +42,9 @@ Every file below is in [`quickstart/`](quickstart), and every command runs there
 ./seed.sh
 ```
 
-The seed is a Java AgentSpaces node. It listens on `127.0.0.1:7700` and founds the group `shop-v1` with the space `orders`. The first run compiles it and fetches the AgentSpaces 0.5.0 jars from Maven Central. Leave it running. Type `quit` or press Ctrl-C to stop it.
+The seed is `aspace seed`, a listening member. It reads `fleet.yaml` (below), listens on `127.0.0.1:7700`, serves the group `shop-v1`, and keeps the space `orders`, so a worker or a desk can leave and the orders stay. It runs the `aspace` on your PATH, or builds this repository's on the first run. It prints one JSON line when it listens, then one line per member it admits. Leave it running. Press Ctrl-C to stop it.
+
+A Java node can be the seed instead: `SEED=java ./seed.sh` runs the scripted Java seed in `interop/java-seed`, with a JDK 21 or newer and Maven.
 
 **2. Describe the fleet.** The program reads `fleet.yaml`, the fleet file. The Spring and Micronaut starters, the Node host, and the Ruby client read files of the same shape.
 
@@ -209,7 +210,7 @@ SHIP_SECONDS=10 cargo run -q
 
 Run the desk again. One worker prints `shipping o-... (attempt 1)`. Kill that one with `kill -9 <pid>`, using the pid from its `serving as` line. Its take lapses within 30 seconds. Then the other worker prints `shipping o-... (attempt 2)`, and the desk prints the shipment with the survivor in `by`.
 
-**6. The same with no Rust code.** `aspace` is a fleet member for scripts and shells. Install it from this repository (it lands in `~/.cargo/bin`):
+**6. The same with no Rust code.** `aspace` is a fleet member for scripts and shells, and the seed you started in step 1. Install it from this repository (it lands in `~/.cargo/bin`):
 
 ```sh
 cargo install --locked --path ../crates/aspace
@@ -257,6 +258,63 @@ cargo run -q -- top
 {"id":"4a5b17e0-ab25-4b84-a5d0-e485a223e2c2","schema":"shop.Shipment#v1","space":"orders","entry":{"orderId":"o-2","item":"ball","by":"fulfil.sh"},"tags":{},"issuer":"z5syUVc2Qi3bHmzjjAz2jvCZrAXNicYqWVdmRay8mH8Ma/fulfiller","attestation":"AGENT_ATTESTED","expiresAt":1794195285910}
 ```
 
+## A fleet from the shell: the multiple-peer example
+
+You can run a whole fleet from a shell with nothing but the `aspace` binary: no JVM, no Node, no Python, no Ruby, and no Rust code. [`examples/two-peers`](examples/two-peers) does it in about four seconds. Every peer below is a separate process with its own Ed25519 identity (its own `--keystore`), and every frame is signed:
+
+- **Peer 1, the seed**, is `aspace seed --found demo`. It founds the group `demo`, keeps the signed founding beside its keystore so a restart keeps the group's id, listens on `127.0.0.1:7700`, and prints the `aspace://` id to join by.
+- **Peer 2** writes a note to the space `notes`, reads it back, and leaves.
+- **A worker**, `aspace work -- ./handler.sh`, serves the action `shout`. It runs the script once per task, with the task as JSON on standard input, and the script's JSON is the result.
+- **A third peer** finds the action with `aspace cards` and calls it with `aspace call`.
+- **A late visitor** joins after peer 2 left and still reads its note, because the seed keeps what the group wrote. Its `aspace status` lists the members the seed knows.
+
+The commands, as you would type them (the example script runs exactly these in a scratch directory):
+
+```sh
+# Peer 1: found the group demo and listen. Its one line on standard output names the group to join.
+aspace --profile dev-local --keystore keys/seed seed --found demo --listen tcp://127.0.0.1:7700 &
+
+# Every other peer joins through the seed: the same group, a keystore of its own.
+export ASPACE_PROFILE=dev-local ASPACE_SEEDS=tcp://127.0.0.1:7700 ASPACE_JOIN=aspace://<group-id from the seed>
+
+aspace --keystore keys/peer2 write 'demo.Note#v1' --space notes --json '{"text":"hello from peer 2"}'
+aspace --keystore keys/peer2 read 'demo.Note#v1' --space notes
+
+aspace --keystore keys/worker work --space desk --take 'demo.Shout#v1' --produces 'demo.Shouted#v1' \
+    --action shout -- ./handler.sh &
+aspace --keystore keys/caller cards
+aspace --keystore keys/caller call shout --json '{"text":"hello, fleet"}' --timeout 30s
+
+aspace --keystore keys/late read 'demo.Note#v1' --space notes
+aspace --keystore keys/late status
+```
+
+From a real run (ids and times differ in every run):
+
+```text
+{"event":"listening","peer":"z4kMUMVP…","group":"z4ZbWj6S…","join":"aspace://z4ZbWj6S…","listen":["tcp://127.0.0.1:7741"],"advertise":[],"membership":"OPEN"}
+{"id":"94210e27-…","schema":"demo.Note#v1","space":"notes"}
+shout  demo.Shout#v1 -> demo.Shouted#v1 in desk  (agent zEaxu5ar…/shout)
+{"offering":"shout",…,"entry":{"text":"hello, fleet","shout":"HELLO, FLEET","by":"handler.sh"},…,"attestation":"AGENT_ATTESTED",…}
+members  4 (1 reachable)
+```
+
+Run it, or check it:
+
+```sh
+cargo install --locked --path crates/aspace     # once, from the repository root
+examples/two-peers/two-peers.sh                 # prints each command, then what it printed
+cargo test -p aspace --test two_peers           # runs examples/two-peers/verify.sh; needs nothing else
+```
+
+What to know:
+
+- **Add as many peers as you like.** Give each one its own keystore and the same `ASPACE_SEEDS` and `ASPACE_JOIN`. A second `aspace work` serving `shout` becomes a replica of the same offering, and a call reaches whichever worker takes it.
+- **The seed is a full member.** It admits the others, forwards what they write, answers late joiners from what it holds, and relays between members that cannot reach each other.
+- **`dev-local` is for a laptop.** It signs every frame over plain loopback `tcp` and encrypts nothing. On a network, the seed listens on `tls://` and the members dial `tls://`.
+- **An invite group** admits only peers that hold its key: start the seed with `--membership invite`, print a key with `aspace invite --found demo`, and give it to joiners with `--invite`.
+- [docs/seed.md](docs/seed.md) covers running a seed in full: founding, invite groups, `tls`, a second seed, and the bounds.
+
 ## About agentspaces-rust
 
 AgentSpaces for Rust brings coding assistants, scripts, CI jobs, and Rust services into a fleet with one binary or one crate. Any of them can call what the fleet offers, and a script or a Rust program can work for it, with no JVM, Node, Python, or Ruby beside it.
@@ -264,15 +322,18 @@ AgentSpaces for Rust brings coding assistants, scripts, CI jobs, and Rust servic
 | Crate | What it is |
 |---|---|
 | `agentspaces-wire` | The protocol core, with no I/O and no runtime: the CBOR codec that writes Java's bytes, identities and certificates, envelopes, records, the claim lattice, and the space fold. Proven byte for byte against the specification's golden vectors for every feature it has. |
-| `agentspaces` | The peer, on Tokio. It dials a seed over `tcp`, or `tls` with channel certificates, then joins, verifies, and replicates. On top: `Fleet`, the space verbs, typed entries, workers with AgentCards, remote actions, the fleet catalogue, the fleet YAML, the keystore, and a blocking facade. |
+| `agentspaces` | The peer, on Tokio. It dials a seed over `tcp`, or `tls` with channel certificates, then joins, verifies, and replicates; started with listeners, it is a seed other members dial. On top: `Fleet`, the space verbs, typed entries, workers with AgentCards, remote actions, the fleet catalogue, the fleet YAML, the keystore, and a blocking facade. |
 | `agentspaces-derive` | `#[derive(Entry)]`, which binds a Rust type to its wire schema. |
-| `aspace` | The command: every verb from a shell with JSON in and out, `aspace work` to run any program as a worker, `aspace daemon`, and `aspace mcp`. |
+| `aspace` | The command: every verb from a shell with JSON in and out, `aspace work` to run any program as a worker, `aspace seed` to serve a group of your own, `aspace daemon`, and `aspace mcp`. |
 | `agentspaces-mcp` | `FleetMcpServer`: the fleet's catalogue as Model Context Protocol tools, over stdio and Streamable HTTP, with tokens or JWTs and scopes. |
 
 The repository also holds:
 
+- [`examples/two-peers`](examples/two-peers): a seed, a writer, a worker, a caller, and a late visitor from one shell script, with nothing but `aspace`.
 - [`examples/rust-fleet`](examples/rust-fleet): a Rust worker and a shell-script worker serve the Java research fleet of example 02 in the [core repository](https://github.com/badmonkeyai/agentspaces), over `tcp` and over attested `tls`.
-- [`interop/java-seed`](interop/java-seed): the scripted Java peer that the cross-language tests and the quick start use as a seed.
+- [`interop/java-seed`](interop/java-seed): the scripted Java peer that the Java interop tests use as a seed (and the quick start, with `SEED=java`).
+- [`interop/clients`](interop/clients): Python, TypeScript, and Ruby peers that the cross-language tests join to a Rust seed.
+- [`docs/seed.md`](docs/seed.md): running a seed, founding a group, invite groups, `tls`, and the bounds and counters.
 - [`docs/mcp.md`](docs/mcp.md) and [`docs/recipes/`](docs/recipes): the MCP gateway in full, and recipes for Codex, goose, Zed, Claude Code, GitHub Actions, and cron.
 
 AgentSpaces has peers in other languages too: the [Java core](https://github.com/badmonkeyai/agentspaces), [Python](https://github.com/badmonkeyai/agentspaces-python), [TypeScript](https://github.com/badmonkeyai/agentspaces-typescript), and [Ruby](https://github.com/badmonkeyai/agentspaces-rb). The protocol and its golden vectors live in the [specification](https://github.com/badmonkeyai/agentspaces-spec).
@@ -283,6 +344,7 @@ Built and tested today:
 
 - the protocol core, proven on the golden vectors of every feature it has;
 - the peer over `tcp` and `tls`, with reconnects, revocations, relays, and bounds on everything a remote sends;
+- the listening role: `aspace seed` founds or serves a group, admits members under its open or invite membership, and replicates what they write, so a fleet needs no other implementation;
 - spaces: write, read, take, complete, watch, and notify, typed entries, and the blocking facade;
 - workers and their AgentCards, remote actions, and the fleet catalogue;
 - `aspace` with every command below, including `aspace daemon` and `aspace mcp`.
@@ -293,7 +355,6 @@ Next, roughly in this order:
 - artifacts: the content swarm, with `aspace put` and `aspace get`;
 - bindings: a C header, Swift and Kotlin packages, and a WASI component;
 - framework adapters: rig tools and workers, an ACP supervisor, `aspace hook` for the hooks of coding assistants such as Codex and Claude Code, and MCP servers imported as fleet agents;
-- `aspace seed`, a listener, so a fleet of Rust members needs no other peer to dial;
 - release binaries and packages on crates.io.
 
 ### How it works
@@ -305,7 +366,7 @@ Next, roughly in this order:
 
 ## The aspace command
 
-`aspace` is a fleet member for scripts, hooks, and shells. Most commands join, do one thing, and leave. `aspace work`, `aspace daemon`, and `aspace mcp` stay, and `aspace watch` streams until you stop it or it reaches `--count`.
+`aspace` is a fleet member for scripts, hooks, and shells. Most commands join, do one thing, and leave. `aspace work`, `aspace seed`, `aspace daemon`, and `aspace mcp` stay, and `aspace watch` streams until you stop it or it reaches `--count`.
 
 | Command | What it does |
 |---|---|
@@ -319,6 +380,8 @@ Next, roughly in this order:
 | `aspace cards` | List the offerings of the fleet catalogue. |
 | `aspace call TARGET --json OBJECT` | Invoke an offering, by name or by the schema it consumes, and print its result. |
 | `aspace work --take SCHEMA --space SPACE -- PROGRAM` | Run a program for each task taken, as an agent with a card. |
+| `aspace seed` | Listen and serve a group as its seed: one it founds (`--found NAME`), one founded from a text (`--group`), or another seed's (`--join`). See [docs/seed.md](docs/seed.md). |
+| `aspace invite --found NAME` | Print an invite key of an invite group this keystore founded; joiners pass it with `--invite` or `ASPACE_INVITE`. |
 | `aspace daemon` | Stay joined and serve the other commands over a local socket. |
 | `aspace mcp` | Serve the fleet's offerings as MCP tools. |
 | `aspace doctor` | Check the configuration, the keystore, the seeds, and the join. |
@@ -338,7 +401,7 @@ Every command's `--help` ends with examples.
 | 3 | A timeout: the join, the dial, or a wait for an entry or a result. |
 | 4 | Authentication or authorization: a revoked identity, a key file others can read, a seed that does not attest. |
 
-**Configuration.** Flags come first, then the `ASPACE_*` variables, then the fleet file: `--config`, else `ASPACE_CONFIG`, else `~/.config/agentspaces/fleet.yaml`. The keystore defaults to `~/.config/agentspaces/keys`. When `XDG_CONFIG_HOME` is set, both defaults move under `$XDG_CONFIG_HOME/agentspaces`.
+**Configuration.** Flags come first, then the `ASPACE_*` variables, then the fleet file: `--config`, else `ASPACE_CONFIG`, else `~/.config/agentspaces/fleet.yaml`. The keystore defaults to `~/.config/agentspaces/keys`. When `XDG_CONFIG_HOME` is set, both defaults move under `$XDG_CONFIG_HOME/agentspaces`. `aspace seed` also reads its listeners from `--listen`, `ASPACE_LISTEN`, or the file's `bind`, and what they advertise from `--advertise`, `ASPACE_ADVERTISE`, or the file's `advertise`; no other command binds anything.
 
 **`aspace work`.** For each task it runs the program with no shell, in a process group of its own:
 
@@ -351,6 +414,8 @@ Every command's `--help` ends with examples.
 `--parallel N` runs up to N programs at once. SIGINT or SIGTERM stops taking and gives running programs `--grace` to finish.
 
 **The daemon.** Each command joins the fleet on its own, unless `aspace daemon` runs. While it runs, `status`, `write`, `read`, `take`, `complete`, `watch`, `cards`, and `call` go through it when they name the same group, keystore, and profile. They answer in milliseconds, with the same output and exit codes. Its socket is owner-only and serves only processes of the same user. Run it under systemd or launchd, or with `setsid`. `--no-daemon` makes a command join on its own.
+
+**Several peers from a shell.** [A fleet from the shell](#a-fleet-from-the-shell-the-multiple-peer-example) runs a seed, a writer, a worker, a caller, and a late visitor with nothing but `aspace`.
 
 ## MCP: the fleet as tools
 
@@ -547,6 +612,12 @@ A Rust member is a member like any other, so the repository proves it against th
 - The other 58 vectors belong to features this peer does not have, such as DTLS, WebRTC, and the content swarm.
 - A coverage test fails when a vector is neither tested nor listed as skipped with its reason.
 
+**Around a Rust seed.** `crates/aspace/tests/clients_seed.rs` starts `aspace seed` and joins the Python, TypeScript, and Ruby clients (each through its public API, the drivers in `interop/clients`) and a Rust peer to it, over `tcp` (the group joined by id) and over `tls` with required attestation:
+
+- each writes tasks, and every peer reads all of them;
+- all four race to take them, each task completed exactly once, and every result read by the peers of the other languages;
+- a watch in each language hears the other languages' writes and completions.
+
 **Against a live Java peer.** The interop tests start the scripted Java seed (`interop/java-seed`) on a free port and check what both sides see:
 
 - membership, over `tcp` and over attested `tls` with unsigned frames on the attested channel;
@@ -590,7 +661,8 @@ cargo fmt --all --check
 ASPACE_INTEROP_REQUIRED=1 cargo test --workspace
 ```
 
-- With `ASPACE_INTEROP_REQUIRED=1`, the MCP client tests need Node and Ruby too, as [CONTRIBUTING.md](CONTRIBUTING.md) lists under "The cross-language suites".
+- With `ASPACE_INTEROP_REQUIRED=1`, the MCP client tests need Node and Ruby too, as [CONTRIBUTING.md](CONTRIBUTING.md) lists under "The cross-language suites", and the Rust-seed test needs the Python, TypeScript, and Ruby clients beside this repository ([interop/clients](interop/clients/README.md) says how it finds them).
+- `cargo test -p aspace --test two_peers` runs the two-peer example with nothing but the build's `aspace`.
 - Three more Java checks are opt-in: `cargo test --workspace -- --ignored java`.
 - `quickstart/verify.sh` runs the quick start end to end in a scratch copy of the repository.
 - On a machine with few cores, `CARGO_BUILD_JOBS=4` keeps a build from taking every one.

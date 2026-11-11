@@ -292,20 +292,31 @@ fn a_completion_without_its_claim_is_refused() {
 
 #[test]
 fn a_state_signed_outside_its_window_or_beyond_the_drift_ceiling_is_refused() {
-    for (name, offset) in [
-        ("adv_agent_state_out_of_window_delta", -HOUR),
-        ("adv_agent_state_drift_delta", MAX_DRIFT_MILLIS + 60_000),
-    ] {
-        let state = state_of(name);
-        assert_eq!(text(&state, "signedAt"), stamp(offset, 0), "{name}");
-        let mut replica = Replica::at(verify_at());
-        assert_eq!(
-            replica.fold(&state),
-            refused(Refusal::UnverifiedState),
-            "{name}"
-        );
-        assert!(replica.store.is_empty(), "{name}");
+    let out_of_window = state_of("adv_agent_state_out_of_window_delta");
+    assert_eq!(text(&out_of_window, "signedAt"), stamp(-HOUR, 0));
+    let mut replica = Replica::at(verify_at());
+    assert_eq!(
+        replica.fold(&out_of_window),
+        refused(Refusal::UnverifiedState)
+    );
+    assert!(replica.store.is_empty());
+    // SPEC §9.2 F4 (v0.1.31): the certificate bounds `signedAt` by its window alone, and the
+    // far-future rule judges how far it leads. The drift vector's `signedAt` lies eleven minutes
+    // past the receiver's wall, so it is deferred: nothing merges, nobody is struck, and the
+    // deferral counts once however often it is offered (the golden label says refused; SPEC
+    // §9.2 records the corrected verdict).
+    let drift = state_of("adv_agent_state_drift_delta");
+    assert_eq!(
+        text(&drift, "signedAt"),
+        stamp(MAX_DRIFT_MILLIS + 60_000, 0)
+    );
+    let mut replica = Replica::at(verify_at());
+    for _ in 0..3 {
+        assert_eq!(replica.fold(&drift), FoldOutcome::Deferred);
     }
+    assert!(replica.store.is_empty());
+    assert_eq!(replica.store.stamps_far_future_deferred(), 1);
+    assert_eq!(replica.store.stamps_far_future_refused(), 0);
     // The drift vector is inside the window: a receiver whose clock has caught up accepts it.
     let mut caught_up = Replica::at(t0() + 60_000);
     assert_eq!(
@@ -385,10 +396,22 @@ fn a_record_under_a_renewed_certificate_is_judged_at_signing_time() {
     // Long after the renewed certificate lapsed, the record is still judged at its stamp.
     let mut later = Replica::at(signed_at + 30 * HOUR);
     assert_eq!(later.fold(&state), APPLIED);
-    // A receiver the stamp leads beyond the drift ceiling refuses it.
+    // The certificate bounds the stamp by its window alone (SPEC §4.2, v0.1.30); the far-future
+    // rule judges the lead. A receiver the stamp leads by more than an hour past its margin
+    // refuses it as hostile, once per distinct state ...
     let mut behind = Replica::at(verify_at());
-    assert_eq!(behind.fold(&state), refused(Refusal::UnverifiedRecord));
+    assert_eq!(behind.fold(&state), refused(Refusal::StampFarFuture));
+    assert_eq!(behind.fold(&state), refused(Refusal::StampFarFuture));
     assert!(behind.store.is_empty());
+    assert_eq!(behind.store.stamps_far_future_refused(), 1);
+    assert_eq!(behind.store.stamps_logical_refused(), 0);
+    // ... a receiver within that hour defers it, and merges it once its wall has caught up.
+    let mut skewed = Replica::at(signed_at - MAX_DRIFT_MILLIS - 30 * 60_000);
+    assert_eq!(skewed.fold(&state), FoldOutcome::Deferred);
+    assert!(skewed.store.is_empty());
+    skewed.now = signed_at;
+    assert_eq!(skewed.fold(&state), APPLIED);
+    assert_eq!(skewed.store.stamps_far_future_deferred(), 1);
 }
 
 // ------------------------------------------------------------------------- the join
@@ -457,12 +480,15 @@ fn the_freeze_rule_keeps_history_and_refuses_what_follows() {
         ],
     );
     assert_eq!(replica.fold(&renewal), refused(Refusal::Revoked));
-    // The same renewal stamped before the effective instant folds.
+    // The same renewal stamped before the effective instant folds, once the receiver's wall is
+    // within the far-future margin of its stamp (an hour ahead, it waits as deferred).
     let early_stamp = stamp(HOUR, 0);
     let early = resigned(
         &state_of("delta_cbor"),
         &[("leaseStamp", Value::from(early_stamp.as_str()))],
     );
+    assert_eq!(replica.fold(&early), FoldOutcome::Deferred);
+    replica.now = verify_at() + HOUR;
     assert_eq!(replica.fold(&early), APPLIED);
     // A revoked holder takes nothing, whatever the claim's stamp.
     let (entry, signed) = claim_of("claim_delta_cbor");

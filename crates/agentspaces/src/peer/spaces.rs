@@ -25,7 +25,6 @@
 use std::collections::HashMap;
 
 use agentspaces_wire::bodies::STREAM_SPACE_PREFIX;
-use agentspaces_wire::cbor::{self, Map, Value};
 use agentspaces_wire::fold::SpaceStore;
 use agentspaces_wire::ids;
 use tokio::time::Instant;
@@ -49,6 +48,11 @@ pub(super) struct Slot {
     pub max_lease: i64,
     /// When a received state last made the space collect because it was full.
     pub full_collected: Option<Instant>,
+    /// The bytes of the entries' states held (`PeerConfig::space_max_bytes` bounds it): the
+    /// sum of [`Slot::sizes`].
+    pub bytes: usize,
+    /// Each held entry's state size, as counted when it last applied.
+    pub sizes: HashMap<String, usize>,
 }
 
 /// The cap on the lease that feeds a space's collection horizon (Java
@@ -57,6 +61,13 @@ pub(super) struct Slot {
 pub(super) const MAX_TRACKED_LEASE_MILLIS: i64 = 24 * 60 * 60 * 1000;
 
 impl Slot {
+    /// Forgets the size of an entry that left the store.
+    pub fn forget_size(&mut self, entry_id: &str) {
+        if let Some(size) = self.sizes.remove(entry_id) {
+            self.bytes = self.bytes.saturating_sub(size);
+        }
+    }
+
     /// Takes a lease of `millis` into the space's longest lease (Java `observeLease`): capped at
     /// [`MAX_TRACKED_LEASE_MILLIS`]; a lease that is not positive is ignored.
     pub fn observe_lease(&mut self, millis: i64) {
@@ -100,6 +111,11 @@ impl Spaces {
             slots: HashMap::new(),
             max_entries: max_entries.max(1),
         }
+    }
+
+    /// Whether the space `name` is open.
+    pub fn contains(&self, name: &str) -> bool {
+        self.slots.contains_key(name)
     }
 
     /// The names of the spaces opened.
@@ -157,6 +173,8 @@ impl Spaces {
                     fired: HashMap::new(),
                     max_lease: 0,
                     full_collected: None,
+                    bytes: 0,
+                    sizes: HashMap::new(),
                 },
             );
         }
@@ -171,51 +189,11 @@ pub(super) fn space_name(stream: &str) -> Option<&str> {
         .filter(|name| !name.is_empty())
 }
 
-/// A space rumor's delta (Java `SpaceWire.Delta`, `{state, claimEntry, claim}`): the claim it
-/// carries under its entry id, and the state. Either may be absent. `None` when the payload is
-/// not a map.
-pub(super) type Delta = (Option<(String, Map)>, Option<Map>);
-
-/// Parses a space rumor's payload ([`Delta`]).
-pub(super) fn parse_delta(payload: &[u8]) -> Option<Delta> {
-    let mut delta = cbor::decode(payload).ok()?.into_map()?;
-    let claim_entry = delta
-        .remove("claimEntry")
-        .and_then(Value::into_text)
-        .filter(|entry| !entry.is_empty());
-    let claim = delta.remove("claim").and_then(Value::into_map);
-    let state = delta.remove("state").and_then(Value::into_map);
-    Some((claim_entry.zip(claim), state))
-}
-
-/// A space's pull response delta (`{states: [...], claims: {entryId: signedClaim}}`): its claims
-/// and its states, each skipping an item of the wrong shape. `None` when the bytes are not a map.
-pub(super) type Sync = (Vec<(String, Map)>, Vec<Map>);
-
-/// Parses a space's pull response delta ([`Sync`]).
-pub(super) fn parse_sync(delta: &[u8]) -> Option<Sync> {
-    let mut sync = cbor::decode(delta).ok()?.into_map()?;
-    let claims = sync
-        .remove("claims")
-        .and_then(Value::into_map)
-        .map(|claims| {
-            claims
-                .into_iter()
-                .filter_map(|(entry, signed)| Some((entry.into_text()?, signed.into_map()?)))
-                .collect()
-        })
-        .unwrap_or_default();
-    let states = sync
-        .remove("states")
-        .and_then(Value::into_array)
-        .map(|states| states.into_iter().filter_map(Value::into_map).collect())
-        .unwrap_or_default();
-    Some((claims, states))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentspaces_wire::cbor::{self, Value};
+    use agentspaces_wire::records;
     use agentspaces_wire::{cbor_array, cbor_map};
 
     #[test]
@@ -254,25 +232,43 @@ mod tests {
         assert_eq!(slot.max_lease, MAX_TRACKED_LEASE_MILLIS);
     }
 
+    /// SPEC §9.1 (v0.1.31): a space delta or pulled sync delta decodes under its record schema
+    /// or not at all. A misshapen state or claim no longer drops alone: it makes the whole delta
+    /// undecodable, which the actor counts (`deltas_undecodable`), as every implementation does.
     #[test]
-    fn deltas_and_syncs_parse_and_skip_what_is_misshapen() {
+    fn deltas_and_syncs_that_break_the_record_rules_do_not_decode() {
         let delta = cbor::encode(&cbor_map! {
             "state" => cbor_map! { "a" => 1 },
             "claimEntry" => "e1",
             "claim" => cbor_map! { "b" => 2 },
         });
-        let (claim, state) = parse_delta(&delta).expect("a map");
-        assert_eq!(claim.map(|(entry, _)| entry).as_deref(), Some("e1"));
-        assert!(state.is_some());
-        let none = cbor::encode(&cbor_map! { "state" => Value::Null, "claimEntry" => Value::Null });
-        assert_eq!(parse_delta(&none), Some((None, None)));
-        assert_eq!(parse_delta(&[0xff]), None);
+        assert_eq!(records::decode_delta(&delta), None);
+        let none = cbor::encode(&cbor_map! {
+            "state" => Value::Null,
+            "claimEntry" => Value::Null,
+            "claim" => Value::Null,
+        });
+        assert_eq!(
+            records::decode_delta(&none),
+            Some(records::Delta::default())
+        );
+        // P1: a delta that omits a field does not decode.
+        let short =
+            cbor::encode(&cbor_map! { "state" => Value::Null, "claimEntry" => Value::Null });
+        assert_eq!(records::decode_delta(&short), None);
+        assert_eq!(records::decode_delta(&[0xff]), None);
         let sync = cbor::encode(&cbor_map! {
             "states" => cbor_array![cbor_map! { "a" => 1 }, 7],
             "claims" => cbor_map! { "e1" => cbor_map! { "b" => 2 }, "e2" => 3 },
         });
-        let (claims, states) = parse_sync(&sync).expect("a map");
-        assert_eq!(claims.len(), 1);
-        assert_eq!(states.len(), 1);
+        assert_eq!(records::decode_sync_delta(&sync), None);
+        let empty = cbor::encode(&cbor_map! {
+            "states" => cbor_array![],
+            "claims" => cbor_map! {},
+        });
+        assert_eq!(
+            records::decode_sync_delta(&empty),
+            Some(records::SyncDelta::default())
+        );
     }
 }

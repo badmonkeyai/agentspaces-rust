@@ -8,7 +8,7 @@ The files behind "Quick start: build your first agent in Rust" in the [repositor
 | `Cargo.toml` | A package of its own, outside the repository's workspace, on the `agentspaces` crate by path. |
 | `src/main.rs` | The Fulfiller: a worker with no argument (`cargo run`), a desk with one (`cargo run -- kite`). |
 | `fulfil.sh` | The Fulfiller as a shell script, for `aspace work`. |
-| `seed.sh` | Starts the seed: the Java node in `../interop/java-seed`, founding `shop-v1` with the space `orders`. |
+| `seed.sh` | Starts the seed: `aspace seed` on `127.0.0.1:7700`, serving the group of `fleet.yaml` (`shop-v1`) and keeping the space `orders`. `SEED=java ./seed.sh` starts the Java node in `../interop/java-seed` instead. |
 | `verify.sh` | Runs the whole quick start end to end in a scratch copy of the repository. |
 
 ```sh
@@ -20,6 +20,6 @@ The files behind "Quick start: build your first agent in Rust" in the [repositor
 - a README snippet that differs from its file, or a command it runs that the README does not give;
 - a step whose output is not what the README says: the shipment, the worker that ships it, the second attempt after a worker is killed, the script's shipments.
 
-It needs Rust through rustup, a JDK 21 or newer, Maven, and port 7700 free (`PORT=7711 ./verify.sh` picks another). It stops every process it starts, also when it fails, and removes its scratch directory unless `KEEP=1`.
+It needs Rust through rustup and port 7700 free (`PORT=7711 ./verify.sh` picks another); no Java. It stops every process it starts, also when it fails, and removes its scratch directory unless `KEEP=1`.
 
 Run it at every release, and update the README section whenever a file here changes.

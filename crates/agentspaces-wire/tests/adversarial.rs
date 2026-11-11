@@ -32,13 +32,14 @@ use agentspaces_wire::ids::derive_id;
 use agentspaces_wire::limits::{MAX_CBOR_DEPTH, MAX_FRAME_BYTES, WIRE_VERSION};
 use agentspaces_wire::records::{sign_view_of, state_sign_view_of};
 use agentspaces_wire::revocation::{CREDENTIAL_STREAM, Registry};
+use agentspaces_wire::schema;
 use agentspaces_wire::time::parse_instant_millis;
 use common::{golden, hex, s};
 
 const ENTRY: &str = "11111111-2222-3333-4444-555555555555";
 
 /// Every `adv_*` key this suite and `fold_golden.rs` assert (`founding_test.rb`'s list).
-const COVERED: [&str; 39] = [
+const COVERED: [&str; 57] = [
     "adv_claim_bad_signature_delta",
     "adv_claim_transplanted_delta",
     "adv_claim_nan_bid_delta",
@@ -78,6 +79,24 @@ const COVERED: [&str; 39] = [
     "adv_key_wrap_wrong_rotator_cbor",
     "adv_key_wrap_wrong_rotator_binding_cbor",
     "adv_credential_revocation_cross_issuer_cbor",
+    "adv_app_card_kind_realm_cbor",
+    "adv_app_card_sign_on_tenant_cbor",
+    "adv_app_card_formats_empty_cbor",
+    "adv_app_card_origin_attrs_empty_cbor",
+    "adv_app_card_formats_bound_cbor",
+    "adv_app_card_formats_upper_cbor",
+    "adv_app_card_formats_duplicate_cbor",
+    "adv_app_card_formats_parameter_cbor",
+    "adv_app_card_origin_system_cbor",
+    "adv_app_card_origin_attrs_prefix_cbor",
+    "adv_app_card_origin_ref_bound_cbor",
+    "adv_app_card_spill_placeholder_cbor",
+    "adv_app_card_spill_parts_order_cbor",
+    "adv_app_card_spill_parts_unknown_cbor",
+    "adv_app_card_spill_parts_empty_cbor",
+    "adv_app_card_spill_root_codec_cbor",
+    "adv_app_card_spill_size_zero_cbor",
+    "adv_agent_card_spill_actions_cbor",
 ];
 
 // ------------------------------------------------------------------------- helpers
@@ -158,7 +177,9 @@ fn hostile_claims_never_enter_the_lattice() {
         ("adv_claim_nan_bid_delta", Refusal::Malformed),
         ("adv_claim_epoch_zero_delta", Refusal::Malformed),
         ("adv_claim_epoch_jump_delta", Refusal::OutOfBounds),
-        ("adv_claim_eternal_delta", Refusal::UnverifiedClaim),
+        // Its signature verifies, and its hold is past the bound: Java's mergeClaim refuses it
+        // after the stamp checks, as "claim hold beyond bound" (SPEC §7.4).
+        ("adv_claim_eternal_delta", Refusal::OutOfBounds),
     ] {
         let (entry, signed) = claim_of(name);
         for now in clocks() {
@@ -578,6 +599,187 @@ fn a_key_wrap_for_another_exchange_is_bound_to_that_exchange() {
                 "{wrap_name}"
             );
         }
+    }
+}
+
+// ------------------------------------------------------------------------- cards
+
+/// One field of a card, by its path, and the value that makes the card valid there; `None`
+/// removes the field.
+type Fix = (&'static [&'static str], Option<Value>);
+
+/// Sets (or removes) the field at `path` of a nested map.
+fn fixed(card: &Map, (path, value): &Fix) -> Map {
+    let mut card = card.clone();
+    let mut map = &mut card;
+    for key in &path[..path.len() - 1] {
+        map = map.get_mut(key).and_then(Value::as_map_mut).unwrap();
+    }
+    let last = path[path.len() - 1];
+    match value {
+        Some(value) => {
+            map.insert(last, value.clone());
+        }
+        None => {
+            map.remove(last);
+        }
+    }
+    card
+}
+
+fn texts(items: &[&str]) -> Option<Value> {
+    Some(Value::Array(
+        items.iter().map(|item| Value::from(*item)).collect(),
+    ))
+}
+
+#[test]
+fn hostile_cards_are_undecodable_for_their_own_rule() {
+    // SPEC §6.1a.2 to §6.1a.5 and §6.1b (v0.1.32): each vector breaks one value rule of the
+    // AppCard or the AgentCard, so a reader treats the card as undecodable (Java's constructors
+    // refuse it inside CborCodec.fromWire). Restoring that one field to a valid value makes the
+    // card decode, which proves the refusal is for that rule and nothing else.
+    let mut attrs = Map::new();
+    attrs.insert("realm.namespace", "urn:realm:example-realm#");
+    let cases: Vec<(&str, &str, Fix)> = vec![
+        (
+            "adv_app_card_kind_realm_cbor",
+            "AppCard",
+            (&["kind"], Some(Value::from("fed"))),
+        ),
+        (
+            "adv_app_card_sign_on_tenant_cbor",
+            "AppCard",
+            (&["host", "signOn"], Some(Value::from("idp"))),
+        ),
+        (
+            "adv_app_card_formats_empty_cbor",
+            "AppCard",
+            (&["formats"], texts(&["text/html"])),
+        ),
+        (
+            "adv_app_card_origin_attrs_empty_cbor",
+            "AppCard",
+            (&["origin", "attrs"], None),
+        ),
+        (
+            "adv_app_card_formats_bound_cbor",
+            "AppCard",
+            (&["formats"], texts(&["text/html"])),
+        ),
+        (
+            "adv_app_card_formats_upper_cbor",
+            "AppCard",
+            (&["formats"], texts(&["application/geo+json"])),
+        ),
+        (
+            "adv_app_card_formats_duplicate_cbor",
+            "AppCard",
+            (&["formats"], texts(&["text/html"])),
+        ),
+        (
+            "adv_app_card_formats_parameter_cbor",
+            "AppCard",
+            (&["formats"], texts(&["text/html"])),
+        ),
+        (
+            "adv_app_card_origin_system_cbor",
+            "AppCard",
+            (&["origin", "system"], Some(Value::from("realm"))),
+        ),
+        (
+            "adv_app_card_origin_attrs_prefix_cbor",
+            "AppCard",
+            (&["origin", "attrs"], Some(Value::Map(attrs))),
+        ),
+        (
+            "adv_app_card_origin_ref_bound_cbor",
+            "AppCard",
+            (
+                &["origin", "ref"],
+                Some(Value::from("example-realm/example-app")),
+            ),
+        ),
+        (
+            "adv_app_card_spill_placeholder_cbor",
+            "AppCard",
+            (&["ui"], None),
+        ),
+        (
+            "adv_app_card_spill_parts_order_cbor",
+            "AppCard",
+            (&["spill", "parts"], texts(&["reads", "ui"])),
+        ),
+        (
+            "adv_app_card_spill_parts_unknown_cbor",
+            "AppCard",
+            (&["spill", "parts"], texts(&["ui"])),
+        ),
+        (
+            "adv_app_card_spill_parts_empty_cbor",
+            "AppCard",
+            (&["spill", "parts"], texts(&["reads", "views", "ui"])),
+        ),
+        (
+            "adv_app_card_spill_root_codec_cbor",
+            "AppCard",
+            (
+                &["spill", "root"],
+                Some(Value::from(
+                    "bafkreic74cquwtiiznb5hof73zshjwqiqj6d3neyvh3fwkre7yfpkcn7dy",
+                )),
+            ),
+        ),
+        (
+            "adv_app_card_spill_size_zero_cbor",
+            "AppCard",
+            (&["spill", "size"], Some(Value::from(452))),
+        ),
+        (
+            "adv_agent_card_spill_actions_cbor",
+            "AgentCard",
+            (&["actions"], None),
+        ),
+    ];
+    assert_eq!(cases.len(), 18);
+    for (name, record, fix) in &cases {
+        let bytes = hex(name);
+        // The item rules and the canonical bytes hold: the refusal is the card's own.
+        assert_eq!(
+            schema::load_canonical(&bytes).as_ref(),
+            Some(&decoded(name)),
+            "{name}"
+        );
+        assert!(schema::decode(&bytes, record).is_none(), "{name} decodes");
+        let card = map_of(name);
+        let repaired = fixed(&card, fix);
+        assert!(
+            schema::conforms(&Value::Map(repaired), record),
+            "{name} repaired"
+        );
+        // A signed copy is refused on the advertisement path too.
+        let issuer = peer();
+        let mut own = card.clone();
+        own.insert("issuer", issuer.peer_id());
+        if *record == "AgentCard" {
+            own.insert("agent", issuer.agent("researcher"));
+        }
+        let stored = agentspaces_wire::ads::stored_ad(record, &own, &issuer);
+        for now in clocks() {
+            assert!(
+                agentspaces_wire::ads::verify_stored_ad(&Value::Map(stored.clone()), now).is_none(),
+                "{name} at {now}"
+            );
+        }
+    }
+    // The accepted cards they were cut from decode.
+    for (name, record) in [
+        ("app_card_origin_formats_cbor", "AppCard"),
+        ("app_card_spill_cbor", "AppCard"),
+        ("app_card_host_cbor", "AppCard"),
+        ("agent_card_spill_cbor", "AgentCard"),
+    ] {
+        assert!(schema::decode(&hex(name), record).is_some(), "{name}");
     }
 }
 

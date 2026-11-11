@@ -195,18 +195,18 @@ fn every_document_is_judged_as_java_judges_it() {
     );
 }
 
-/// Java's item rules alone accept a bignum of more than 1000 bytes, which Jackson then refuses;
-/// the wire decoder refuses it as the whole read does, naming the limit.
+/// A bignum of more than 1000 bytes: Java 0.5.0's item rules accepted it and Jackson refused it;
+/// since v0.1.31 (S9) Java's item rules refuse it themselves, so both of Java's verdicts name the
+/// limit, and the wire decoder refuses it as Java does, naming the limit.
 #[test]
 fn a_bignum_past_jacksons_limit_is_refused_as_java_refuses_it() {
-    let differing: Vec<&Json> = entries("documents")
+    let past_limit: Vec<&Json> = entries("documents")
         .iter()
-        .filter(|d| d["checkDocument"] != d["fromDocument"])
+        .filter(|d| text(d, "fromDocument").contains("at most 1000 bytes"))
         .collect();
-    assert_eq!(differing.len(), 3);
-    for entry in differing {
-        assert_eq!(entry["checkDocument"], "accept");
-        assert!(text(entry, "fromDocument").contains("maximum allowed (1000"));
+    assert_eq!(past_limit.len(), 3);
+    for entry in past_limit {
+        assert_eq!(entry["checkDocument"], entry["fromDocument"]);
         let bytes = hex::decode(text(entry, "hex")).expect("hex");
         assert!(
             matches!(
@@ -217,6 +217,12 @@ fn a_bignum_past_jacksons_limit_is_refused_as_java_refuses_it() {
             text(entry, "name")
         );
     }
+    // Every other document gets the same verdict from Java's item rules and its whole read.
+    assert!(
+        entries("documents")
+            .iter()
+            .all(|d| d["checkDocument"] == d["fromDocument"])
+    );
 }
 
 /// A JSON-shaped record: what Java wrote for `Price("x", 1.25, 2^64 - 1)`

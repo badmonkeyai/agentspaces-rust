@@ -22,6 +22,10 @@
 //! PINGs, and PULL_RESPs. It can close a link, stop listening, or accept links without ever
 //! reading them (a stalled far end).
 //!
+//! A [`RawPeer`] is the other way round: a scripted member (or stranger) that dials a listening
+//! peer, signs whatever a test sends (its own introduction, rumors, digests, relay frames, a third
+//! party's advertisement), and records the verified frames it receives.
+//!
 //! A *relaying* seed ([`FakeSeed::start_relay`]) also does what a seed does for the members of a
 //! group, so two or three peers can race through it: it re-signs every RUMOR one link carries
 //! and sends it to every other link (in order, per link), folds the space rumors into replicas
@@ -40,7 +44,8 @@ use agentspaces::clock::SharedClock;
 use agentspaces::group::GroupSpec;
 use agentspaces::peer::PeerConfig;
 use agentspaces::transport::memory::{MemoryListener, MemoryNetwork};
-use agentspaces::transport::{Channel, Closer, FrameReceiver, FrameSender, Listener};
+use agentspaces::transport::{Channel, Closer, Dialer, FrameReceiver, FrameSender, Listener};
+use agentspaces::wire::ads as wire_ads;
 use agentspaces::wire::bodies::{self, Rumor};
 use agentspaces::wire::cbor::{self, Map, Value};
 use agentspaces::wire::envelope::{self, Auth};
@@ -49,6 +54,7 @@ use agentspaces::wire::hlc::Hlc;
 use agentspaces::wire::identity::Identity;
 use agentspaces::wire::ids;
 use agentspaces::wire::revocation::Registry;
+use agentspaces::wire::seed::Seed;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -257,7 +263,9 @@ impl Relay {
         };
         let mut sync = Map::new();
         sync.insert("states", Value::Array(states));
-        sync.insert("claims", claims);
+        // Java writes a map's keys in the RFC 8949 order, and a receiver refuses another
+        // (SPEC §9.1 P2).
+        sync.insert("claims", cbor::canonical_map(&claims));
         cbor::encode(&Value::Map(sync))
     }
 }
@@ -324,7 +332,9 @@ impl FakeSeed {
     ) -> Self {
         let listener = network.listen(address);
         let state = Arc::new(Mutex::new(State::default()));
-        let hlc = Arc::new(Mutex::new(Hlc::new(identity.peer_id())));
+        let hlc = Arc::new(Mutex::new(
+            Hlc::new(identity.peer_id()).expect("a PeerID is a stamp node"),
+        ));
         let relay = relaying.then(|| {
             Arc::new(Relay {
                 identity: identity.clone(),
@@ -706,5 +716,178 @@ fn act_as_relay(relay: &Relay, state: &State, link: usize, env: &Map, frame: &[u
             }
         }
         _ => {}
+    }
+}
+
+// ------------------------------------------------------------------------------- raw peers
+
+/// A scripted peer on a link to a listening peer (see the [module docs](self)).
+pub struct RawPeer {
+    /// Its identity: it signs every frame it sends.
+    pub identity: Identity,
+    /// The GroupID its frames name.
+    pub group: String,
+    clock: SharedClock,
+    sender: FrameSender,
+    closer: Closer,
+    hlc: Mutex<Hlc>,
+    received: Arc<Mutex<Vec<Map>>>,
+    reader: JoinHandle<()>,
+}
+
+impl RawPeer {
+    /// Dials `address` on `network` as `identity`, for `group`.
+    pub async fn dial(
+        network: &MemoryNetwork,
+        address: &str,
+        identity: Identity,
+        group: &str,
+        clock: SharedClock,
+    ) -> RawPeer {
+        Self::dial_with(network.dialer(), address, identity, group, clock).await
+    }
+
+    /// [`RawPeer::dial`] over a link both ends attest, as `tls` does: the listener sees this
+    /// peer attested as `attested_as` (its own PeerID, or another to impersonate), and this peer
+    /// sees the listener as `listener`.
+    pub async fn dial_attested(
+        network: &MemoryNetwork,
+        address: &str,
+        identity: Identity,
+        group: &str,
+        clock: SharedClock,
+        listener: &str,
+        attested_as: &str,
+    ) -> RawPeer {
+        let mut dialer = network.dialer();
+        dialer.attest_as = Some((listener.to_owned(), attested_as.to_owned()));
+        Self::dial_with(dialer, address, identity, group, clock).await
+    }
+
+    async fn dial_with(
+        dialer: agentspaces::transport::memory::MemoryDialer,
+        address: &str,
+        identity: Identity,
+        group: &str,
+        clock: SharedClock,
+    ) -> RawPeer {
+        let seed: Seed = address.parse().expect("an address");
+        let channel = dialer
+            .dial(&seed, &identity, Duration::from_secs(1))
+            .await
+            .expect("the raw peer dials");
+        let Channel {
+            attested,
+            sender,
+            mut receiver,
+            closer,
+            ..
+        } = channel;
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&received);
+        let reader = tokio::spawn(async move {
+            while let Some(frame) = receiver.recv().await {
+                if let Some((env, _)) =
+                    envelope::decode_frame_detailed(&frame, attested.as_deref(), None)
+                {
+                    lock(&sink).push(env);
+                }
+            }
+        });
+        RawPeer {
+            hlc: Mutex::new(Hlc::new(identity.peer_id()).expect("a PeerID is a stamp node")),
+            identity,
+            group: group.to_owned(),
+            clock,
+            sender,
+            closer,
+            received,
+            reader,
+        }
+    }
+
+    /// Its PeerID.
+    pub fn peer_id(&self) -> &str {
+        self.identity.peer_id()
+    }
+
+    /// A frame it signs with a fresh stamp.
+    pub fn frame(&self, kind: &str, body: &[u8], to: Option<&str>) -> Vec<u8> {
+        let stamp = lock(&self.hlc).now(self.clock.now_ms());
+        let env = envelope::envelope(&self.group, kind, self.peer_id(), &stamp, body, to);
+        envelope::encode_frame(&env, &self.identity)
+    }
+
+    /// Sends raw bytes; whether the link took them.
+    pub async fn send_raw(&self, frame: Vec<u8>) -> bool {
+        self.sender.send(frame).await.is_ok()
+    }
+
+    /// Sends a frame it signs; whether the link took it.
+    pub async fn send(&self, kind: &str, body: &[u8], to: Option<&str>) -> bool {
+        let frame = self.frame(kind, body, to);
+        self.send_raw(frame).await
+    }
+
+    /// The `peers` payload of an advertisement `identity` signs for `group` with `hints`, issued
+    /// now.
+    pub fn signed_ad(&self, identity: &Identity, group: &str, hints: &Map) -> Vec<u8> {
+        let now = self.clock.now_ms();
+        let issued = agentspaces::wire::time::instant_iso(now.div_euclid(1000) * 1000);
+        let ad = wire_ads::peer_advertisement(group, identity, &issued, Some(hints));
+        wire_ads::signed_peer_ad(&ad, identity)
+    }
+
+    /// Sends a RUMOR on `stream` with `payload`.
+    pub async fn rumor(&self, stream: &str, item: &str, payload: &[u8]) -> bool {
+        let body = bodies::rumor_body(stream, item, bodies::RUMOR_HOPS, payload);
+        self.send(bodies::KIND_RUMOR, &body, None).await
+    }
+
+    /// Introduces itself: its own signed advertisement (with `hints`) on the `peers` stream.
+    pub async fn introduce(&self, hints: &Map) -> bool {
+        let payload = self.signed_ad(&self.identity, &self.group, hints);
+        let item = format!("peer:{}:{}", self.peer_id(), self.clock.now_ms());
+        self.rumor(bodies::STREAM_PEERS, &item, &payload).await
+    }
+
+    /// Every verified frame received so far.
+    pub fn received(&self) -> Vec<Map> {
+        lock(&self.received).clone()
+    }
+
+    /// The verified frames of `kind` received so far.
+    pub fn of_kind(&self, kind: &str) -> Vec<Map> {
+        self.received()
+            .into_iter()
+            .filter(|env| env.get("kind").and_then(Value::as_str) == Some(kind))
+            .collect()
+    }
+
+    /// Waits until `ready` holds over the frames received; panics naming `what` after
+    /// [`PATIENCE`].
+    pub async fn wait_for(&self, what: &str, ready: impl Fn(&[Map]) -> bool) {
+        let deadline = Instant::now() + PATIENCE;
+        while !ready(&lock(&self.received)) {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Whether its link has closed (either end).
+    pub fn is_closed(&self) -> bool {
+        self.closer.is_closed() || self.sender.is_closed()
+    }
+
+    /// Closes its link.
+    pub fn close(&self) {
+        self.closer.close();
+    }
+}
+
+impl Drop for RawPeer {
+    fn drop(&mut self) {
+        self.closer.close();
+        self.reader.abort();
     }
 }

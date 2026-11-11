@@ -20,7 +20,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use agentspaces::catalog::{CatalogError, FleetCatalog, Offering, Principal};
-use agentspaces::config::{self, Config, Origin};
+use agentspaces::config::Config;
 use agentspaces::keystore;
 use agentspaces::peer::{DEFAULT_AGENT_NAME, PeerCounters, PeerEvent};
 use agentspaces::remote::RemoteActions;
@@ -37,19 +37,7 @@ use crate::session::{self, Session, note};
 
 /// `aspace id`: the PeerID of the keystore, minted there when it holds none.
 pub fn id(global: &Global) -> Result<(), Failure> {
-    let (dir, origin) = match config::Config::keystore_from_vars(&global.overrides(), session::env)?
-    {
-        Some(found) => found,
-        None => match config::default_keystore(&session::env) {
-            Some(dir) => (dir, Origin::Default),
-            None => {
-                return Err(Failure::refused(
-                    "no keystore named and no HOME for the default ~/.config/agentspaces/keys; \
-                     pass --keystore <dir> or set ASPACE_KEYSTORE",
-                ));
-            }
-        },
-    };
+    let (dir, origin) = session::keystore_with_origin(global)?;
     let created = !dir.join(keystore::PRIVATE_FILE).exists();
     let identity = session::identity(Some(&dir), global.allow_readable_key)?;
     if created {

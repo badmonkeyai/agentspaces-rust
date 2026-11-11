@@ -6,7 +6,7 @@ This example puts Rust members on example 02's Java research fleet.
 - **`research.sh`**: a shell script that `aspace work` runs once per task, as the agent `script-worker`. It declares the same `research` action, using plain `sh` and `sed`.
 - **`aspace call`**: invokes `research` through the fleet catalogue, by the schema it consumes, and prints the `Finding` that answers it.
 
-Example 02's coordinator publishes the tasks and tallies the findings. The coordinator is the Java `ResearchFleet`, run from the installed `example-02-research-fleet` 0.5.0 jar.
+Example 02's coordinator publishes the tasks and tallies the findings. The coordinator is the Java `ResearchFleet`, run from the installed `example-02-research-fleet` 0.6.0 jar.
 
 The two workers declare the same action, so the catalogue folds them into one offering with two replicas. A call reaches whichever worker takes the task.
 
@@ -33,7 +33,7 @@ A Spring Boot or Micronaut host makes the same kind of seed, since their starter
 
 - Rust 1.99 (the workspace's `rust-toolchain.toml`).
 - A JDK 21 or later (`java`, or `JAVA_HOME`, or `JAVA=...`).
-- Maven, and the AgentSpaces 0.5.0 artifacts in `~/.m2`, including `ai.badmonkey.agentspaces:example-02-research-fleet:0.5.0`. Everything resolves offline (`mvn -o`).
+- Maven, and the AgentSpaces 0.6.0 artifacts in `~/.m2`, including `ai.badmonkey.agentspaces:example-02-research-fleet:0.6.0`. Everything resolves offline (`mvn -o`).
 - `python3` is optional: `run.sh` uses it to find free ports.
 
 ## Run it
