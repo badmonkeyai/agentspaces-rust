@@ -96,7 +96,7 @@
 #![warn(missing_docs)]
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 use crate::cbor::{self, Map, Value};
@@ -190,6 +190,11 @@ pub enum Refusal {
     /// A verified state or claim carries a stamp more than [`FAR_FUTURE_HOSTILE_MILLIS`] past
     /// `wall + MAX_DRIFT + SKEW_MARGIN` (SPEC §7.3, v0.1.30): `far-future stamp`.
     StampFarFuture,
+    /// The entry id holds a control character (U+0000 to U+001F, U+007F): under `wire.ae=2` a
+    /// replica drops such a state or claim, uncounted and unacknowledged, since its id could not
+    /// stand in a digest line (SPEC annex I.6, *Entry ids in the set*). The fold itself never
+    /// answers this; a replica that audits judges it before folding.
+    ControlId,
 }
 
 impl Refusal {
@@ -214,6 +219,7 @@ impl Refusal {
             Refusal::RecordPending => "record-pending",
             Refusal::StampLogical => "stamp-logical",
             Refusal::StampFarFuture => "stamp-far-future",
+            Refusal::ControlId => "control-id",
         }
     }
 }
@@ -497,7 +503,7 @@ fn dots_bound_to(dto: &Map, issuer_peer: &str) -> bool {
 
 /// The expiry of a state's lease: the joined register `leaseValue`, else the record's own
 /// `lease`.
-fn lease_expires_at(state: &Map) -> Option<i64> {
+pub fn lease_expires_at(state: &Map) -> Option<i64> {
     let expiry = |lease: Option<&Value>| lease?.get("expiresAtMillis")?.as_i64();
     expiry(state.get("leaseValue")).or_else(|| expiry(state.get("record")?.get("lease")))
 }
@@ -518,6 +524,18 @@ fn lease_holds(state: &Map, now_ms: i64) -> bool {
     }
 }
 
+/// Whether an entry is present and its write lease lapsed by `now_ms`: what keeps its state and
+/// claim lines out of the audited set (SPEC annex I.6). A lease of another kind never lapses.
+pub fn write_lease_lapsed(state: &Map, now_ms: i64) -> bool {
+    fn kind(lease: Option<&Value>) -> Option<&str> {
+        lease?.get("kind")?.as_str()
+    }
+    let kind = kind(state.get("leaseValue")).or_else(|| kind(state.get("record")?.get("lease")));
+    is_present(state)
+        && kind.is_none_or(|kind| kind == WRITE_LEASE_KIND)
+        && lease_expires_at(state).is_some_and(|expires| expires <= now_ms)
+}
+
 /// Java `EntryState.present`: not completed, and some add dot is not removed.
 ///
 /// Dots are `{replica, counter}` maps; malformed dots are ignored. The vote module reads this as
@@ -528,6 +546,23 @@ pub fn is_present(state: &Map) -> bool {
     }
     let removes: BTreeSet<DotKey<'_>> = dots(state.get("removes")).map(|(key, _)| key).collect();
     dots(state.get("adds")).any(|(key, _)| !removes.contains(&key))
+}
+
+/// Java `EntryState.removes().containsAll(adds())`: every well-formed add dot is also removed,
+/// the withdrawal of SPEC §7.2 whether or not the entry also completed.
+pub fn removes_cover_adds(state: &Map) -> bool {
+    let removes: BTreeSet<DotKey<'_>> = dots(state.get("removes")).map(|(key, _)| key).collect();
+    dots(state.get("adds")).all(|(key, _)| removes.contains(&key))
+}
+
+/// The writing nodes of a state (SPEC §7.3, *The per-entry horizon*): the replica each
+/// well-formed add dot names, each once, in dot order.
+pub fn add_replicas(state: &Map) -> Vec<&str> {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    dots(state.get("adds"))
+        .map(|(key, _)| key.0)
+        .filter(|replica| seen.insert(replica))
+        .collect()
 }
 
 /// `peer.py`'s `_union_dots`: the union of two dot lists, deduplicated by `(replica, counter)`
@@ -652,6 +687,109 @@ impl<V> Ordered<V> {
 // ---------------------------------------------------------------------------------------------
 // The store
 
+/// The most acknowledged lines one space keeps (SPEC §9.2 R7, §7.3): past it the least recently
+/// refused line is forgotten first.
+pub const ACK_CAP: usize = 8192;
+
+/// One acknowledged line: the entry it names, when it was last refused (its place in the order
+/// of refusals), and when it is forgotten.
+#[derive(Debug, Clone)]
+struct AckLine {
+    entry_id: String,
+    tick: u64,
+    forget_at: i64,
+}
+
+/// The lines a replica refused and acknowledges in its digest (`a:<line>`, SPEC §7.3, §9.2 R7):
+/// each stands in its entry's audited slot as the line itself (annex I.6). Bounded at
+/// [`ACK_CAP`] per space, the least recently refused forgotten first, and each forgotten at its
+/// own time.
+#[derive(Debug, Clone, Default)]
+struct AckBook {
+    lines: BTreeMap<String, AckLine>,
+    order: BTreeMap<u64, String>,
+    by_entry: BTreeMap<String, BTreeSet<String>>,
+    next: u64,
+}
+
+impl AckBook {
+    /// Acknowledges `line` of `entry_id`, most recently refused now and forgotten at
+    /// `forget_at`; whether it is new. Past the cap the least recently refused goes, its entry
+    /// pushed onto `evicted`.
+    fn acknowledge(
+        &mut self,
+        entry_id: &str,
+        line: &str,
+        forget_at: i64,
+        evicted: &mut Vec<String>,
+    ) -> bool {
+        let tick = self.next;
+        self.next = self.next.wrapping_add(1);
+        let new = match self.lines.get_mut(line) {
+            Some(held) => {
+                self.order.remove(&held.tick);
+                held.tick = tick;
+                held.forget_at = forget_at;
+                false
+            }
+            None => {
+                self.lines.insert(
+                    line.to_owned(),
+                    AckLine {
+                        entry_id: entry_id.to_owned(),
+                        tick,
+                        forget_at,
+                    },
+                );
+                self.by_entry
+                    .entry(entry_id.to_owned())
+                    .or_default()
+                    .insert(line.to_owned());
+                true
+            }
+        };
+        self.order.insert(tick, line.to_owned());
+        while self.order.len() > ACK_CAP {
+            if let Some((_, oldest)) = self.order.pop_first()
+                && let Some(entry) = self.drop_line(&oldest)
+            {
+                evicted.push(entry);
+            }
+        }
+        new
+    }
+
+    fn drop_line(&mut self, line: &str) -> Option<String> {
+        let held = self.lines.remove(line)?;
+        self.order.remove(&held.tick);
+        if let Some(lines) = self.by_entry.get_mut(&held.entry_id) {
+            lines.remove(line);
+            if lines.is_empty() {
+                self.by_entry.remove(&held.entry_id);
+            }
+        }
+        Some(held.entry_id)
+    }
+
+    /// Forgets every line whose time has come; the entries of the lines that went.
+    fn forget(&mut self, now_ms: i64) -> Vec<String> {
+        let due: Vec<String> = self
+            .lines
+            .iter()
+            .filter(|(_, held)| held.forget_at <= now_ms)
+            .map(|(line, _)| line.clone())
+            .collect();
+        due.iter().filter_map(|line| self.drop_line(line)).collect()
+    }
+
+    fn of(&self, entry_id: &str) -> impl Iterator<Item = &str> {
+        self.by_entry
+            .get(entry_id)
+            .into_iter()
+            .flat_map(|lines| lines.iter().map(String::as_str))
+    }
+}
+
 /// One entry's state as the store holds it.
 #[derive(Debug, Clone)]
 struct Held {
@@ -677,7 +815,22 @@ pub struct SpaceStore {
     stamps_logical_refused: u64,
     stamps_far_future_refused: u64,
     stamps_far_future_deferred: u64,
+    generation: u64,
+    acks: AckBook,
+    /// This store's own number, so a mirror of its audited set knows the store it mirrors.
+    instance: u64,
+    /// The entries whose audited slot may have changed since a mirror last took them.
+    audit_dirty: HashSet<String>,
+    /// More changed than [`AUDIT_DIRTY_MAX`] entries: a mirror derives every slot again.
+    audit_dirty_all: bool,
 }
+
+/// The changed entries a store remembers for its audit mirror at most; past it the mirror
+/// derives every slot again.
+pub const AUDIT_DIRTY_MAX: usize = 1 << 16;
+
+/// The source of [`SpaceStore`] instance numbers.
+static STORE_INSTANCES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl fmt::Debug for SpaceStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -688,6 +841,7 @@ impl fmt::Debug for SpaceStore {
             .field("refused_inserts", &self.refused_inserts)
             .field("refused_offers", &self.refused_offers.len())
             .field("deferred_offers", &self.deferred_offers.len())
+            .field("acks", &self.acks.lines.len())
             .finish()
     }
 }
@@ -716,6 +870,172 @@ impl SpaceStore {
             stamps_logical_refused: 0,
             stamps_far_future_refused: 0,
             stamps_far_future_deferred: 0,
+            generation: 0,
+            acks: AckBook::default(),
+            instance: STORE_INSTANCES.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            audit_dirty: HashSet::new(),
+            audit_dirty_all: false,
+        }
+    }
+
+    /// Notes that an entry's audited slot may have changed, and moves the generation.
+    fn touch(&mut self, entry_id: &str) {
+        self.generation = self.generation.wrapping_add(1);
+        if self.audit_dirty_all {
+            return;
+        }
+        if self.audit_dirty.len() >= AUDIT_DIRTY_MAX {
+            self.audit_dirty_all = true;
+            self.audit_dirty.clear();
+            return;
+        }
+        self.audit_dirty.insert(entry_id.to_owned());
+    }
+
+    /// Takes the entries whose audited slot may have changed since the last take: `None` when
+    /// too many changed to remember, so every slot must be derived again.
+    fn take_audit_changes(&mut self) -> Option<Vec<String>> {
+        let all = std::mem::take(&mut self.audit_dirty_all);
+        let changed: Vec<String> = self.audit_dirty.drain().collect();
+        (!all).then_some(changed)
+    }
+
+    /// One entry's audited slot at `now_ms` ([`SpaceStore::audit_slots`]) and, for a present
+    /// entry whose write lease has not lapsed yet, the time it lapses, when the slot changes
+    /// again with nothing folded.
+    pub fn audit_slot(&self, entry_id: &str, now_ms: i64) -> (Vec<String>, Option<i64>) {
+        let acks: Vec<String> = self.acks.of(entry_id).map(str::to_owned).collect();
+        let held = self.states.get(entry_id).map(|held| &held.joined);
+        let state = held.map(crate::serving::state_hash);
+        let claim = self.claims.get(entry_id).map(|signed| {
+            signed
+                .get("claim")
+                .and_then(Value::as_map)
+                .map(crate::serving::claim_hash)
+                .unwrap_or_default()
+        });
+        let lapsed = held.is_some_and(|joined| write_lease_lapsed(joined, now_ms));
+        let source = crate::trie::SlotSource {
+            id: entry_id,
+            state: state.as_deref(),
+            claim: claim.as_deref(),
+            lapsed,
+            acks: &acks,
+            ..crate::trie::SlotSource::default()
+        };
+        let lapses_at = held
+            .filter(|joined| !lapsed && is_present(joined))
+            .filter(|joined| write_lease_lapsed(joined, i64::MAX))
+            .and_then(lease_expires_at);
+        (source.lines(), lapses_at)
+    }
+
+    /// A counter that moves whenever a state or a claim is added, changed, or removed, so a
+    /// caller that derives something from the store (the audited set of SPEC annex I.6) knows
+    /// when to derive it again.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The store's audited slots at `now_ms` (SPEC annex I.6, *The audited set*): per entry id,
+    /// its state line and its claim line, except that a present entry whose write lease lapsed
+    /// contributes neither, each line it acknowledges standing as the line itself
+    /// ([`SpaceStore::acknowledge`]), and an id holding a control character contributes nothing.
+    /// This store keeps no shard-dropped lines.
+    pub fn audit_slots(&self, now_ms: i64) -> Vec<(&str, Vec<String>)> {
+        self.audit_ids()
+            .map(|entry_id| (entry_id, self.audit_slot(entry_id, now_ms).0))
+            .collect()
+    }
+
+    /// Every entry id that may hold an audited slot: each held state, each claim without one,
+    /// and each acknowledged entry holding neither, once.
+    fn audit_ids(&self) -> impl Iterator<Item = &str> {
+        let states = self.states.iter().map(|(entry_id, _)| entry_id);
+        let claims = self
+            .claims
+            .iter()
+            .map(|(entry_id, _)| entry_id)
+            .filter(|entry_id| self.states.get(entry_id).is_none());
+        let acks = self
+            .acks
+            .by_entry
+            .keys()
+            .map(String::as_str)
+            .filter(|entry_id| {
+                self.states.get(entry_id).is_none() && self.claims.get(entry_id).is_none()
+            });
+        states.chain(claims).chain(acks)
+    }
+
+    /// Acknowledges a line this replica refused for `entry_id` (`e:<id>=<stateHash>` or
+    /// `c:<id>=<claimHash>`, SPEC §7.3, §9.2 R7), so a partner reads it as held and stops
+    /// re-offering it: the digest writes it as `a:<line>` ([`SpaceStore::acknowledged`]) and the
+    /// audited set holds it as the line itself. Refusing it again makes it the most recent and
+    /// moves its time to `forget_at`. At most [`ACK_CAP`] lines are kept, the least recently
+    /// refused forgotten first. Answers whether the line is new.
+    pub fn acknowledge(&mut self, entry_id: &str, line: &str, forget_at: i64) -> bool {
+        let mut evicted = Vec::new();
+        let new = self
+            .acks
+            .acknowledge(entry_id, line, forget_at, &mut evicted);
+        if new {
+            self.touch(entry_id);
+        }
+        for entry in evicted {
+            self.touch(&entry);
+        }
+        new
+    }
+
+    /// Forgets the acknowledged lines whose time has come at `now_ms`; how many went.
+    pub fn forget_acknowledged(&mut self, now_ms: i64) -> usize {
+        let gone = self.acks.forget(now_ms);
+        for entry in &gone {
+            self.touch(entry);
+        }
+        gone.len()
+    }
+
+    /// Every acknowledged line (without its `a:` prefix), in no particular order.
+    pub fn acknowledged(&self) -> impl Iterator<Item = &str> {
+        self.acks.lines.keys().map(String::as_str)
+    }
+
+    /// Whether `line` is acknowledged.
+    pub fn is_acknowledged(&self, line: &str) -> bool {
+        self.acks.lines.contains_key(line)
+    }
+
+    /// How many lines are acknowledged.
+    pub fn acknowledged_count(&self) -> usize {
+        self.acks.lines.len()
+    }
+
+    /// Whether `dto` is a state this store would merge: authentic (record and transition
+    /// verify), its actor not revoked, and its stamps acceptable and not far in the future
+    /// (checks 1 to 11 of [`SpaceStore::fold_state`]), without merging it. A door that refuses a
+    /// state past its horizon acknowledges it only when this holds (SPEC §7.3). A recordless
+    /// state is judged over the record this store holds, and is refused without one.
+    pub fn judge(&self, dto: &Map, ctx: &FoldContext<'_>) -> Result<(), Refusal> {
+        if crate::records::is_recordless(dto) {
+            let entry_id = crate::records::state_entry_id(dto).ok_or(Refusal::Malformed)?;
+            let record = self
+                .states
+                .get(entry_id)
+                .and_then(|held| held.signed.get("record"))
+                .and_then(Value::as_map)
+                .ok_or(Refusal::RecordPending)?;
+            let full = crate::records::with_record(dto, record).ok_or(Refusal::Malformed)?;
+            return self.judge(&full, ctx);
+        }
+        self.judge_state(dto, ctx)?;
+        let issued = dto.get("record").and_then(|record| record.get("issued"));
+        let stamps = [issued, dto.get("leaseStamp"), dto.get("signedAt")];
+        match stamp_verdict(stamps, ctx.now_ms) {
+            StampVerdict::Merge => Ok(()),
+            StampVerdict::Defer => Err(Refusal::StampFarFuture),
+            StampVerdict::Refuse(refusal) => Err(refusal),
         }
     }
 
@@ -856,8 +1176,12 @@ impl SpaceStore {
     /// Removes an entry's state and claim (a collected tombstone, a lapsed entry), returning its
     /// joined state. A removed entry folds again as new.
     pub fn remove(&mut self, entry_id: &str) -> Option<Map> {
-        self.claims.remove(entry_id);
-        self.states.remove(entry_id).map(|held| held.joined)
+        let claim = self.claims.remove(entry_id);
+        let state = self.states.remove(entry_id).map(|held| held.joined);
+        if claim.is_some() || state.is_some() {
+            self.touch(entry_id);
+        }
+        state
     }
 
     /// Folds one received state DTO (`peer.py`'s `_fold`): authenticated (record and transition),
@@ -940,6 +1264,7 @@ impl SpaceStore {
                 held.signed = dto.clone();
             }
             return if joined_changed || advanced {
+                self.touch(entry_id);
                 FoldOutcome::Applied
             } else {
                 FoldOutcome::Unchanged
@@ -953,6 +1278,7 @@ impl SpaceStore {
             signed: dto.clone(),
         };
         self.states.push(entry_id, held);
+        self.touch(entry_id);
         FoldOutcome::Applied
     }
 
@@ -1019,12 +1345,14 @@ impl SpaceStore {
                 return FoldOutcome::Unchanged;
             }
             *current = winner;
+            self.touch(entry_id);
             return FoldOutcome::Applied;
         }
         if self.claims.len() >= self.max_entries {
             return self.refuse_insert();
         }
         self.claims.push(entry_id, signed.clone());
+        self.touch(entry_id);
         FoldOutcome::Applied
     }
 
@@ -1062,9 +1390,50 @@ impl SpaceStore {
         FoldOutcome::Refused(Refusal::Full)
     }
 
+    /// Whether `dto`, a completed state, is the authentic completion of the holder of `claim` (a
+    /// signed claim that verified on its own): the record and the transition verify with the
+    /// completion signed by that claim's holder, that holder is not revoked, and the claim names
+    /// this entry and space. Judged as [`SpaceStore::fold_state`] judges a completion, but under
+    /// the given claim rather than the claim this store holds, which is how a replica whose own
+    /// claim displaced that holder's recognizes the completion it dropped (SPEC §7.4, the settle
+    /// guarantee). A recordless state is judged over the record this store holds.
+    pub fn authenticates_completion_under(
+        &self,
+        dto: &Map,
+        claim: &Map,
+        ctx: &FoldContext<'_>,
+    ) -> bool {
+        if !is_completed(dto) {
+            return false;
+        }
+        if crate::records::is_recordless(dto) {
+            let Some(full) = crate::records::state_entry_id(dto)
+                .and_then(|entry_id| self.states.get(entry_id))
+                .and_then(|held| held.signed.get("record"))
+                .and_then(Value::as_map)
+                .and_then(|record| crate::records::with_record(dto, record))
+            else {
+                return false;
+            };
+            return self.judge_state_under(&full, ctx, Some(claim)).is_ok();
+        }
+        self.judge_state_under(dto, ctx, Some(claim)).is_ok()
+    }
+
     /// `peer.py`'s `_verify_state` and `_refused_for_revocation`, with Java's shape checks; the
     /// entry id of an admitted state.
     fn judge_state<'d>(&self, dto: &'d Map, ctx: &FoldContext<'_>) -> Result<&'d str, Refusal> {
+        self.judge_state_under(dto, ctx, None)
+    }
+
+    /// [`SpaceStore::judge_state`], a completion authenticated against `claim` when given and
+    /// against the claim held otherwise.
+    fn judge_state_under<'d>(
+        &self,
+        dto: &'d Map,
+        ctx: &FoldContext<'_>,
+        claim: Option<&Map>,
+    ) -> Result<&'d str, Refusal> {
         if dot_list(dto, "adds").len() > MAX_DOTS_PER_STATE
             || dot_list(dto, "removes").len() > MAX_DOTS_PER_STATE
         {
@@ -1103,7 +1472,9 @@ impl SpaceStore {
         }
         let completed = is_completed(dto);
         let (party, party_key, party_attested) = if completed {
-            let signed = self.claims.get(entry_id).ok_or(Refusal::NoClaim)?;
+            let signed = claim
+                .or_else(|| self.claims.get(entry_id))
+                .ok_or(Refusal::NoClaim)?;
             let claim = signed
                 .get("claim")
                 .and_then(Value::as_map)
@@ -1141,7 +1512,7 @@ impl SpaceStore {
         if !verify_state_signature(dto, party, party_key, party_attested, ctx.now_ms) {
             return Err(Refusal::UnverifiedState);
         }
-        if self.refused_for_revocation(dto, entry_id, issuer, completed, ctx.revocations) {
+        if self.refused_for_revocation(dto, entry_id, issuer, completed, ctx.revocations, claim) {
             return Err(Refusal::Revoked);
         }
         Ok(entry_id)
@@ -1160,9 +1531,10 @@ impl SpaceStore {
         issuer: &str,
         completed: bool,
         registry: &Registry,
+        claim: Option<&Map>,
     ) -> bool {
         if completed {
-            let Some(signed) = self.claims.get(entry_id) else {
+            let Some(signed) = claim.or_else(|| self.claims.get(entry_id)) else {
                 return false;
             };
             let Some(holder) = signed
@@ -1264,6 +1636,87 @@ impl SpaceStore {
             }
         }
         Ok(verdict)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The audit mirror
+
+/// A space's audited set (SPEC annex I.6) kept as a trie in step with its store: each sync
+/// derives again only the slots of the entries the store changed since the last one and of the
+/// entries whose write lease lapsed since, so its cost follows what moved, not the size of the
+/// space. Only the first sync, a sync against another store, or a store that changed more entries
+/// than it remembers ([`AUDIT_DIRTY_MAX`]) derives every slot.
+#[derive(Debug, Default)]
+pub struct AuditMirror {
+    trie: crate::trie::AuditTrie,
+    store: Option<u64>,
+    /// Present entries whose write lease has yet to lapse, by the time it lapses.
+    lapses: BTreeSet<(i64, String)>,
+    lapse_of: HashMap<String, i64>,
+    derived: u64,
+}
+
+impl AuditMirror {
+    /// An empty mirror, of no store yet.
+    pub fn new() -> Self {
+        AuditMirror::default()
+    }
+
+    /// Brings the trie in step with `store` at `now_ms` and answers it.
+    pub fn sync(&mut self, store: &mut SpaceStore, now_ms: i64) -> &mut crate::trie::AuditTrie {
+        let changes = store.take_audit_changes();
+        match changes {
+            Some(changed) if self.store == Some(store.instance) => {
+                let mut ids: BTreeSet<String> = changed.into_iter().collect();
+                while let Some((at, _)) = self.lapses.first() {
+                    if *at > now_ms {
+                        break;
+                    }
+                    if let Some((_, id)) = self.lapses.pop_first() {
+                        self.lapse_of.remove(&id);
+                        ids.insert(id);
+                    }
+                }
+                for id in ids {
+                    self.derive(store, &id, now_ms);
+                }
+            }
+            _ => {
+                self.trie.clear();
+                self.lapses.clear();
+                self.lapse_of.clear();
+                self.store = Some(store.instance);
+                let ids: Vec<String> = store.audit_ids().map(str::to_owned).collect();
+                for id in ids {
+                    self.derive(store, &id, now_ms);
+                }
+            }
+        }
+        &mut self.trie
+    }
+
+    /// The trie as last synced.
+    pub fn trie(&mut self) -> &mut crate::trie::AuditTrie {
+        &mut self.trie
+    }
+
+    /// How many slots its syncs derived, in all.
+    pub fn slots_derived(&self) -> u64 {
+        self.derived
+    }
+
+    fn derive(&mut self, store: &SpaceStore, entry_id: &str, now_ms: i64) {
+        let (lines, lapses_at) = store.audit_slot(entry_id, now_ms);
+        self.derived += 1;
+        self.trie.put(entry_id, lines);
+        if let Some(at) = self.lapse_of.remove(entry_id) {
+            self.lapses.remove(&(at, entry_id.to_owned()));
+        }
+        if let Some(at) = lapses_at {
+            self.lapses.insert((at, entry_id.to_owned()));
+            self.lapse_of.insert(entry_id.to_owned(), at);
+        }
     }
 }
 

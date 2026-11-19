@@ -404,7 +404,7 @@ fn a_ui_component_role_outside_the_three_is_refused() {
 fn the_app_card_with_a_host_matches_java() {
     let ui = app_card_ui(
         "a2ui",
-        "v0.9.1",
+        "1.0",
         &["example-widgets", "agentspaces-viz"],
         "summariser",
         "views",
@@ -564,7 +564,7 @@ fn the_app_card_refuses_what_the_record_refuses() {
     assert_eq!(
         defaulted,
         cbor_map! {
-            "protocol" => "a2ui", "version" => "v0.9.1", "catalogIds" => Vec::<Value>::new(),
+            "protocol" => "a2ui", "version" => "1.0", "catalogIds" => Vec::<Value>::new(),
             "agent" => "", "transport" => "views", "surfaces" => Vec::<Value>::new(),
         }
         .into_map()

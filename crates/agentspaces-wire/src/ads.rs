@@ -514,8 +514,8 @@ pub fn card_action(
 
 /// The UI protocol a declaration names by default.
 pub const UI_PROTOCOL: &str = "a2ui";
-/// The A2UI version a declaration names by default.
-pub const UI_VERSION: &str = "v0.9.1";
+/// The A2UI version a declaration names by default (A2UI 1.0, as Java's `UiDeclaration.VERSION`).
+pub const UI_VERSION: &str = "1.0";
 /// The roles a ui component may have: a self-standing block, an input, one line in a list.
 pub use crate::schema::UI_ROLES;
 

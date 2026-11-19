@@ -141,6 +141,7 @@ impl From<SpaceError> for Failure {
             | SpaceError::Entry(_)
             | SpaceError::UnknownEntry(_)
             | SpaceError::NotHeld(_)
+            | SpaceError::CompletedByDisplaced(_)
             | SpaceError::LeaseLapsed(_)
             | SpaceError::Refused { .. } => Failure::refused(message),
             _ => Failure::error(message),

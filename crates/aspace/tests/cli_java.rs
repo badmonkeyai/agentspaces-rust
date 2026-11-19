@@ -84,7 +84,7 @@ const VISIT: Duration = Duration::from_secs(40);
 const DEADLINE: Duration = Duration::from_secs(30);
 
 /// Every variable the configuration reads, removed from each `aspace` run first.
-const CONFIG_VARIABLES: [&str; 13] = [
+const CONFIG_VARIABLES: [&str; 14] = [
     "ASPACE_SEEDS",
     "ASPACE_INVITE",
     "ASPACE_LISTEN",
@@ -98,6 +98,7 @@ const CONFIG_VARIABLES: [&str; 13] = [
     "ASPACE_SOCKET",
     "XDG_CONFIG_HOME",
     "HOME",
+    "ASPACE_ANTI_ENTROPY_PERIOD_MILLIS",
 ];
 
 // ------------------------------------------------------------------------------ preparing

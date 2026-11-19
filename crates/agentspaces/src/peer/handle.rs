@@ -115,6 +115,10 @@ impl Peer {
             fetched_block_bytes,
             space_max_bytes,
             listen: listen_config,
+            audit,
+            audit_budget,
+            horizon,
+            horizon_engage_rounds,
         } = config;
         let (group_id, founding, joining) = resolve_group(&group)?;
         let listening = !listen_config.listeners.is_empty();
@@ -143,7 +147,9 @@ impl Peer {
             send_stall_timeout,
         )
         .with_bounds(space_max_entries, fetched_block_bytes)
-        .with_listen(space_max_bytes, &listen_config);
+        .with_listen(space_max_bytes, &listen_config)
+        .with_audit(audit, audit_budget)
+        .with_horizon(horizon, horizon_engage_rounds);
         let bound = listen::bind(&listen_config.listeners, &identity).await?;
         let listen_addrs: Arc<[Seed]> = bound.iter().filter_map(listen::listen_seed).collect();
         let seeds = actor::expand_seeds(&seeds, &dialers, settings.dial_timeout).await;
@@ -496,6 +502,24 @@ impl Peer {
             .unwrap_or_default()
     }
 
+    /// Collects every open space's tombstones past their horizon now (SPEC §7.3), as the
+    /// collection timer does every few seconds; answers how many entries (and orphaned claims)
+    /// went.
+    pub async fn collect_now(&self) -> usize {
+        self.call(|actor| actor.collect_now()).await.unwrap_or(0)
+    }
+
+    /// Where a space stands on the per-entry horizon of SPEC §7.3, judged now from this peer's
+    /// view (a judgement counts at most one round per gossip period, as the sweep's do); `None`
+    /// when the space was never opened.
+    pub async fn space_horizon(&self, space: &str) -> Option<super::HorizonStatus> {
+        let space = space.to_owned();
+        self.call(move |actor| actor.space_horizon(&space))
+            .await
+            .ok()
+            .flatten()
+    }
+
     /// The winning signed claims of a space, by entry id.
     pub async fn space_claims(&self, space: &str) -> Vec<(String, Map)> {
         let space = space.to_owned();
@@ -717,12 +741,13 @@ impl Peer {
         entry_id: &str,
         holder: &str,
         epoch: i64,
+        agent: Option<AgentIdentity>,
     ) -> Result<Option<EntryView>, SpaceError> {
         let space = space.to_owned();
         let entry_id = entry_id.to_owned();
         let holder = holder.to_owned();
         Ok(self
-            .call(move |actor| actor.space_settle(&space, &entry_id, &holder, epoch))
+            .call(move |actor| actor.space_settle(&space, &entry_id, &holder, epoch, agent))
             .await?)
     }
 

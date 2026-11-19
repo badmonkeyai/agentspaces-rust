@@ -135,13 +135,16 @@ impl WatchQueue {
         self.expires_at.load(Ordering::SeqCst) <= now_ms
     }
 
-    /// Moves the lapse to `expires_at`, unless the watch has ended or lapsed at `now_ms`.
+    /// Moves the lapse to `expires_at` unless that is earlier than it already is (a renewal
+    /// never shortens a lease, SPEC §7.2), unless the watch has ended or lapsed at `now_ms`. The
+    /// read and the write are one step under the queue's lock, so two renewals at once cannot
+    /// leave the shorter one in force.
     fn renew(&self, expires_at: i64, now_ms: i64) -> bool {
         let state = self.lock();
         if state.closed.is_some() || self.lapsed(now_ms) {
             return false;
         }
-        self.expires_at.store(expires_at, Ordering::SeqCst);
+        self.expires_at.fetch_max(expires_at, Ordering::SeqCst);
         true
     }
 
@@ -248,8 +251,10 @@ impl Subscription {
         Self { queue, clock, task }
     }
 
-    /// Extends the lease to `lease` from now; [`SpaceError::SubscriptionClosed`] when it has
-    /// already lapsed or been closed (Java `Subscription.renew`).
+    /// Extends the lease to at least `lease` from now, never shortening it: the new lapse is
+    /// `max(current, now + lease)` (SPEC §7.2; close the subscription to stop it sooner);
+    /// [`SpaceError::SubscriptionClosed`] when it has already lapsed or been closed (Java
+    /// `Subscription.renew`).
     pub fn renew(&self, lease: Lease) -> Result<(), SpaceError> {
         let now = self.clock.now_ms();
         let expires_at = now.saturating_add(lease.millis());
@@ -258,6 +263,11 @@ impl Subscription {
         } else {
             Err(SpaceError::SubscriptionClosed)
         }
+    }
+
+    /// When the subscription's lease lapses, epoch milliseconds on the peer's clock.
+    pub fn expires_at_millis(&self) -> i64 {
+        self.queue.expires_at.load(Ordering::SeqCst)
     }
 
     /// Ends the subscription at once; events still queued are not delivered. Idempotent.

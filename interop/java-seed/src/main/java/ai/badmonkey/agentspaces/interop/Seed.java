@@ -29,6 +29,7 @@ import ai.badmonkey.agentspaces.api.ad.GroupAdvertisement;
 import ai.badmonkey.agentspaces.api.ad.PeerAdvertisement;
 import ai.badmonkey.agentspaces.api.entry.EntryId;
 import ai.badmonkey.agentspaces.api.space.ConflictStrategyType;
+import ai.badmonkey.agentspaces.api.space.EntryHandle;
 import ai.badmonkey.agentspaces.api.space.Lease;
 import ai.badmonkey.agentspaces.api.error.LeaseExpiredException;
 import ai.badmonkey.agentspaces.api.space.Space;
@@ -36,6 +37,7 @@ import ai.badmonkey.agentspaces.api.space.TakenEntry;
 import ai.badmonkey.agentspaces.api.space.Template;
 import ai.badmonkey.agentspaces.common.codec.CborCodec;
 import ai.badmonkey.agentspaces.common.id.GroupId;
+import ai.badmonkey.agentspaces.common.id.PeerId;
 import ai.badmonkey.agentspaces.discovery.DiscoveryService;
 import ai.badmonkey.agentspaces.identity.PeerIdentity;
 import ai.badmonkey.agentspaces.peering.membership.GroupMembership;
@@ -71,6 +73,13 @@ import java.util.concurrent.ConcurrentHashMap;
  * <pre>
  *   members                        {"members":["z...", ...]}
  *   write-task TOPIC PRIORITY      {"written":"TOPIC"}
+ *   write-tasks PREFIX COUNT       {"written":COUNT}  writes Task(PREFIX + n, n) for n below COUNT
+ *   audit                          {"roundsAudited":n,"sessionsOpened":n,"rootsAnswered":n,
+ *                                  "requestsAnswered":n,"requestsSent":n,"answersReceived":n,
+ *                                  "idsFetched":n,"fetchesAnswered":n,"budgetedAnswers":n,
+ *                                  "refusals":{"REASON":n, ...},"forms":{"PEER":"TREE"|"HASHED"|"TEXT"}}
+ *                                  (the trie audit's signals of SPEC annex I.6, and the form a
+ *                                  round toward each member takes now)
  *   tasks                          {"tasks":[{"topic":..,"priority":..}, ...]}
  *   results                        {"results":[{"topic":..,"summary":..,"worker":..}, ...]}
  *   take-task TIMEOUT_MS WORKER    {"took":"TOPIC"} or {"took":null}  (completes with a Result)
@@ -150,6 +159,19 @@ import java.util.concurrent.ConcurrentHashMap;
  *                                  first available action consuming Task and producing Result
  *                                  whose declared name, planner name, agent, or agent local name is
  *                                  SELECTOR, with Task(TOPIC, PRIORITY); null at the timeout
+ *   horizon PEER                   {"mode":"LEGACY"|"WAITING"|"SETTLING"|"PER_ENTRY","engagements":n,
+ *                                  "settlements":n,"disengagements":n,"selfHinted":bool,
+ *                                  "peerHinted":bool,"maxLease":n}  sweeps the space first, so the
+ *                                  mode is judged now (the per-entry horizon of SPEC §7.3), and
+ *                                  says whether this node and PEER's current card carry
+ *                                  wire.horizon=1
+ *   settle                         {"duplicateCompletions":n}  the entries this replica completed
+ *                                  with its own work whose displaced rival's completion arrived
+ *                                  afterwards (the settle guarantee of SPEC §7.4)
+ *   expiry TOPIC                   {"topic":..,"expiry":n|null}  the write lease expiry this
+ *                                  replica holds for the task, epoch milliseconds
+ *   renew TOPIC SECONDS            {"renewed":..,"expiry":n}  renews the seed's own task by
+ *                                  SECONDS through its EntryHandle (SPEC §7.2: never shorter)
  *   quit                           exits
  * </pre>
  *
@@ -158,7 +180,12 @@ import java.util.concurrent.ConcurrentHashMap;
  * transitions with their actors, for {@code task-state}).
  *
  * Arguments: {@code port [--tls] [--require-attestation] [--channel-auth SIGNED|ATTESTED|SESSION]
- * [--founding TEXT] [--space NAME] [--settle-ms N] [--blocks] [--dial HOST:PORT]}. {@code --blocks}
+ * [--founding TEXT] [--space NAME] [--settle-ms N] [--blocks] [--dial HOST:PORT] [--no-audit]
+ * [--no-horizon] [--engage-rounds N]}. {@code --no-horizon} keeps the legacy collection horizon of
+ * SPEC §7.3 and advertises no {@code wire.horizon} hint; {@code --engage-rounds N} sets the fully
+ * hinted rounds before the per-entry horizon engages (3 by default).
+ * {@code --no-audit} turns the trie audit of SPEC annex I.6 off: the node advertises no
+ * {@code wire.ae} hint and reconciles by the digest forms of v0.1.34, as a 0.6.0 member does. {@code --blocks}
  * gives the space a {@link BlockExchange}, as the Spring starter does: payloads over the inline
  * limit (64 KiB) are fetched from their writer in the background and held and served here. The
  * first line printed is
@@ -278,6 +305,9 @@ public final class Seed {
         long settleMs = 200;
         boolean withBlocks = false;
         String dial = null;
+        boolean audit = true;
+        boolean horizon = true;
+        int engageRounds = 3;
         for (int i = 1; i < args.length; i++) {
             switch (args[i]) {
                 case "--tls" -> tls = true;
@@ -288,11 +318,15 @@ public final class Seed {
                 case "--settle-ms" -> settleMs = Long.parseLong(args[++i]);
                 case "--blocks" -> withBlocks = true;
                 case "--dial" -> dial = args[++i];
+                case "--no-audit" -> audit = false;
+                case "--no-horizon" -> horizon = false;
+                case "--engage-rounds" -> engageRounds = Integer.parseInt(args[++i]);
                 default -> throw new IllegalArgumentException("unknown argument " + args[i]);
             }
         }
         PeerIdentity identity = PeerIdentity.generate();
-        PeerNode node = PeerNode.builder(identity).requireAttestation(require).channelAuth(auth).build();
+        PeerNode node = PeerNode.builder(identity).requireAttestation(require).channelAuth(auth)
+                .audit(audit).horizon(horizon).build();
         List<PeerAdvertisement.Endpoint> seeds = List.of();
         if (dial == null) {
             node.listen(tls ? new TlsTcpTransport(identity) : new TcpTransport(), "127.0.0.1:" + port);
@@ -318,6 +352,8 @@ public final class Seed {
             spaceBuilder.blocks(new BlockExchange(runtime, CborCodec.defaultCodec()));
         }
         ReplicatedSpace space = spaceBuilder.build();
+        space.horizonEngageRounds(engageRounds);
+        Map<String, EntryHandle> handles = new ConcurrentHashMap<>();
         // The Java worker layer over the same group and space (bind-agent, remote-actions, invoke):
         // agents sign with renewing subordinate keys, as the Spring starter mints them, unless
         // bound peer-signed.
@@ -365,9 +401,43 @@ public final class Seed {
                         trim(out).append("]}");
                         System.out.println(out);
                     }
+                    case "write-tasks" -> {
+                        String prefix = cmd[1];
+                        int count = Integer.parseInt(cmd[2]);
+                        for (int n = 0; n < count; n++) {
+                            String topic = prefix + n;
+                            taskIds.put(topic, space.write(new Task(topic, n), Lease.of(Duration.ofMinutes(30)))
+                                    .entryId());
+                        }
+                        System.out.println("{\"written\":" + count + "}");
+                    }
+                    case "audit" -> {
+                        var signals = runtime.gossip().auditSignals();
+                        StringBuilder out = new StringBuilder("{\"roundsAudited\":" + signals.roundsAudited()
+                                + ",\"sessionsOpened\":" + signals.sessionsOpened()
+                                + ",\"rootsAnswered\":" + signals.rootsAnswered()
+                                + ",\"requestsAnswered\":" + signals.requestsAnswered()
+                                + ",\"requestsSent\":" + signals.requestsSent()
+                                + ",\"answersReceived\":" + signals.answersReceived()
+                                + ",\"idsFetched\":" + signals.idsFetched()
+                                + ",\"fetchesAnswered\":" + signals.fetchesAnswered()
+                                + ",\"budgetedAnswers\":" + signals.budgetedAnswers()
+                                + ",\"refusals\":{");
+                        signals.refusals().forEach((reason, n) -> out.append(q(reason)).append(':').append(n)
+                                .append(','));
+                        trim(out).append("},\"forms\":{");
+                        runtime.membership().allMembers().stream()
+                                .filter(m -> !m.id().equals(identity.peerId()))
+                                .forEach(m -> out.append(q(m.id().value())).append(':')
+                                        .append(q(runtime.gossip().formToward(m.id()).name())).append(','));
+                        trim(out).append("}}");
+                        System.out.println(out);
+                    }
                     case "write-task" -> {
-                        EntryId written = space.write(new Task(cmd[1], Integer.parseInt(cmd[2])),
-                                Lease.of(Duration.ofMinutes(30))).entryId();
+                        var handle = space.write(new Task(cmd[1], Integer.parseInt(cmd[2])),
+                                Lease.of(Duration.ofMinutes(30)));
+                        EntryId written = handle.entryId();
+                        handles.put(cmd[1], handle);
                         taskIds.put(cmd[1], written);
                         System.out.println("{\"written\":" + q(cmd[1]) + "}");
                     }
@@ -426,6 +496,39 @@ public final class Seed {
                         trim(took).append("],");
                         trim(lost).append("]}");
                         System.out.println(took.append(lost));
+                    }
+                    case "horizon" -> {
+                        space.sweepNow();
+                        PeerId peer = PeerId.of(cmd[1]);
+                        System.out.println("{\"mode\":" + q(space.horizonMode().name())
+                                + ",\"engagements\":" + space.horizonEngagements()
+                                + ",\"settlements\":" + space.horizonSettlements()
+                                + ",\"disengagements\":" + space.horizonDisengagements()
+                                + ",\"selfHinted\":" + node.horizonPerEntry()
+                                + ",\"peerHinted\":" + node.advertisesHorizon(peer)
+                                + ",\"maxLease\":" + space.maxLeaseMillis() + "}");
+                    }
+                    case "settle" -> System.out.println("{\"duplicateCompletions\":"
+                            + space.duplicateCompletions() + "}");
+                    case "expiry" -> {
+                        Long expiry = null;
+                        for (Space.Entry<Task> e : space.readAllEntries(Template.of(Task.class), 1000)) {
+                            if (e.value().topic().equals(cmd[1])) {
+                                expiry = e.lease().expiresAtMillis();
+                            }
+                        }
+                        System.out.println("{\"topic\":" + q(cmd[1]) + ",\"expiry\":" + expiry + "}");
+                    }
+                    case "renew" -> {
+                        var handle = handles.get(cmd[1]);
+                        handle.renew(Duration.ofSeconds(Long.parseLong(cmd[2])));
+                        Long expiry = null;
+                        for (Space.Entry<Task> e : space.readAllEntries(Template.of(Task.class), 1000)) {
+                            if (e.value().topic().equals(cmd[1])) {
+                                expiry = e.lease().expiresAtMillis();
+                            }
+                        }
+                        System.out.println("{\"renewed\":" + q(cmd[1]) + ",\"expiry\":" + expiry + "}");
                     }
                     case "entries" -> {
                         StringBuilder out = new StringBuilder("{\"entries\":[");

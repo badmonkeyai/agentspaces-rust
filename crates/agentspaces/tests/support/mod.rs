@@ -26,6 +26,14 @@
 //! peer, signs whatever a test sends (its own introduction, rumors, digests, relay frames, a third
 //! party's advertisement), and records the verified frames it receives.
 //!
+//! A [`LossyDialer`] wraps another dialer and, while told to, drops the rumors of one stream that
+//! the far end sends: the dialing peer misses them, and only anti-entropy brings them back.
+//!
+//! A [`HoldingDialer`] wraps another dialer and, while told to, holds back everything but the
+//! liveness frames the dialing peer sends, then delivers what it held in order once released: the
+//! far end hears of the peer's claims later than a settle window, as a gossip repair or a busy host
+//! makes it hear them (SPEC §7.4, the settle guarantee).
+//!
 //! A *relaying* seed ([`FakeSeed::start_relay`]) also does what a seed does for the members of a
 //! group, so two or three peers can race through it: it re-signs every RUMOR one link carries
 //! and sends it to every other link (in order, per link), folds the space rumors into replicas
@@ -37,14 +45,17 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use agentspaces::clock::SharedClock;
 use agentspaces::group::GroupSpec;
 use agentspaces::peer::PeerConfig;
-use agentspaces::transport::memory::{MemoryListener, MemoryNetwork};
-use agentspaces::transport::{Channel, Closer, Dialer, FrameReceiver, FrameSender, Listener};
+use agentspaces::transport::memory::{self, MemoryListener, MemoryNetwork};
+use agentspaces::transport::{
+    BoxFuture, Channel, Closer, Dialer, FrameReceiver, FrameSender, Listener, TransportError,
+};
 use agentspaces::wire::ads as wire_ads;
 use agentspaces::wire::bodies::{self, Rumor};
 use agentspaces::wire::cbor::{self, Map, Value};
@@ -889,5 +900,299 @@ impl Drop for RawPeer {
     fn drop(&mut self) {
         self.closer.close();
         self.reader.abort();
+    }
+}
+
+// ------------------------------------------------------------------------------- a lossy link
+
+/// A dialer over `inner` whose links drop, while [`LossyDialer::set_dropping`] is on, every
+/// `RUMOR` on `stream` the far end sends; everything else passes both ways in order.
+#[derive(Debug, Clone)]
+pub struct LossyDialer {
+    inner: Arc<dyn Dialer>,
+    stream: String,
+    dropping: Arc<AtomicBool>,
+    dropped: Arc<AtomicUsize>,
+}
+
+impl LossyDialer {
+    /// A dialer over `inner` that can drop the rumors of `stream`.
+    pub fn new(inner: Arc<dyn Dialer>, stream: &str) -> Self {
+        Self {
+            inner,
+            stream: stream.to_owned(),
+            dropping: Arc::new(AtomicBool::new(false)),
+            dropped: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Starts or stops dropping.
+    pub fn set_dropping(&self, dropping: bool) {
+        self.dropping.store(dropping, Ordering::SeqCst);
+    }
+
+    /// The rumors dropped so far.
+    pub fn dropped(&self) -> usize {
+        self.dropped.load(Ordering::SeqCst)
+    }
+
+    /// Whether `frame` (from the far end) is a rumor to drop now.
+    fn drops(&self, frame: &[u8], attested: Option<&str>) -> bool {
+        if !self.dropping.load(Ordering::SeqCst) {
+            return false;
+        }
+        let Some((env, _)) = envelope::decode_frame_detailed(frame, attested, None) else {
+            return false;
+        };
+        let rumor = (env.get("kind").and_then(Value::as_str) == Some(bodies::KIND_RUMOR))
+            .then(|| env.get("body").and_then(Value::as_bytes))
+            .flatten()
+            .and_then(bodies::parse_rumor);
+        rumor.is_some_and(|rumor| rumor.stream_id == self.stream)
+    }
+}
+
+impl Dialer for LossyDialer {
+    fn schemes(&self) -> &[&'static str] {
+        self.inner.schemes()
+    }
+
+    fn dial<'a>(
+        &'a self,
+        seed: &'a Seed,
+        identity: &'a Identity,
+        timeout: Duration,
+    ) -> BoxFuture<'a, Result<Channel, TransportError>> {
+        Box::pin(async move {
+            let far = self.inner.dial(seed, identity, timeout).await?;
+            let (near, middle) = memory::pair(
+                &far.scheme,
+                &far.remote,
+                "lossy",
+                far.attested.clone(),
+                None,
+            );
+            let Channel {
+                sender: far_tx,
+                receiver: mut far_rx,
+                closer: far_closer,
+                attested,
+                ..
+            } = far;
+            let Channel {
+                sender: middle_tx,
+                receiver: mut middle_rx,
+                closer: middle_closer,
+                ..
+            } = middle;
+            let (up_far, up_middle) = (far_closer.clone(), middle_closer.clone());
+            tokio::spawn(async move {
+                while let Some(frame) = middle_rx.recv().await {
+                    if far_tx.send(frame).await.is_err() {
+                        break;
+                    }
+                }
+                up_far.close();
+                up_middle.close();
+            });
+            let lossy = self.clone();
+            tokio::spawn(async move {
+                while let Some(frame) = far_rx.recv().await {
+                    if lossy.drops(&frame, attested.as_deref()) {
+                        lossy.dropped.fetch_add(1, Ordering::SeqCst);
+                        continue;
+                    }
+                    if middle_tx.send(frame).await.is_err() {
+                        break;
+                    }
+                }
+                middle_closer.close();
+                far_closer.close();
+            });
+            Ok(near)
+        })
+    }
+}
+
+// ------------------------------------------------------------------------------- a late link
+
+/// A dialer over `inner` whose links can hold back, in either direction, every frame but `PING`,
+/// `PING_REQ`, and `ACK`, and deliver the held frames in their order once released: what the
+/// dialing peer sends while [`HoldingDialer::hold`] is on, and what the far end sends while
+/// [`HoldingDialer::hold_inbound`] is on.
+#[derive(Debug, Clone)]
+pub struct HoldingDialer {
+    inner: Arc<dyn Dialer>,
+    outbound: Arc<Gate>,
+    inbound: Arc<Gate>,
+    links: Arc<Mutex<Vec<Closer>>>,
+}
+
+/// One direction of a [`HoldingDialer`]'s links.
+#[derive(Debug, Default)]
+struct Gate {
+    holding: AtomicBool,
+    held: AtomicUsize,
+    released: tokio::sync::Notify,
+}
+
+impl Gate {
+    fn release(&self) {
+        self.holding.store(false, Ordering::SeqCst);
+        self.released.notify_waiters();
+    }
+
+    /// Whether `frame` waits now: anything but a liveness frame, and a frame that does not decode
+    /// here.
+    fn holds(&self, frame: &[u8], attested: Option<&str>) -> bool {
+        if !self.holding.load(Ordering::SeqCst) {
+            return false;
+        }
+        let kind = envelope::decode_frame_detailed(frame, attested, None)
+            .and_then(|(env, _)| env.get("kind").and_then(Value::as_str).map(str::to_owned));
+        !matches!(
+            kind.as_deref(),
+            Some(bodies::KIND_PING | bodies::KIND_PING_REQ | bodies::KIND_ACK)
+        )
+    }
+
+    /// Carries `rx` to `tx`, holding what this gate holds, until either side closes.
+    async fn pump(
+        self: Arc<Self>,
+        mut rx: FrameReceiver,
+        tx: FrameSender,
+        attested: Option<String>,
+        closers: [Closer; 2],
+    ) {
+        let mut waiting: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
+        'pump: loop {
+            let released = self.released.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            if !self.holding.load(Ordering::SeqCst) {
+                while let Some(frame) = waiting.pop_front() {
+                    if tx.send(frame).await.is_err() {
+                        break 'pump;
+                    }
+                }
+            }
+            let frame = tokio::select! {
+                frame = rx.recv() => frame,
+                () = &mut released => continue,
+            };
+            let Some(frame) = frame else { break };
+            if self.holds(&frame, attested.as_deref()) {
+                self.held.fetch_add(1, Ordering::SeqCst);
+                waiting.push_back(frame);
+                continue;
+            }
+            if !waiting.is_empty() && !self.holding.load(Ordering::SeqCst) {
+                // Released meanwhile: after what was held, in order.
+                waiting.push_back(frame);
+                continue;
+            }
+            if tx.send(frame).await.is_err() {
+                break;
+            }
+        }
+        for closer in closers {
+            closer.close();
+        }
+    }
+}
+
+impl HoldingDialer {
+    /// A dialer over `inner` that can hold what either end sends.
+    pub fn new(inner: Arc<dyn Dialer>) -> Self {
+        Self {
+            inner,
+            outbound: Arc::new(Gate::default()),
+            inbound: Arc::new(Gate::default()),
+            links: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Closes every link dialed so far, as a dropped connection does: the peer dials again.
+    pub fn close(&self) {
+        for closer in lock(&self.links).drain(..) {
+            closer.close();
+        }
+    }
+
+    /// Starts holding what the dialing peer sends.
+    pub fn hold(&self) {
+        self.outbound.holding.store(true, Ordering::SeqCst);
+    }
+
+    /// Stops holding what the dialing peer sends, and delivers what was held, in order.
+    pub fn release(&self) {
+        self.outbound.release();
+    }
+
+    /// Starts holding what the far end sends.
+    pub fn hold_inbound(&self) {
+        self.inbound.holding.store(true, Ordering::SeqCst);
+    }
+
+    /// Stops holding what the far end sends, and delivers what was held, in order.
+    pub fn release_inbound(&self) {
+        self.inbound.release();
+    }
+
+    /// The frames the dialing peer sent that were held back so far (delivered or not).
+    pub fn held(&self) -> usize {
+        self.outbound.held.load(Ordering::SeqCst)
+    }
+
+    /// The frames the far end sent that were held back so far (delivered or not).
+    pub fn held_inbound(&self) -> usize {
+        self.inbound.held.load(Ordering::SeqCst)
+    }
+}
+
+impl Dialer for HoldingDialer {
+    fn schemes(&self) -> &[&'static str] {
+        self.inner.schemes()
+    }
+
+    fn dial<'a>(
+        &'a self,
+        seed: &'a Seed,
+        identity: &'a Identity,
+        timeout: Duration,
+    ) -> BoxFuture<'a, Result<Channel, TransportError>> {
+        Box::pin(async move {
+            let far = self.inner.dial(seed, identity, timeout).await?;
+            let (near, middle) = memory::pair(
+                &far.scheme,
+                &far.remote,
+                "holding",
+                far.attested.clone(),
+                None,
+            );
+            let Channel {
+                sender: far_tx,
+                receiver: far_rx,
+                closer: far_closer,
+                attested,
+                ..
+            } = far;
+            let Channel {
+                sender: middle_tx,
+                receiver: middle_rx,
+                closer: middle_closer,
+                ..
+            } = middle;
+            lock(&self.links).push(far_closer.clone());
+            let closers = [far_closer.clone(), middle_closer.clone()];
+            tokio::spawn(Arc::clone(&self.outbound).pump(middle_rx, far_tx, None, closers));
+            tokio::spawn(Arc::clone(&self.inbound).pump(
+                far_rx,
+                middle_tx,
+                attested,
+                [middle_closer, far_closer],
+            ));
+            Ok(near)
+        })
     }
 }

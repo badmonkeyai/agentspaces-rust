@@ -84,6 +84,11 @@
 //! take claims one). Every claim bids 0.0 (LEASE_RACE); AUCTION takes are not offered at this
 //! layer.
 //!
+//! A take judges the race at most [`Space::take_window`] after its claim (the settle window and
+//! the follow-up wait), and only a claim still live then wins, so a take whose lease is no longer
+//! than that is refused at once with [`SpaceError::TakeLeaseWithinSettle`], naming both values,
+//! before any claim goes out (SPEC §7.4). [`Taken::renew`] never shortens the hold (SPEC §7.2).
+//!
 //! [`Taken::release`] stops renewing: there is no un-claim on the wire, so the hold lapses at its
 //! expiry and the entry reappears. A take whose future is dropped after its claim went out does
 //! the same; see [`Space::take`]'s cancel safety.
@@ -348,6 +353,14 @@ impl Space {
         self.settle
     }
 
+    /// How long after its claim a take of this handle judges the race at most: the settle
+    /// window and a follow-up wait of `min(settle, 300 ms)` for a fold. A take whose lease is no
+    /// longer is refused at once ([`SpaceError::TakeLeaseWithinSettle`], SPEC §7.4).
+    pub fn take_window(&self) -> Duration {
+        self.settle
+            .saturating_add(self.settle.min(SETTLE_FOLD_WAIT))
+    }
+
     /// This space with another capacity for the queues of its watches
     /// ([`DEFAULT_WATCH_CAPACITY`] otherwise; at least 1).
     pub fn with_watch_capacity(&self, capacity: usize) -> Space {
@@ -414,7 +427,10 @@ impl Space {
     }
 
     /// Renews the write lease of an entry this handle's actor wrote (`peer.py`'s `renew_entry`,
-    /// Java `EntryHandle.renew`): the lease runs `lease` from now, re-signed by the issuer.
+    /// Java `EntryHandle.renew`): the lease runs at least `lease` from now, re-signed by the
+    /// issuer. A renewal never shortens a lease (SPEC §7.2): the new expiry is
+    /// `max(current, now + lease)`, and one that would not move it succeeds and sends nothing;
+    /// cancel and write again for a shorter lease.
     /// [`SpaceError::NotIssuer`] for another writer's entry (an agent-attested entry renews only
     /// as its agent), [`SpaceError::LeaseLapsed`] once its lease lapsed or it was completed or
     /// withdrawn.
@@ -618,6 +634,15 @@ impl Space {
                 Lease::MAX_TAKE
             )));
         }
+        let window = i64::try_from(self.take_window().as_millis()).unwrap_or(i64::MAX);
+        if lease.millis() <= window {
+            // SPEC §7.4: only a claim still live when the race is judged wins, so this take could
+            // only publish claims that hold the entry from other takers, and come back empty.
+            return Err(SpaceError::TakeLeaseWithinSettle {
+                lease_millis: lease.millis(),
+                window_millis: window,
+            });
+        }
         self.open().await?;
         // `None`: the timeout reaches past what the clock can hold, so there is no deadline.
         let deadline = Instant::now().checked_add(timeout);
@@ -660,7 +685,13 @@ impl Space {
                     tokio::time::timeout(self.settle.min(SETTLE_FOLD_WAIT), folds.changed()).await;
                 if let Some(settled) = self
                     .peer
-                    .space_settle(&self.name, entry_id, &ticket.holder, ticket.epoch)
+                    .space_settle(
+                        &self.name,
+                        entry_id,
+                        &ticket.holder,
+                        ticket.epoch,
+                        self.agent_owned(),
+                    )
                     .await?
                 {
                     // The settled view names the holder and the state; the payload is the one
@@ -765,12 +796,15 @@ impl Space {
     /// Cancel-safe: the events' owner exists before the watch is registered, so a future dropped
     /// at any point (`select!`, a timeout) leaves no watch behind.
     pub async fn watch(&self, template: &Template) -> Result<SpaceEvents, SpaceError> {
-        self.open().await?;
+        // The peer opens (and first pulls) the space and registers the watch in one step: opening
+        // first, as a step of its own, let an entry the opening pull brought fold before the
+        // watch existed, and that entry raised no event.
         let queue = WatchQueue::new(self.watch_capacity, i64::MAX);
         let events = SpaceEvents::new(Arc::clone(&queue));
         self.peer
             .space_watch(&self.name, template.clone(), queue)
             .await?;
+        self.opened.store(true, Ordering::Release);
         Ok(events)
     }
 
@@ -812,7 +846,7 @@ impl Space {
         template: &Template,
         lease: Lease,
     ) -> Result<(SpaceEvents, Arc<WatchQueue>, SharedClock), SpaceError> {
-        self.open().await?;
+        // Opened by the peer together with the registration, as in `watch`.
         let clock = Arc::clone(self.peer.clock());
         let expires_at = clock.now_ms().saturating_add(lease.millis());
         let queue = WatchQueue::new(self.watch_capacity, expires_at);
@@ -820,6 +854,7 @@ impl Space {
         self.peer
             .space_watch(&self.name, template.clone(), Arc::clone(&queue))
             .await?;
+        self.opened.store(true, Ordering::Release);
         Ok((events, queue, clock))
     }
 }
@@ -918,9 +953,11 @@ impl Taken {
             .await
     }
 
-    /// Renews the hold to `lease` from now (Java `TakenEntry.renew`): the claim re-signed with the
-    /// same epoch and stamp and a later expiry, which every member's claim lattice prefers.
-    /// Answers the new expiry. [`SpaceError::NotHeld`] once the hold lapsed or was lost.
+    /// Renews the hold to at least `lease` from now (Java `TakenEntry.renew`): the claim re-signed
+    /// with the same epoch, stamp, and bid and the expiry `max(current, now + lease)`, which every
+    /// member's claim lattice prefers; a renewal never shortens the hold (SPEC §7.2), and one that
+    /// would not move it sends nothing. Answers the expiry in force. [`SpaceError::NotHeld`] once
+    /// the hold lapsed or was lost.
     pub async fn renew(&mut self, lease: Lease) -> Result<i64, SpaceError> {
         if lease > Lease::MAX_TAKE {
             return Err(SpaceError::InvalidLease(format!(

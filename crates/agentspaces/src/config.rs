@@ -32,6 +32,7 @@
 //! | `ASPACE_INVITE` | An invite key of an `INVITE` group (`aspace-inv1-...`, as `aspace invite` prints it): the peer presents the delegated credential it signs as the `aspace:join` resource hint ([`Config`] only). |
 //! | `ASPACE_LISTEN` | A listening peer's listeners, comma-separated: `tcp://host:port`, `tls://host:port`, or `host:port` (`tls` under `mtls`, `tcp` under `dev-local`). Read only for a listening configuration ([`Overrides::listening`], `aspace seed`). |
 //! | `ASPACE_ADVERTISE` | What a listening peer's advertisement names in place of what it binds, comma-separated `host:port` or `scheme://host:port` (one per listener). Read only for a listening configuration. |
+//! | `ASPACE_ANTI_ENTROPY_PERIOD_MILLIS` | The base period of this peer's own anti-entropy rounds, in milliseconds, from 100 to 3,600,000 ([`Config::anti_entropy_period`]; [`Config`] only). Unset: the founding's gossip period. |
 //!
 //! The `aspace` command reads a few more, outside this module: `ASPACE_NO_DAEMON` (join in the
 //! process even when a daemon answers), `ASPACE_ALLOW_READABLE_KEY` (through
@@ -77,7 +78,8 @@
 //! layers it:
 //!
 //! 1. command-line flags ([`Overrides`]: `--seeds`, `--group`, `--join`, `--keystore`,
-//!    `--profile`, `--socket`, `--join-timeout`, `--config`), then
+//!    `--profile`, `--socket`, `--join-timeout`, `--anti-entropy-period-millis`, `--config`),
+//!    then
 //! 2. the variables above, then
 //! 3. the file: the one `--config` names, else `ASPACE_CONFIG`, else
 //!    `$XDG_CONFIG_HOME/agentspaces/fleet.yaml` (`~/.config/agentspaces/fleet.yaml`) when it
@@ -104,6 +106,13 @@
 //!   as a file (raw CBOR, or its base64) or inline base64 CBOR as the Java starter reads it,
 //!   verified when the file is read;
 //! - with none of these, from its `name` as a founding text, as the Java starter does.
+//!
+//! The file's `gossip.anti-entropy-period-millis` sets the base period of this peer's own
+//! anti-entropy rounds ([`Config::anti_entropy_period`]), under `ASPACE_ANTI_ENTROPY_PERIOD_MILLIS`
+//! and `--anti-entropy-period-millis`. It is a local choice, never advertised: unset, the rounds
+//! run at the founding's gossip period, as they always have. The Java, Spring, Micronaut, Clojure,
+//! TypeScript, Python, and Ruby hosts read the same key (`.wfcont/ANTI-ENTROPY-PERIOD-PLAN.md`).
+//! Other keys under `gossip` are this peer's to ignore.
 //!
 //! The file is read under bounds ([`MAX_FLEET_FILE_BYTES`], one document, a few hundred nodes of
 //! anchors and aliases at most), so an alias bomb or an oversize file is refused, never
@@ -745,12 +754,15 @@ pub const ENV_INVITE: &str = "ASPACE_INVITE";
 pub const ENV_LISTEN: &str = "ASPACE_LISTEN";
 /// What a listening peer's advertisement names in place of what it binds, comma-separated.
 pub const ENV_ADVERTISE: &str = "ASPACE_ADVERTISE";
+/// The base period of this peer's own anti-entropy rounds, in milliseconds
+/// ([`Config::anti_entropy_period`]).
+pub const ENV_ANTI_ENTROPY_PERIOD: &str = "ASPACE_ANTI_ENTROPY_PERIOD_MILLIS";
 /// The base of the default configuration directory when set (XDG).
 pub const ENV_XDG_CONFIG_HOME: &str = "XDG_CONFIG_HOME";
 /// The home directory, for `~` and the default configuration directory.
 pub const ENV_HOME: &str = "HOME";
 /// Every variable [`Config::from_env`] reads.
-pub const CONFIG_VARIABLES: [&str; 13] = [
+pub const CONFIG_VARIABLES: [&str; 14] = [
     ENV_SEEDS,
     ENV_GROUP,
     ENV_JOIN,
@@ -764,6 +776,7 @@ pub const CONFIG_VARIABLES: [&str; 13] = [
     ENV_INVITE,
     ENV_LISTEN,
     ENV_ADVERTISE,
+    ENV_ANTI_ENTROPY_PERIOD,
 ];
 
 /// The flag naming the fleet file.
@@ -790,6 +803,14 @@ pub const FLAG_LISTEN: &str = "--listen";
 pub const FLAG_ADVERTISE: &str = "--advertise";
 /// The flag of a group the peer founded itself ([`Overrides::founded`]).
 pub const FLAG_FOUND: &str = "--found";
+/// The flag setting the base period of this peer's own anti-entropy rounds, in milliseconds.
+pub const FLAG_ANTI_ENTROPY_PERIOD: &str = "--anti-entropy-period-millis";
+/// The shortest anti-entropy period a flag, variable, or fleet file may set: 100 ms, the floor of
+/// the reference implementation's pace.
+pub const MIN_ANTI_ENTROPY_PERIOD: Duration = Duration::from_millis(100);
+/// The longest anti-entropy period a flag, variable, or fleet file may set: one hour, the longest
+/// founding period this peer reads.
+pub const MAX_ANTI_ENTROPY_PERIOD: Duration = Duration::from_secs(3600);
 /// The port a listening peer binds when no layer names a listener: `127.0.0.1:7700`.
 pub const DEFAULT_LISTEN_PORT: u16 = 7700;
 
@@ -886,6 +907,10 @@ pub struct Overrides {
     /// (over `ASPACE_ADVERTISE` and the file's `advertise`). Read only when
     /// [`Overrides::listening`].
     pub advertise: Vec<String>,
+    /// `--anti-entropy-period-millis`: the base period of this peer's own anti-entropy rounds
+    /// (over `ASPACE_ANTI_ENTROPY_PERIOD_MILLIS` and the file's
+    /// `gossip.anti-entropy-period-millis`).
+    pub anti_entropy_period: Option<Duration>,
     /// `--found`: a group this peer founded itself, its signed founding document. It is the
     /// group, over the variables and the file; `--group` or `--join` beside it is refused.
     pub founded: Option<Founded>,
@@ -980,6 +1005,9 @@ pub struct FleetFile {
     pub allow_plain: bool,
     /// `peer-ad-interval-millis`, when set.
     pub peer_ad_interval: Option<Duration>,
+    /// `gossip.anti-entropy-period-millis`, when set (unchecked against the bounds until the
+    /// configuration is resolved).
+    pub anti_entropy_period: Option<Duration>,
     /// `groups`, in order.
     pub groups: Vec<FleetGroup>,
     /// `bind`, as written (a scalar, a comma-separated scalar, or a list), unchecked: only a
@@ -1026,6 +1054,13 @@ pub struct Config {
     /// The membership the chosen group of the file names (`membership`), with the key, in a
     /// listening configuration; `None` otherwise.
     pub membership: Option<(MembershipPolicy, Origin)>,
+    /// The base period of this peer's own anti-entropy rounds, from
+    /// `--anti-entropy-period-millis`, `ASPACE_ANTI_ENTROPY_PERIOD_MILLIS`, or the file's
+    /// `gossip.anti-entropy-period-millis`, within [`MIN_ANTI_ENTROPY_PERIOD`] and
+    /// [`MAX_ANTI_ENTROPY_PERIOD`]. `None` (the default) keeps the founding's gossip period.
+    /// [`Config::peer_config`] carries it as
+    /// [`ListenConfig::anti_entropy_period`](crate::peer::ListenConfig::anti_entropy_period).
+    pub anti_entropy_period: Option<Duration>,
 }
 
 impl Config {
@@ -1457,6 +1492,54 @@ impl Config {
             }
         }
 
+        // The base period of this peer's own anti-entropy rounds: a flag, a variable, the file.
+        let anti_entropy_period =
+            match (overrides.anti_entropy_period, var(ENV_ANTI_ENTROPY_PERIOD)) {
+                (Some(period), _) => Some((period, Origin::Flag(FLAG_ANTI_ENTROPY_PERIOD))),
+                (None, Some(text)) => {
+                    let origin = Origin::Variable(ENV_ANTI_ENTROPY_PERIOD);
+                    let millis = text
+                        .trim()
+                        .parse::<u64>()
+                        .map_err(|_| ConfigError::Invalid {
+                            origin: Box::new(origin.clone()),
+                            value: shorten(text.trim()),
+                            reason: "is not a number of milliseconds; write e.g. 2000".to_owned(),
+                        })?;
+                    Some((Duration::from_millis(millis), origin))
+                }
+                (None, None) => file.and_then(|file| {
+                    file.anti_entropy_period.map(|period| {
+                        (
+                            period,
+                            Origin::key(
+                                &file.path,
+                                "agentspaces.gossip.anti-entropy-period-millis",
+                            ),
+                        )
+                    })
+                }),
+            };
+        let anti_entropy_period = match anti_entropy_period {
+            Some((period, origin)) => {
+                if !(MIN_ANTI_ENTROPY_PERIOD..=MAX_ANTI_ENTROPY_PERIOD).contains(&period) {
+                    return Err(ConfigError::Invalid {
+                        origin: Box::new(origin),
+                        value: period.as_millis().to_string(),
+                        reason: format!(
+                            "is outside {} to {} milliseconds; leave it unset for the \
+                             founding's gossip period",
+                            MIN_ANTI_ENTROPY_PERIOD.as_millis(),
+                            MAX_ANTI_ENTROPY_PERIOD.as_millis()
+                        ),
+                    });
+                }
+                origins.push(("anti_entropy_period", origin));
+                Some(period)
+            }
+            None => None,
+        };
+
         // A plaintext seed outside loopback is refused unless the profile is dev-local, naming
         // where the seed and the profile came from.
         if settings.profile != Profile::DevLocal
@@ -1516,12 +1599,13 @@ impl Config {
             listening: overrides.listening,
             listen,
             membership,
+            anti_entropy_period,
         })
     }
 
     /// Where the setting `name` came from (`group`, `seeds`, `profile`, `keystore`, `spaces`,
-    /// `socket`, `join_timeout`, `file`, `peer_ad_interval`); `None` for a setting left at its
-    /// default.
+    /// `socket`, `join_timeout`, `file`, `peer_ad_interval`, `anti_entropy_period`); `None` for a
+    /// setting left at its default.
     pub fn origin(&self, name: &str) -> Option<&Origin> {
         self.origins
             .iter()
@@ -1570,6 +1654,7 @@ impl Config {
         }
         let mut config = crate::peer::PeerConfig::from_checked_settings(&self.settings, identity);
         config.join_timeout = self.join_timeout;
+        config.listen.anti_entropy_period = self.anti_entropy_period;
         if let Some(hints) = hints {
             config.resource_hints.extend(hints);
         }
@@ -1666,6 +1751,7 @@ impl FleetFile {
             profile: None,
             allow_plain: false,
             peer_ad_interval: None,
+            anti_entropy_period: None,
             groups: Vec::new(),
             bind: Vec::new(),
             advertise: Vec::new(),
@@ -1690,6 +1776,19 @@ impl FleetFile {
                 }
                 "allowplain" => file.allow_plain = value.as_bool().unwrap_or(false),
                 "peeradintervalmillis" => file.peer_ad_interval = millis_of(value, &at)?,
+                "gossip" => {
+                    if let Some(gossip) = map_of(value, &at)? {
+                        let gossip_fields = Fields::of(gossip, &at)?;
+                        for (normal, key, value) in &gossip_fields.entries {
+                            let at = at.child(key);
+                            if normal == "antientropyperiodmillis" {
+                                file.anti_entropy_period = millis_of(value, &at)?;
+                            } else {
+                                file.ignored.push(at.key);
+                            }
+                        }
+                    }
+                }
                 "groups" => {
                     for (index, group) in list_of(value).into_iter().enumerate() {
                         let (group, ignored) =

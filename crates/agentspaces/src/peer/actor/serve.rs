@@ -323,7 +323,12 @@ pub(in crate::peer) struct Hub {
     fetches: HashMap<String, Fetch>,
     /// Whether anything moved since the last round (SPEC §5.3's idle backoff).
     pub activity: bool,
-    base_period: Duration,
+    /// When a probe last started a targeted round with each member (SPEC §5.2: at most once per
+    /// gossip period per member).
+    pub probe_rounds: HashMap<String, Instant>,
+    /// Each member's pace of probes answered with this peer's own hashes.
+    pub probe_pace: HashMap<String, crate::peer::listen::TokenBucket>,
+    pub base_period: Duration,
     round_period: Duration,
     next_round: Option<Instant>,
     pub next_tick: Option<Instant>,
@@ -363,6 +368,8 @@ impl Hub {
             replicated: BTreeSet::new(),
             fetches: HashMap::new(),
             activity: false,
+            probe_rounds: HashMap::new(),
+            probe_pace: HashMap::new(),
             base_period: base,
             round_period: base,
             next_round: None,
@@ -393,6 +400,7 @@ pub(in crate::peer) fn forwardable(outcome: Option<FoldOutcome>) -> bool {
                 | Refusal::Revoked
                 | Refusal::StampLogical
                 | Refusal::StampFarFuture
+                | Refusal::ControlId
         ),
         _ => true,
     }
@@ -449,13 +457,54 @@ fn random_u64() -> u64 {
 }
 
 /// `period` plus a random spread of up to a quarter of it.
-fn jittered(period: Duration) -> Duration {
+pub(super) fn jittered(period: Duration) -> Duration {
     let spread = period / 4;
     let nanos = u64::try_from(spread.as_nanos()).unwrap_or(u64::MAX);
     if nanos == 0 {
         return period;
     }
     period.saturating_add(Duration::from_nanos(random_u64() % nanos))
+}
+
+/// The period of the round after one that ran at `period` (SPEC §5.3, the idle floor): back to
+/// `base` when something counted as activity since the last round, else doubled, never past
+/// [`ROUND_STRETCH`] times `base`. However long nothing moves, a round still runs.
+pub(super) fn next_period(period: Duration, base: Duration, active: bool) -> Duration {
+    if active {
+        base
+    } else {
+        period
+            .saturating_mul(2)
+            .min(base.saturating_mul(ROUND_STRETCH))
+    }
+}
+
+/// `digests` (stream, text digest) packed into the fewest `DIGEST` bodies a round sends: each
+/// up to [`PULL_CHUNK_BYTES`] of digests and [`MAX_DIGEST_STREAMS`] streams (what a partner
+/// answers of one body), in their order. A digest no frame carries is left out: that stream
+/// waits for a later round.
+pub(super) fn pack_digests(digests: Vec<(String, Vec<u8>)>) -> Vec<Vec<(String, Vec<u8>)>> {
+    let mut frames: Vec<Vec<(String, Vec<u8>)>> = Vec::new();
+    let mut size = 0usize;
+    for (stream, digest) in digests {
+        let length = digest.len().saturating_add(stream.len());
+        if length.saturating_add(FRAME_OVERHEAD.saturating_mul(2)) > MAX_FRAME_BYTES {
+            continue;
+        }
+        let full = frames.last().is_none_or(|frame| {
+            frame.len() >= MAX_DIGEST_STREAMS
+                || (size.saturating_add(length) > PULL_CHUNK_BYTES && !frame.is_empty())
+        });
+        if full {
+            frames.push(Vec::new());
+            size = 0;
+        }
+        size = size.saturating_add(length);
+        if let Some(frame) = frames.last_mut() {
+            frame.push((stream, digest));
+        }
+    }
+    frames
 }
 
 /// Whether a RELAY_FRAME's path is well formed for this relay at `hop` (SPEC §5.4): at most
@@ -508,19 +557,7 @@ impl Actor {
             let _ = self.pull_space(name);
         }
         if self.hub.settings.anti_entropy_period.is_none() {
-            // The founding's gossip period (SPEC §5.1), one second for a group from text.
-            let period = self
-                .founding
-                .as_ref()
-                .and_then(|founding| founding.get("advertisement"))
-                .and_then(|ad| ad.get("gossip"))
-                .and_then(|gossip| gossip.get("period"))
-                .and_then(Value::as_str)
-                .and_then(|period| agentspaces_wire::time::parse_duration_millis(period).ok())
-                .and_then(|millis| u64::try_from(millis).ok())
-                .filter(|millis| *millis > 0)
-                .map_or(Duration::from_secs(1), Duration::from_millis)
-                .min(Duration::from_secs(3600));
+            let period = self.gossip_period();
             self.hub.base_period = period;
             self.hub.round_period = period;
         }
@@ -529,6 +566,35 @@ impl Actor {
         let at = Instant::now();
         self.hub.next_round = Some(at + jittered(self.hub.base_period));
         self.hub.next_tick = Some(at + TICK);
+    }
+
+    /// The base period of this peer's own rounds: [`ListenConfig::anti_entropy_period`] when
+    /// set, else the founding's gossip period (SPEC §5.1), one second for a group from text or a
+    /// period that does not parse, at most an hour.
+    ///
+    /// [`ListenConfig::anti_entropy_period`]: crate::peer::ListenConfig::anti_entropy_period
+    pub(super) fn gossip_period(&self) -> Duration {
+        if let Some(period) = self.hub.settings.anti_entropy_period {
+            return period;
+        }
+        self.founding_period()
+    }
+
+    /// The founding's gossip period (SPEC §5.1): one second for a group from text or a period
+    /// that does not parse, at most an hour. What the group's members pace their rounds by, the
+    /// reference implementation's alike, whatever this peer's own setting.
+    pub(super) fn founding_period(&self) -> Duration {
+        self.founding
+            .as_ref()
+            .and_then(|founding| founding.get("advertisement"))
+            .and_then(|ad| ad.get("gossip"))
+            .and_then(|gossip| gossip.get("period"))
+            .and_then(Value::as_str)
+            .and_then(|period| agentspaces_wire::time::parse_duration_millis(period).ok())
+            .and_then(|millis| u64::try_from(millis).ok())
+            .filter(|millis| *millis > 0)
+            .map_or(Duration::from_secs(1), Duration::from_millis)
+            .min(Duration::from_secs(3600))
     }
 
     /// Stops accepting and closes every accepted link (the peer is closing).
@@ -755,7 +821,7 @@ impl Actor {
         self.reply_with(via, kind, body, to, Budget::Whole)
     }
 
-    fn reply_with(
+    pub(super) fn reply_with(
         &mut self,
         via: Via,
         kind: &str,
@@ -985,7 +1051,8 @@ impl Actor {
                 round_owed: fresh,
             },
         );
-        self.members.hold_ad(issuer.clone(), ad);
+        let now = self.now();
+        self.members.hold_ad(issuer.clone(), ad, now);
         if let Some(link) = self.hub.accepted.get_mut(&id) {
             link.owner = Some(issuer.clone());
         }
@@ -1452,31 +1519,45 @@ impl Actor {
 
     /// Answers a DIGEST from `sender` with what its digests show it lacks, in as many PULL_RESP
     /// frames as it takes (see the [module docs](self#gossip-and-anti-entropy-spec-53-7-9)).
+    /// Every field of a v0.1.35 body is handled on its own ([`Actor::on_digest_body`]); this is
+    /// the answer to `digests` without a budget, as a member of v0.1.34 answers it.
     pub(super) fn on_digest(
         &mut self,
         sender: &str,
         body: &[u8],
         via: Via,
     ) -> Result<(), Malformed> {
-        let digests = bodies::parse_digest(body).ok_or(Malformed)?;
+        self.on_digest_body(sender, body, via)
+    }
+
+    /// Spends one of `sender`'s paced DIGEST answers; `false` (counted) when none is left.
+    pub(super) fn pace_answer(&mut self, sender: &str) -> bool {
         let paced = match self.hub.admitted.get_mut(sender) {
             Some(member) => !member.answers.take(),
             None => !self.hub.dialed_answers.take(),
         };
         if paced {
             bump(&mut self.hub.counters.pulls_paced);
-            return Ok(());
         }
-        // A member whose DIGEST names the view runs anti-entropy itself: it answers this peer's
-        // rounds, and a newcomer gets its targeted round now.
-        let mut owed = false;
-        if digests.contains_key(serving::STREAM_VIEW) {
-            if self.hub.digesters.len() < MAX_DIGESTERS || self.hub.digesters.contains(sender) {
-                self.hub.digesters.insert(sender.to_owned());
-            }
-            if let Some(member) = self.hub.admitted.get_mut(sender) {
-                owed = std::mem::take(&mut member.round_owed);
-            }
+        !paced
+    }
+
+    /// Notes that `sender` runs anti-entropy itself (its DIGEST named the view): it answers this
+    /// peer's rounds. Whether it is owed the targeted round of a newcomer now.
+    pub(super) fn note_digester(&mut self, sender: &str) -> bool {
+        if self.hub.digesters.len() < MAX_DIGESTERS || self.hub.digesters.contains(sender) {
+            self.hub.digesters.insert(sender.to_owned());
+        }
+        self.hub
+            .admitted
+            .get_mut(sender)
+            .is_some_and(|member| std::mem::take(&mut member.round_owed))
+    }
+
+    /// The answer to the text digests of a DIGEST without a budget, paced per member.
+    pub(super) fn answer_text_digests(&mut self, sender: &str, digests: &Map, via: Via) {
+        if !self.pace_answer(sender) {
+            return;
         }
         let mut asked: Vec<(&str, &[u8])> = digests
             .iter()
@@ -1511,10 +1592,42 @@ impl Actor {
                 bump(&mut self.hub.counters.pull_frames);
             }
         }
-        if owed {
-            self.round_with(sender);
+    }
+
+    /// The pieces of `stream` the asker lacks given its text digest, encoded as that stream's
+    /// delta, with no bound: what a budgeted answer carries whole for a stream that is not a
+    /// space's (its items are not states). `None` when nothing is missing.
+    pub(super) fn whole_delta(&self, asker: &str, stream: &str, remote: &[u8]) -> Option<Vec<u8>> {
+        let pieces = self.missing_pieces(asker, stream, remote, self.now());
+        if pieces.is_empty() {
+            return None;
         }
-        Ok(())
+        Some(encode_pieces(stream, &pieces))
+    }
+
+    /// Registers that `partner`'s PULL_RESP answers a body this peer sent, for
+    /// [`EXPECTED_FOR`].
+    pub(super) fn expect_answer(&mut self, partner: &str) {
+        self.hub
+            .expected
+            .retain(|expected| expected.peer != partner);
+        self.hub.expected.push_back(Expected {
+            peer: partner.to_owned(),
+            asked: Instant::now(),
+            answered: None,
+        });
+        while self.hub.expected.len() > MAX_EXPECTED {
+            self.hub.expected.pop_front();
+        }
+    }
+
+    /// Whether this peer awaits an answer from `partner` (a round it opened with it).
+    pub(super) fn awaits(&self, partner: &str) -> bool {
+        let now = Instant::now();
+        self.hub
+            .expected
+            .iter()
+            .any(|expected| expected.peer == partner && expected.open(now))
     }
 
     /// The PULL_RESP bodies answering `asked` (stream, the asker's digest), the cursors to resume
@@ -1670,87 +1783,110 @@ impl Actor {
     }
 
     /// This peer's full digests (every stream it serves), the opening of its own round.
-    fn full_digests(&self) -> Vec<(String, Vec<u8>)> {
-        let now = self.now();
-        let mut digests = Vec::new();
-        let peers = self
-            .registry
-            .peers()
-            .iter()
-            .map(|(peer, held)| serving::revocation_line(&format!("r:{peer}"), &held.digest));
-        digests.push((
+    pub(super) fn full_digests(&self) -> Vec<(String, Vec<u8>)> {
+        self.served_streams()
+            .into_iter()
+            .filter_map(|stream| {
+                let digest = self.stream_digest(&stream)?;
+                Some((stream, digest))
+            })
+            .collect()
+    }
+
+    /// The streams this peer serves: the revocations, the view, the advertisements, and each open
+    /// space, in that order.
+    pub(super) fn served_streams(&self) -> Vec<String> {
+        let mut streams = vec![
             revocation::PEER_STREAM.to_owned(),
-            serving::revocation_digest(peers),
-        ));
-        let credentials = self
-            .registry
-            .credentials()
-            .iter()
-            .map(|(key, held)| serving::revocation_line(&format!("c:{key}"), &held.digest));
-        digests.push((
             revocation::CREDENTIAL_STREAM.to_owned(),
-            serving::revocation_digest(credentials),
-        ));
-        let live = self
-            .hub
-            .admitted
-            .iter()
-            .filter(|(_, member)| member.expires_ms > now)
-            .map(|(peer, _)| peer.as_str())
-            .chain(std::iter::once(self.peer_id.as_str()));
-        digests.push((serving::STREAM_VIEW.to_owned(), serving::view_digest(live)));
-        let ads = self
-            .ads
-            .live_entries(now, &self.registry)
-            .filter_map(|cached| Some((cached.ad.get("id")?.as_str()?, cached.issued_ms)));
-        digests.push((STREAM_ADS.to_owned(), serving::ad_digest(ads)));
-        for name in self.spaces.names() {
-            if let Some(slot) = self.spaces.get(&name) {
-                digests.push((
-                    format!("{STREAM_SPACE_PREFIX}{name}"),
-                    serving::space_digest(slot.store.states(), slot.store.claims()),
-                ));
+            serving::STREAM_VIEW.to_owned(),
+            STREAM_ADS.to_owned(),
+        ];
+        streams.extend(
+            self.spaces
+                .names()
+                .into_iter()
+                .map(|name| format!("{STREAM_SPACE_PREFIX}{name}")),
+        );
+        streams
+    }
+
+    /// This peer's text digest of one stream it serves.
+    pub(super) fn stream_digest(&self, stream: &str) -> Option<Vec<u8>> {
+        let now = self.now();
+        match stream {
+            revocation::PEER_STREAM => {
+                let peers = self.registry.peers().iter().map(|(peer, held)| {
+                    serving::revocation_line(&format!("r:{peer}"), &held.digest)
+                });
+                Some(serving::revocation_digest(peers))
+            }
+            revocation::CREDENTIAL_STREAM => {
+                let credentials =
+                    self.registry.credentials().iter().map(|(key, held)| {
+                        serving::revocation_line(&format!("c:{key}"), &held.digest)
+                    });
+                Some(serving::revocation_digest(credentials))
+            }
+            serving::STREAM_VIEW => {
+                let live = self
+                    .hub
+                    .admitted
+                    .iter()
+                    .filter(|(_, member)| member.expires_ms > now)
+                    .map(|(peer, _)| peer.as_str())
+                    .chain(std::iter::once(self.peer_id.as_str()));
+                Some(serving::view_digest(live))
+            }
+            STREAM_ADS => {
+                let ads = self
+                    .ads
+                    .live_entries(now, &self.registry)
+                    .filter_map(|cached| Some((cached.ad.get("id")?.as_str()?, cached.issued_ms)));
+                Some(serving::ad_digest(ads))
+            }
+            _ => {
+                let slot = self.spaces.get(stream.strip_prefix(STREAM_SPACE_PREFIX)?)?;
+                Some(serving::space_digest_acked(
+                    slot.store.states(),
+                    slot.store.claims(),
+                    slot.store.acknowledged(),
+                ))
             }
         }
-        digests
     }
 
     /// One anti-entropy round with `partner`: this peer's full digests, in as many DIGEST frames
     /// as they take, and the partner's answers expected for [`EXPECTED_FOR`].
     pub(super) fn round_with(&mut self, partner: &str) {
-        let digests = self.full_digests();
-        let mut frames: Vec<Map> = vec![Map::new()];
-        let mut size = 0usize;
-        for (stream, digest) in digests {
-            let length = digest.len().saturating_add(stream.len());
-            if length.saturating_add(FRAME_OVERHEAD.saturating_mul(2)) > MAX_FRAME_BYTES {
-                continue; // a digest no frame carries: that stream waits for a later round
-            }
-            if size.saturating_add(length) > PULL_CHUNK_BYTES && size > 0 {
-                frames.push(Map::new());
-                size = 0;
-            }
-            size = size.saturating_add(length);
-            if let Some(frame) = frames.last_mut() {
-                frame.insert(stream, digest);
-            }
+        if self.audit_opening(partner) {
+            self.expect_answer(partner);
+            bump(&mut self.hub.counters.rounds);
+            return;
         }
-        self.hub
-            .expected
-            .retain(|expected| expected.peer != partner);
-        self.hub.expected.push_back(Expected {
-            peer: partner.to_owned(),
-            asked: Instant::now(),
-            answered: None,
-        });
-        while self.hub.expected.len() > MAX_EXPECTED {
-            self.hub.expected.pop_front();
-        }
-        for digests in frames {
+        let frames = pack_digests(self.full_digests());
+        self.expect_answer(partner);
+        for frame in frames {
+            let mut digests = Map::with_capacity(frame.len());
+            for (stream, digest) in frame {
+                digests.insert(stream, digest);
+            }
             let body = bodies::digest_body(&digests);
             let _ = self.send_addressed_with(KIND_DIGEST, &body, partner, Budget::Whole);
         }
         bump(&mut self.hub.counters.rounds);
+    }
+
+    /// Whether this peer's own periodic rounds run stretched past the base period (SPEC §5.3):
+    /// nothing moved lately, so it relies on probes to learn of a difference (SPEC §5.2).
+    pub(super) fn rounds_backed_off(&self) -> bool {
+        self.hub.listening && self.hub.round_period > self.hub.base_period
+    }
+
+    /// Whether `member` is a partner of this peer's rounds: it runs anti-entropy itself and a
+    /// link to it is held.
+    pub(super) fn runs_rounds_with(&self, member: &str) -> bool {
+        self.hub.digesters.contains(member) && self.hub.routes.contains_key(member)
     }
 
     /// The periodic round: with a random member that runs anti-entropy (or the seed), then the
@@ -1774,12 +1910,9 @@ impl Actor {
             let pick = usize::try_from(random_u64() % partners.len() as u64).unwrap_or(0);
             let partner = partners.swap_remove(pick.min(partners.len() - 1));
             self.round_with(&partner);
-            if std::mem::take(&mut self.hub.activity) {
-                self.hub.round_period = self.hub.base_period;
-            } else {
-                let longest = self.hub.base_period.saturating_mul(ROUND_STRETCH);
-                self.hub.round_period = self.hub.round_period.saturating_mul(2).min(longest);
-            }
+            let active = std::mem::take(&mut self.hub.activity);
+            self.hub.round_period =
+                next_period(self.hub.round_period, self.hub.base_period, active);
         }
         self.hub.next_round = Some(now + jittered(self.hub.round_period));
     }
@@ -1994,6 +2127,7 @@ impl Actor {
         self.expire_members(wall);
         self.hub.expected.retain(|expected| expected.open(now));
         self.run_fetches(now);
+        self.audit_tick();
         if self.hub.next_round.is_some_and(|at| at <= now) {
             self.periodic_round(now);
         }
@@ -2051,54 +2185,99 @@ impl Actor {
 fn encode_chunk(chunk: Chunk<'_>) -> Vec<u8> {
     let mut deltas = Map::with_capacity(chunk.streams.len());
     for (stream, pieces) in chunk.streams {
-        let delta = if stream == revocation::PEER_STREAM || stream == revocation::CREDENTIAL_STREAM
-        {
-            let signed: Vec<&Map> = pieces
-                .iter()
-                .filter_map(|piece| match piece {
-                    Piece::Revocation(map) => Some(*map),
-                    _ => None,
-                })
-                .collect();
-            serving::revocations_delta(&signed)
-        } else if stream == serving::STREAM_VIEW {
-            let payloads: Vec<&[u8]> = pieces
-                .iter()
-                .filter_map(|piece| match piece {
-                    Piece::View(payload) => Some(payload.as_slice()),
-                    _ => None,
-                })
-                .collect();
-            serving::view_delta(&payloads)
-        } else if stream == STREAM_ADS {
-            let stored: Vec<&Value> = pieces
-                .iter()
-                .filter_map(|piece| match piece {
-                    Piece::Ad(value) => Some(*value),
-                    _ => None,
-                })
-                .collect();
-            serving::ads_delta(&stored)
-        } else {
-            let mut states = Vec::new();
-            let mut claims = Vec::new();
-            for piece in &pieces {
-                match piece {
-                    Piece::State(state) => states.push(*state),
-                    Piece::Claim(entry_id, signed) => claims.push((*entry_id, *signed)),
-                    _ => {}
-                }
-            }
-            serving::sync_delta(&states, &claims)
-        };
+        let delta = encode_pieces(&stream, &pieces);
         deltas.insert(stream, delta);
     }
     bodies::pull_resp_body(&deltas)
 }
 
+/// One stream's delta of `pieces`, in that stream's format.
+fn encode_pieces(stream: &str, pieces: &[Piece<'_>]) -> Vec<u8> {
+    if stream == revocation::PEER_STREAM || stream == revocation::CREDENTIAL_STREAM {
+        let signed: Vec<&Map> = pieces
+            .iter()
+            .filter_map(|piece| match piece {
+                Piece::Revocation(map) => Some(*map),
+                _ => None,
+            })
+            .collect();
+        serving::revocations_delta(&signed)
+    } else if stream == serving::STREAM_VIEW {
+        let payloads: Vec<&[u8]> = pieces
+            .iter()
+            .filter_map(|piece| match piece {
+                Piece::View(payload) => Some(payload.as_slice()),
+                _ => None,
+            })
+            .collect();
+        serving::view_delta(&payloads)
+    } else if stream == STREAM_ADS {
+        let stored: Vec<&Value> = pieces
+            .iter()
+            .filter_map(|piece| match piece {
+                Piece::Ad(value) => Some(*value),
+                _ => None,
+            })
+            .collect();
+        serving::ads_delta(&stored)
+    } else {
+        let mut states = Vec::new();
+        let mut claims = Vec::new();
+        for piece in pieces {
+            match piece {
+                Piece::State(state) => states.push(*state),
+                Piece::Claim(entry_id, signed) => claims.push((*entry_id, *signed)),
+                _ => {}
+            }
+        }
+        serving::sync_delta(&states, &claims)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_round_packs_its_digests_by_bytes_and_streams() {
+        let streams = |count: usize, bytes: usize| -> Vec<(String, Vec<u8>)> {
+            (0..count)
+                .map(|n| (format!("space:s{n}"), vec![b'x'; bytes]))
+                .collect()
+        };
+        // 52 small streams (a dial-only peer of 50 spaces): one body.
+        let packed = pack_digests(streams(52, 2_000));
+        assert_eq!(packed.len(), 1);
+        assert_eq!(packed[0].len(), 52);
+        // Past the streams one body is answered for: the rest in the next.
+        let sizes: Vec<usize> = pack_digests(streams(130, 10))
+            .iter()
+            .map(Vec::len)
+            .collect();
+        assert_eq!(sizes, vec![MAX_DIGEST_STREAMS, MAX_DIGEST_STREAMS, 2]);
+        // Past the bytes of one answer: one body each.
+        assert_eq!(pack_digests(streams(3, PULL_CHUNK_BYTES / 2 + 1)).len(), 3);
+        // A digest no frame carries waits; the others go.
+        let mut mixed = streams(2, 10);
+        mixed.insert(1, ("space:huge".to_owned(), vec![0; MAX_FRAME_BYTES]));
+        let packed = pack_digests(mixed);
+        assert_eq!(packed.len(), 1);
+        assert_eq!(packed[0].len(), 2);
+        assert!(pack_digests(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn the_period_doubles_to_32_times_and_returns_on_activity() {
+        let base = Duration::from_millis(100);
+        let mut period = base;
+        for _ in 0..10 {
+            period = next_period(period, base, false);
+        }
+        assert_eq!(period, base * 32);
+        assert_eq!(next_period(period, base, false), base * 32);
+        assert_eq!(next_period(period, base, true), base);
+        assert_eq!(next_period(base, base, false), base * 2);
+    }
 
     #[test]
     fn the_seen_memory_is_bounded_and_keyed_by_stream_and_payload() {

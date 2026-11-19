@@ -25,9 +25,9 @@
 //!   than this one may have claimed its entries since), builds the claim with the wire builder
 //!   (epoch one past the held claim's, the stamp from this peer's clock for the holder), merges it
 //!   here, and rumors it; [`Actor::space_settle`] then decides the race;
-//! - a take's renewal re-signs the held claim with the same epoch, stamp, holder, and bid and a
-//!   later expiry, which the claim lattice prefers (Java `Taken.renew`, `peer.rb`'s
-//!   `renew_claim`);
+//! - a take's renewal re-signs the held claim with the same epoch, stamp, holder, and bid and the
+//!   later expiry of the renewal rule, which the claim lattice prefers (Java `Taken.renew`,
+//!   `peer.rb`'s `renew_claim`);
 //! - a completion re-signs the joined state with `completed` set as the holder (the agent when
 //!   the claim was the agent's: the two-key rule), carries the winning claim in the delta, and
 //!   writes the result in the same turn, prepared before the completion commits (Java
@@ -42,7 +42,8 @@
 //!
 //! Folds and a sweep derive each entry's transitions once (Java `ReplicatedSpace.fire`,
 //! `sweepLocked`): `Written` at the first fold of a live entry, `Completed` when the joined state
-//! turns completed, `Taken` when a member's claim wins the lattice while live (once per epoch and
+//! turns completed (for an entry first learned already completed, only when its value is held
+//! here, and never with a `Written` or `Taken` before it: SPEC §7.2, *Completed on arrival*), `Taken` when a member's claim wins the lattice while live (once per epoch and
 //! holder; this peer's own claim only once its take has won), and, from the sweep that runs every
 //! [`SWEEP_INTERVAL`] while a space has watchers, `Expired` once per open entry whose write lease
 //! lapsed and `Reappeared` once per lapsed claim epoch of an open entry. Each transition is offered
@@ -52,15 +53,26 @@
 //! # Collection
 //!
 //! Every [`COLLECT_INTERVAL`], watched or not, each open space drops its tombstones past the
-//! horizon of SPEC §7.3 (Java `SpaceStateCrdt.collectable`, `ReplicatedSpace.sweepLocked`): a
-//! completed or withdrawn entry two of the space's longest leases after its write lease lapsed, a
-//! lapsed one after the shorter of that and five minutes; with its claim, its transitions'
-//! trackers, and the block it pinned. The longest lease is the longest observed in the space
-//! (writes, renewals, and claims), capped at 24 hours. A received state already past that
-//! horizon is refused at the door (a member re-offering what this peer collected; Python, Ruby,
-//! and TypeScript peers never collect), and lapsed claims of entries with no state go too. A
-//! space at its bound collects before it refuses a new entry: at once for a write of this peer,
-//! at most once a second for received ones.
+//! horizon of SPEC §7.3 ([`agentspaces_wire::horizon`]): a completed entry two of the space's
+//! longest leases after its write lease lapsed, a withdrawn one (or one both withdrawn and
+//! completed) the longer of that and the drift ceiling (ten minutes), a lapsed one the shorter of
+//! two longest leases and five minutes; with its claim, its transitions' trackers, and the block
+//! it pinned. Under the per-entry horizon (`wire.horizon=1` from this peer and every member in
+//! view, [`super::horizon`]) a withdrawal whose writers this peer vouches for goes ten minutes
+//! after its lease's expiry instead. The longest lease is the longest observed in the space
+//! (writes, renewals, and claims), capped at 24 hours. A received state already past its horizon
+//! is refused at the door by the same rule and clock (a member re-offering what this peer
+//! collected), and acknowledged in the space's digest when this peer holds no state of it; lapsed
+//! claims of entries with no state go too. A space at its bound collects before it refuses a new
+//! entry: at once for a write of this peer, at most once a second for received ones.
+//!
+//! # Renewals (SPEC §7.2)
+//!
+//! A renewal of a write, a take, or a subscription never shortens its lease: the new expiry is
+//! `max(current, now + extension)`. One that would change nothing succeeds, sends nothing, and is
+//! counted in [`PeerCounters::renew_shortenings`](crate::peer::PeerCounters::renew_shortenings)
+//! when it asked for less than the lease had left. A take's renewal keeps its claim's epoch,
+//! stamp, holder, and bid, so no watcher reads it as a new take.
 //!
 //! [`Peer`]: crate::peer::Peer
 
@@ -70,14 +82,15 @@ use std::time::Duration;
 
 use agentspaces_wire::bodies::{self, RUMOR_HOPS, STREAM_SPACE_PREFIX};
 use agentspaces_wire::cbor::{self, Map, Value};
-use agentspaces_wire::fold::{self, FoldOutcome, Refusal};
+use agentspaces_wire::fold::{self, FoldContext, FoldOutcome, Refusal};
 use agentspaces_wire::hlc::Stamp;
+use agentspaces_wire::horizon;
 use agentspaces_wire::identity::AgentIdentity;
 use agentspaces_wire::ids;
 use agentspaces_wire::records::{self, PayloadSource, WRITE_LEASE_KIND};
 use tokio::time::Instant;
 
-use super::{Actor, DEFAULT_AGENT_NAME, PeerError, PeerEvent, fits_a_frame};
+use super::{Actor, DEFAULT_AGENT_NAME, PeerError, PeerEvent, bump, fits_a_frame};
 use crate::peer::spaces::{Fired, MAX_TRACKED_LEASE_MILLIS, Slot};
 use crate::space::watch::{CloseReason, WatchQueue};
 use crate::space::{
@@ -96,10 +109,6 @@ const MAX_WATCHERS: usize = 4096;
 const MAX_HELD_AGENTS: usize = 4096;
 /// How often every open space collects its tombstones ([module docs](self#collection)).
 pub(in crate::peer) const COLLECT_INTERVAL: Duration = Duration::from_secs(5);
-/// How long a lapsed entry's tombstone stays at most (Java `SpaceStateCrdt.LAPSED_GRACE_MILLIS`,
-/// five minutes): a lapse is judged alike on every replica, so it need not wait two longest
-/// leases as a completion or a withdrawal does.
-const LAPSED_GRACE_MILLIS: i64 = 5 * 60 * 1000;
 /// How often a full space collects for a received state at most.
 const FULL_COLLECT_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -185,31 +194,12 @@ fn claim_holder(claim: &Map) -> Option<&str> {
     claim.get("holder").and_then(Value::as_str)
 }
 
-/// Java `SpaceStateCrdt.collectable` (SPEC §7.3): whether `state` is a tombstone past its horizon
-/// at `now` in a space whose longest lease is `max_lease`. An entry still visible (present, its
-/// write lease holding; a lease of another kind never lapses) never is. Otherwise its horizon is
-/// its lease's expiry plus two longest leases for a completed or withdrawn entry, the shorter of
-/// that and [`LAPSED_GRACE_MILLIS`] for a lapsed one. A state without a readable lease is kept.
-pub(in crate::peer) fn collectable(state: &Map, now: i64, max_lease: i64) -> bool {
-    let Some(expiry) = write_expiry(state) else {
-        return false;
-    };
-    if expiry > now {
-        return false;
-    }
-    let present = fold::is_present(state);
-    if present && !write_lapsed(state, now) {
-        return false;
-    }
-    let twice = max_lease.max(0).saturating_mul(2);
-    let keep = if present {
-        twice.min(LAPSED_GRACE_MILLIS)
-    } else {
-        twice
-    };
-    expiry
-        .checked_add(keep)
-        .is_some_and(|horizon| horizon <= now)
+/// Java `SpaceStateCrdt.collectable` under the legacy rule (SPEC §7.3): whether `state` is a
+/// tombstone past its horizon at `now` in a space whose longest lease is `max_lease`
+/// ([`horizon::collectable`]). A state without a readable lease is kept.
+#[cfg(test)]
+fn collectable(state: &Map, now: i64, max_lease: i64) -> bool {
+    horizon::collectable(state, now, max_lease, horizon::Rule::Legacy)
 }
 
 /// The lease a state carries, milliseconds: its expiry less the physical time of its lease stamp
@@ -535,6 +525,7 @@ impl Actor {
                     entry_id: entry_id.to_owned(),
                 });
                 self.bump_folds();
+                self.dial_rounds.note_activity();
             }
             FoldOutcome::Unchanged | FoldOutcome::Deferred => {}
         }
@@ -619,27 +610,46 @@ impl Actor {
     /// *without* its payload (`Value::Null`): the take keeps the payload its candidate carried
     /// (Java's `claimedValue`), which the entry's signed record fixes, so a payload block evicted
     /// from the fetched cache during the settle window cannot empty a won take.
+    ///
+    /// A claim that won after a holder it displaced completed the entry (that holder heard of
+    /// this claim later than the settle window, [`Actor::note_outbid_completion`]) finds the work
+    /// done: the take acknowledges that completion under this claim, with no result, and answers
+    /// `None` (SPEC §7.4, the settle guarantee's second rule).
     pub(crate) fn space_settle(
         &mut self,
         space: &str,
         entry_id: &str,
         holder: &str,
         epoch: i64,
+        agent: Option<AgentIdentity>,
     ) -> Option<EntryView> {
         let now = self.now();
-        let view = {
-            let slot = self.spaces.get(space)?;
+        let (view, done_by_outbid) = {
+            let slot = self.spaces.get_mut(space)?;
             let state = slot.store.state(entry_id)?;
             let claim = slot.store.claim_of(entry_id)?;
             let won = fold::is_present(state)
                 && claim_holder(claim) == Some(holder)
                 && claim_epoch(claim) == epoch
-                && claim_live(claim, now);
-            if !won || self.registry.refuses(holder, None, None) {
-                return None;
+                && claim_live(claim, now)
+                && !self.registry.refuses(holder, None, None);
+            let done_by_outbid = won && slot.settle.outbid(entry_id) == Some(epoch);
+            let view = if won {
+                bare_view(entry_id, state, Some(claim), now)
+            } else {
+                None
+            };
+            if !done_by_outbid {
+                slot.settle.take_outbid(entry_id);
             }
-            bare_view(entry_id, state, Some(claim), now)?
+            (view?, done_by_outbid)
         };
+        if done_by_outbid {
+            // The completion finds the line, acknowledges, counts, and reports it by failing; a
+            // claim lost meanwhile has nothing to acknowledge and fails the same way.
+            let _ = self.space_complete(space, entry_id, holder, epoch, agent, None);
+            return None;
+        }
         self.fire_taken(space, entry_id);
         Some(view)
     }
@@ -708,8 +718,9 @@ impl Actor {
     }
 
     /// Renews a held take (Java `Taken.renew`, `peer.rb`'s `renew_claim`): the claim re-signed
-    /// with the same epoch, stamp, holder, and bid and the expiry `now + lease`, which the lattice
-    /// prefers, rumored under `c:<entry id>:renew:<expiry>`. Answers the expiry in force.
+    /// with the same epoch, stamp, holder, and bid and the expiry `max(current, now + lease)`
+    /// (SPEC §7.2), which the lattice prefers, rumored under `c:<entry id>:renew:<expiry>`. A
+    /// renewal that would not move the expiry sends nothing. Answers the expiry in force.
     pub(crate) fn space_renew_claim(
         &mut self,
         space: &str,
@@ -729,9 +740,21 @@ impl Actor {
             // Java (v0.1.13): every receiver refuses the renewal; the take lapses.
             return Err(PeerError::Revoked(holder.to_owned()).into());
         }
-        let expires_at = now
+        let asked = now
             .checked_add(lease_millis)
             .ok_or_else(|| SpaceError::InvalidLease("the lease overflows".to_owned()))?;
+        let held_expiry = current
+            .get("expiresAtMillis")
+            .and_then(Value::as_i64)
+            .unwrap_or(now);
+        let expires_at = horizon::renewed_expiry(held_expiry, now, lease_millis);
+        if asked < held_expiry {
+            bump(&mut self.counters.renew_shortenings);
+        }
+        if expires_at == held_expiry {
+            // The hold already runs at least that long, and a renewal never shortens it.
+            return Ok(held_expiry);
+        }
         let stamp = current
             .get("stamp")
             .and_then(Value::as_str)
@@ -785,6 +808,17 @@ impl Actor {
         if self.refuses(holder, agent.as_ref()) {
             return Err(PeerError::Revoked(holder.to_owned()).into());
         }
+        // A holder this claim displaced completed the entry after this take was judged (SPEC
+        // §7.4): this completion acknowledges that one, and the result is not written.
+        let outbid = self
+            .spaces
+            .get_mut(space)
+            .and_then(|slot| slot.settle.take_outbid(entry_id));
+        if outbid == Some(epoch) {
+            self.commit_completion(space, entry_id, agent.as_ref(), now)?;
+            bump(&mut self.counters.outbid_acknowledged);
+            return Err(SpaceError::CompletedByDisplaced(EntryId::new(entry_id)));
+        }
         let prepared = match result {
             Some(result) => {
                 let prepared = self.prepare_write(
@@ -811,6 +845,11 @@ impl Actor {
                 self.discard_write(prepared);
             }
             return Err(error);
+        }
+        // This holder did the work, so a displaced holder's completion arriving later is a
+        // duplicate (SPEC §7.4, the settle guarantee's third rule).
+        if let Some(slot) = self.spaces.get_mut(space) {
+            slot.settle.note_completed_here(entry_id, epoch);
         }
         match prepared {
             Some(prepared) => Ok(Some(EntryId::new(self.commit_write(space, prepared)?))),
@@ -929,9 +968,11 @@ impl Actor {
     }
 
     /// Renews a write this peer (or its agent) issued (`peer.py`'s `renew_entry`, Java
-    /// `Handle.renew`): a later lease stamp and the lease `{holder: issuer, expiresAtMillis: now +
-    /// lease, kind: WRITE}`, re-signed by the issuer, rumored under `r:<entry id>:<lease stamp>`.
-    /// A lapsed, completed, or withdrawn entry is [`SpaceError::LeaseLapsed`].
+    /// `Handle.renew`): a later lease stamp and the lease `{holder: issuer, expiresAtMillis:
+    /// max(current, now + lease), kind: WRITE}` (SPEC §7.2), re-signed by the issuer, rumored under
+    /// `r:<entry id>:<lease stamp>`. A renewal that would not move the expiry succeeds and sends
+    /// nothing. A lapsed, completed, or withdrawn entry is [`SpaceError::LeaseLapsed`]; only the
+    /// issuer renews ([`SpaceError::NotIssuer`]).
     pub(crate) fn space_renew_write(
         &mut self,
         space: &str,
@@ -952,9 +993,18 @@ impl Actor {
         if self.refuses(&issuer, agent.as_ref()) {
             return Err(PeerError::Revoked(issuer).into());
         }
-        let expires_at = now
+        let asked = now
             .checked_add(lease_millis)
             .ok_or_else(|| SpaceError::InvalidLease("the lease overflows".to_owned()))?;
+        let current = write_expiry(&dto).unwrap_or(now);
+        let expires_at = horizon::renewed_expiry(current, now, lease_millis);
+        if asked < current {
+            bump(&mut self.counters.renew_shortenings);
+        }
+        if expires_at == current {
+            // The lease already runs at least that long, and a renewal never shortens it.
+            return Ok(());
+        }
         let lease_stamp = self.issuer_stamp(&issuer, now)?;
         dto.insert("leaseStamp", lease_stamp.as_str());
         dto.insert(
@@ -1004,21 +1054,27 @@ impl Actor {
     // ----------------------------------------------------------------------------- collection
 
     /// Folds a state received for `space` (a rumor's or a pull response's): a state already past
-    /// the collection horizon is refused at the door (SPEC §7.3, Java `mergeState`: a member that
-    /// collects later, or never, would otherwise bounce it back as new), judged with its own
-    /// lease counted in the space's longest, as Java observes it first; a new entry for a full
-    /// space first collects the space (at most once every [`FULL_COLLECT_INTERVAL`]).
+    /// its collection horizon is refused at the door (SPEC §7.3, Java `mergeState`: a member that
+    /// collects later, or never, would otherwise bounce it back as new), judged by the rule and
+    /// the clock the space's sweep uses, with its own lease counted in the space's longest, as
+    /// Java observes it first, and acknowledged when this space holds no state of its entry; a
+    /// new entry for a full space first collects the space (at most once every
+    /// [`FULL_COLLECT_INTERVAL`]).
     pub(super) fn fold_remote_state(&mut self, space: &str, dto: &Map) -> Option<FoldOutcome> {
         let now = self.now();
         let mut collect = false;
-        if let Some(slot) = self.spaces.get(space) {
+        if self.spaces.contains(space) {
+            let rule = self.horizon_rule(space, now);
+            let slot = self.spaces.get(space)?;
             let own_span =
                 state_lease_span(dto).map_or(0, |span| span.min(MAX_TRACKED_LEASE_MILLIS));
-            if collectable(dto, now, slot.max_lease.max(own_span)) {
+            if self.collects(rule, dto, now, slot.max_lease.max(own_span)) {
                 self.counters.space_reoffers_refused =
                     self.counters.space_reoffers_refused.saturating_add(1);
+                self.acknowledge_collected(space, dto, now);
                 return Some(FoldOutcome::Unchanged);
             }
+            let slot = self.spaces.get(space)?;
             let entry_id = record_of(dto)
                 .and_then(|record| record.get("entryId"))
                 .and_then(Value::as_str);
@@ -1037,6 +1093,114 @@ impl Actor {
         self.fold_state(space, dto)
     }
 
+    /// Judges a completion of `space` this peer refused, received with the claim `proof` it
+    /// travelled with (`claim_entry`, already folded), when a claim of one of this peer's own
+    /// holders displaces `proof` in the lattice (Java `noteOutbidCompletion`). The displaced
+    /// holder judged its take before this peer's claim reached it, later than the settle window
+    /// (SPEC §7.4, the settle guarantee), ran its action and completed; its completion fails to
+    /// authenticate against the claim held here, so it stays dropped, as SPEC §11a.4 has every
+    /// replica do. When it authenticates under its own claim, and its holder is not revoked:
+    ///
+    /// - while this peer still holds the entry present under a live claim, the completion is
+    ///   noted, so this peer's take, when it is judged, or its completion, when it comes,
+    ///   acknowledges it with no result instead of doing the work again
+    ///   ([`PeerCounters::outbid_acknowledged`]);
+    /// - when this peer's holder already completed the entry with its own work at the held
+    ///   claim's epoch, both did the work: the duplicate is counted, once per entry
+    ///   ([`PeerCounters::duplicate_completions`]).
+    ///
+    /// A displaced claim at a lower epoch counts too: its holder never heard of the claim this
+    /// peer saw lapse, so it claimed afresh, which only late delivery allows.
+    ///
+    /// [`PeerCounters::outbid_acknowledged`]: crate::peer::PeerCounters::outbid_acknowledged
+    /// [`PeerCounters::duplicate_completions`]: crate::peer::PeerCounters::duplicate_completions
+    pub(super) fn note_outbid_completion(
+        &mut self,
+        space: &str,
+        claim_entry: &str,
+        proof: &Map,
+        received: &Map,
+    ) {
+        if !is_completed(received) {
+            return;
+        }
+        let Some(entry_id) = records::state_entry_id(received) else {
+            return;
+        };
+        let Some(displaced) = proof.get("claim").and_then(Value::as_map) else {
+            return;
+        };
+        if entry_id != claim_entry
+            || displaced.get("entryId").and_then(Value::as_str) != Some(entry_id)
+        {
+            return;
+        }
+        let now = self.now();
+        let Some(slot) = self.spaces.get(space) else {
+            return;
+        };
+        let (Some(held_proof), Some(state)) =
+            (slot.store.claim_proof(entry_id), slot.store.state(entry_id))
+        else {
+            return;
+        };
+        let Some(held) = held_proof.get("claim").and_then(Value::as_map) else {
+            return;
+        };
+        let (Some(held_holder), Some(displaced_holder)) =
+            (claim_holder(held), claim_holder(displaced))
+        else {
+            return;
+        };
+        let ours = held_holder.split('/').next() == Some(self.peer_id.as_str());
+        let held_epoch = claim_epoch(held);
+        if !ours
+            || held_holder == displaced_holder
+            || claim_epoch(displaced) > held_epoch
+            || records::merge_claims(Some(held_proof), proof) != *held_proof
+        {
+            return;
+        }
+        let duplicate = if fold::is_present(state) {
+            if !claim_live(held, now)
+                || !claim_live(displaced, now)
+                || slot.settle.outbid(entry_id) == Some(held_epoch)
+            {
+                return;
+            }
+            false
+        } else if is_completed(state) && slot.settle.completed_here(entry_id) == Some(held_epoch) {
+            true
+        } else {
+            return;
+        };
+        let ctx = FoldContext::new(now, &self.registry).with_space(&slot.space_id);
+        if !slot
+            .store
+            .authenticates_completion_under(received, proof, &ctx)
+        {
+            return;
+        }
+        let entry_id = entry_id.to_owned();
+        let Some(slot) = self.spaces.get_mut(space) else {
+            return;
+        };
+        if !duplicate {
+            slot.settle.note_outbid(&entry_id, held_epoch);
+        } else if slot.settle.take_completed_here(&entry_id, held_epoch) {
+            bump(&mut self.counters.duplicate_completions);
+            tracing::info!(
+                peer = %self.peer_id,
+                space,
+                entry = %entry_id,
+                displaced = displaced_holder,
+                "agentspaces: an entry was completed twice: here, and by a holder whose claim lost \
+                 the race but heard of the winner later than the settle window (SPEC 7.4); the \
+                 shared state keeps one completion"
+            );
+        }
+    }
+
     /// Whether `space` has room for one more entry, collecting it first when it is full.
     pub(super) fn space_has_room(&mut self, space: &str, now: i64) -> bool {
         let room = |slot: &Slot| slot.store.len() < slot.store.max_entries();
@@ -1051,10 +1215,15 @@ impl Actor {
 
     /// The collection timer: every open space collects its tombstones.
     pub(super) fn on_collect(&mut self) {
+        self.collect_now();
+    }
+
+    /// Every open space collects its tombstones now; how many entries went.
+    pub(crate) fn collect_now(&mut self) -> usize {
         self.last_collect = Instant::now();
         let now = self.now();
         let names = self.spaces.names();
-        self.collect_spaces(&names, now);
+        self.collect_spaces(&names, now)
     }
 
     /// Collects the tombstones of `spaces` past their horizon ([module docs](self#collection)),
@@ -1069,16 +1238,23 @@ impl Actor {
         let mut gone: HashSet<(String, String)> = HashSet::new();
         let mut count = 0usize;
         for space in spaces {
+            if !self.spaces.contains(space) {
+                continue;
+            }
+            let rule = self.horizon_rule(space, now);
+            let tombstones: Vec<String> = match self.spaces.get(space) {
+                Some(slot) => slot
+                    .store
+                    .states()
+                    .filter(|(_, state)| self.collects(rule, state, now, slot.max_lease))
+                    .map(|(entry_id, _)| entry_id.to_owned())
+                    .collect(),
+                None => continue,
+            };
             let Some(slot) = self.spaces.get_mut(space) else {
                 continue;
             };
-            let max_lease = slot.max_lease;
-            let tombstones: Vec<String> = slot
-                .store
-                .states()
-                .filter(|(_, state)| collectable(state, now, max_lease))
-                .map(|(entry_id, _)| entry_id.to_owned())
-                .collect();
+            slot.store.forget_acknowledged(now);
             // Claims fold before their states; a lapsed one whose state never came (or was
             // refused at the door) takes nothing and is kept by nothing.
             let orphans: Vec<String> = slot
@@ -1099,6 +1275,7 @@ impl Actor {
                 }
                 slot.forget_size(&entry_id);
                 slot.fired.remove(&entry_id);
+                slot.settle.forget(&entry_id);
                 gone.insert((space.clone(), entry_id));
                 count = count.saturating_add(1);
             }
@@ -1198,7 +1375,10 @@ impl Actor {
     }
 
     /// The transitions after a state of `entry_id` folded (applied) into `space`: `Written` at
-    /// the first fold of a live entry, `Completed` when the joined state turned completed.
+    /// the first fold of a live entry, `Completed` when the joined state turned completed. An
+    /// entry first learned already completed (SPEC §7.2, *Completed on arrival*) was never
+    /// present here: it raises no `Written` (nor `Taken`, which needs a present entry), and
+    /// `Completed` only when its value is held here already; no block is fetched for it.
     pub(super) fn after_state(&mut self, space: &str, entry_id: &str, is_new: bool) {
         let now = self.now();
         let (written, completed) = {
@@ -1220,7 +1400,30 @@ impl Actor {
             self.deliver(space, EventKind::Written, entry_id);
         }
         if completed {
-            self.deliver(space, EventKind::Completed, entry_id);
+            if is_new {
+                if self.value_held(space, entry_id) {
+                    self.deliver(space, EventKind::Completed, entry_id);
+                }
+            } else {
+                self.deliver(space, EventKind::Completed, entry_id);
+            }
+        }
+    }
+
+    /// Whether an entry's value is available here without fetching anything: an inline or null
+    /// payload, or a block already held.
+    fn value_held(&self, space: &str, entry_id: &str) -> bool {
+        let Some(state) = self
+            .spaces
+            .get(space)
+            .and_then(|slot| slot.store.state(entry_id))
+        else {
+            return false;
+        };
+        match record_of(state).and_then(records::payload_source) {
+            Some(PayloadSource::Inline(_) | PayloadSource::Null) => true,
+            Some(PayloadSource::Block(cid)) => self.blocks.get(cid).is_some(),
+            Some(PayloadSource::Content(_)) | None => false,
         }
     }
 
@@ -1369,13 +1572,26 @@ impl Actor {
         });
     }
 
-    /// Offers again the transitions that waited for a block (a block arrived, or the sweep).
+    /// Offers again the transitions that waited for a block (a block arrived, or the sweep). A
+    /// `Written` is offered only while its entry is still present and unexpired (SPEC §7.2): one
+    /// that completed meanwhile raises its `Completed` alone, and one withdrawn or lapsed raises
+    /// nothing.
     pub(super) fn retry_deferred(&mut self) {
         if self.deferred.is_empty() {
             return;
         }
+        let now = self.now();
         let waiting = std::mem::take(&mut self.deferred);
         for deferred in waiting {
+            if deferred.kind == EventKind::Written
+                && !self
+                    .spaces
+                    .get(&deferred.space)
+                    .and_then(|slot| slot.store.state(&deferred.entry_id))
+                    .is_some_and(|state| visible(state, now))
+            {
+                continue;
+            }
             self.deliver(&deferred.space, deferred.kind, &deferred.entry_id);
         }
     }
@@ -1495,10 +1711,19 @@ mod tests {
             state(lease(100, "WRITE"), false, true),
         ] {
             assert!(!collectable(&done, 99, 0), "not before its lease lapsed");
-            assert!(collectable(&done, 100, 0));
             assert!(!collectable(&done, 100 + 2 * 60 * minute - 1, 60 * minute));
             assert!(collectable(&done, 100 + 2 * 60 * minute, 60 * minute));
         }
+        // A completed one at once under a zero longest lease; a withdrawn one never before the
+        // drift floor, ten minutes past its lease (SPEC §7.3, v0.1.35).
+        assert!(collectable(
+            &state(lease(100, "WRITE"), true, false),
+            100,
+            0
+        ));
+        let withdrawn = state(lease(100, "WRITE"), false, true);
+        assert!(!collectable(&withdrawn, 100 + 10 * minute - 1, 0));
+        assert!(collectable(&withdrawn, 100 + 10 * minute, 0));
         // A present entry under a lease of another kind never lapses, so never goes.
         assert!(!collectable(
             &state(lease(100, "TAKE"), false, false),

@@ -25,6 +25,10 @@
 //!
 //! [`Peer`]: super::Peer
 
+mod audit;
+mod horizon;
+mod probes;
+mod rounds;
 mod serve;
 mod space_ops;
 
@@ -146,6 +150,16 @@ pub(super) struct Settings {
     pub space_max_bytes: usize,
     /// The listening role's settings, clamped (`PeerConfig::listen`).
     pub listen: ListenSettings,
+    /// Whether this peer advertises `wire.ae=2` and audits (`PeerConfig::audit`).
+    pub audit: bool,
+    /// The budget this peer asks for (`PeerConfig::audit_budget`).
+    pub audit_budget: i64,
+    /// Whether this peer advertises `wire.horizon=1` and applies the per-entry horizon
+    /// (`PeerConfig::horizon`).
+    pub horizon: bool,
+    /// The fully hinted rounds before the per-entry horizon engages
+    /// (`PeerConfig::horizon_engage_rounds`, clamped to 1 ..= 64).
+    pub horizon_engage_rounds: u32,
 }
 
 /// The listening role's settings ([`ListenConfig`]), clamped to sane ranges.
@@ -161,6 +175,7 @@ pub(super) struct ListenSettings {
     pub anti_entropy_period: Option<Duration>,
     pub introduction_timeout: Duration,
     pub link_idle_timeout: Duration,
+    pub probe_streams: usize,
 }
 
 impl ListenSettings {
@@ -179,6 +194,9 @@ impl ListenSettings {
             anti_entropy_period: config.anti_entropy_period.map(clamp),
             introduction_timeout: clamp(config.introduction_timeout),
             link_idle_timeout: clamp(config.link_idle_timeout),
+            probe_streams: config
+                .probe_streams
+                .min(agentspaces_wire::bodies::PROBE_STREAMS_MAX),
         }
     }
 }
@@ -206,6 +224,32 @@ impl Settings {
             fetched_block_bytes: MAX_FETCHED_BLOCK_BYTES,
             space_max_bytes: super::DEFAULT_SPACE_MAX_BYTES,
             listen: ListenSettings::of(&ListenConfig::default()),
+            audit: true,
+            audit_budget: agentspaces_wire::audit::BUDGET_DEFAULT,
+            horizon: true,
+            horizon_engage_rounds: agentspaces_wire::horizon::DEFAULT_ENGAGE_ROUNDS,
+        }
+    }
+
+    /// These settings with the per-entry horizon of SPEC §7.3 on or off and its engage rounds
+    /// (clamped to 1 ..= 64).
+    pub fn with_horizon(self, horizon: bool, engage_rounds: u32) -> Self {
+        Self {
+            horizon,
+            horizon_engage_rounds: engage_rounds.clamp(
+                agentspaces_wire::horizon::ENGAGE_ROUNDS_MIN,
+                agentspaces_wire::horizon::ENGAGE_ROUNDS_MAX,
+            ),
+            ..self
+        }
+    }
+
+    /// These settings with the audit of SPEC annex I.6 on or off and the budget it asks for.
+    pub fn with_audit(self, audit: bool, audit_budget: usize) -> Self {
+        Self {
+            audit,
+            audit_budget: i64::try_from(audit_budget).unwrap_or(i64::MAX),
+            ..self
         }
     }
 
@@ -498,6 +542,12 @@ pub(super) struct Actor {
     warned_cards: HashSet<(String, usize)>,
     /// The listening role's state ([`serve`]); inert on a dial-only peer.
     hub: Hub,
+    /// The trie audit of SPEC annex I.6 ([`audit`]).
+    audit: audit::AuditState,
+    /// The view's half of the per-entry horizon of SPEC §7.3 ([`horizon`]).
+    horizon_view: horizon::HorizonView,
+    /// A dial-only peer's periodic rounds toward its seed ([`rounds`]).
+    dial_rounds: rounds::DialRounds,
 }
 
 /// Starts an actor, on `dialed` (a channel dialed to a seed) when there is one, and returns its
@@ -545,6 +595,21 @@ impl Actor {
     fn new(start: Start, inbound_tx: mpsc::Sender<Inbound>, listeners: &[BoundListener]) -> Self {
         let peer_id = start.identity.peer_id().to_owned();
         let hub = Hub::new(&start.settings.listen, listeners);
+        let resource_hints = with_horizon_level(
+            with_audit_level(
+                with_app_card_level(start.resource_hints),
+                start.settings.audit,
+            ),
+            start.settings.horizon,
+        );
+        // Each rule is a promise the card makes: a peer audits and applies the per-entry horizon
+        // only while its card says so, so a configured hint of another value turns it off.
+        let mut settings = start.settings;
+        settings.audit &=
+            agentspaces_wire::audit::hints_audit(Some(&Value::Map(resource_hints.clone())));
+        settings.horizon &=
+            agentspaces_wire::horizon::hints_horizon(Some(&Value::Map(resource_hints.clone())));
+        let audit_state = audit::AuditState::new(settings.audit, settings.audit_budget);
         let mut registry = Registry::new(start.founder, Some(start.group.clone()));
         if registry.founder().is_none() {
             registry.set_founder(start.founding.as_ref().and_then(founder_of));
@@ -552,11 +617,11 @@ impl Actor {
         Self {
             hlc: start.hlc,
             identity: Arc::new(start.identity),
-            spaces: Spaces::new(&start.group, start.settings.space_max_entries),
-            blocks: BlockStore::new(MAX_OWN_BLOCK_BYTES, start.settings.fetched_block_bytes),
+            spaces: Spaces::new(&start.group, settings.space_max_entries),
+            blocks: BlockStore::new(MAX_OWN_BLOCK_BYTES, settings.fetched_block_bytes),
             group: start.group,
             clock: start.clock,
-            settings: start.settings,
+            settings,
             dialers: start.dialers,
             seeds: start.seeds,
             issuer_clocks: HashMap::new(),
@@ -566,7 +631,7 @@ impl Actor {
             members: MemberView::new(MAX_MEMBERS),
             reachable: BTreeSet::new(),
             seed_peer: None,
-            resource_hints: with_app_card_level(start.resource_hints),
+            resource_hints,
             counters: PeerCounters::default(),
             link: None,
             next_link_id: 0,
@@ -602,6 +667,9 @@ impl Actor {
             last_collect: Instant::now(),
             deferred: VecDeque::new(),
             warned_cards: HashSet::new(),
+            audit: audit_state,
+            horizon_view: horizon::HorizonView::default(),
+            dial_rounds: rounds::DialRounds::default(),
             hub,
             peer_id,
         }
@@ -628,6 +696,7 @@ impl Actor {
                 self.last_collect.checked_add(COLLECT_INTERVAL)
             };
             let tick_at = self.hub.next_tick;
+            let round_at = self.dial_rounds.due();
             tokio::select! {
                 job = jobs.recv() => match job {
                     Some(job) => job(&mut self),
@@ -639,6 +708,7 @@ impl Actor {
                 () = wake_at(sweep_at) => self.on_sweep(),
                 () = wake_at(collect_at) => self.on_collect(),
                 () = wake_at(tick_at) => self.on_listen_tick(),
+                () = wake_at(round_at) => self.on_dial_round(),
             }
         }
         self.close();
@@ -807,6 +877,7 @@ impl Actor {
         let Some(link) = self.link.take() else {
             return;
         };
+        self.disarm_dial_rounds();
         link.closer.close();
         if link.queue.shared.stalled.load(Ordering::SeqCst) {
             bump(&mut self.counters.send_overflows);
@@ -973,18 +1044,15 @@ impl Actor {
     }
 
     /// On a link the peer may speak on: introduce, pull the revocations and whatever was pulled
-    /// before, and send the writes made while there was no link.
+    /// before (packed, [`Actor::link_ready_pulls`]), send the writes made while there was no
+    /// link, and (dial-only) arm the periodic rounds ([`rounds`]), whose first these pulls are.
     fn on_link_ready(&mut self) {
         self.introduce();
-        let _ = self.send_revocation_digest();
-        if self.pulled_ads {
-            let _ = self.send_ads_digest();
-        }
-        for space in self.pulled_spaces.clone() {
-            let _ = self.send_space_digest(&space);
-        }
+        // One packed pull of every stream, not one frame per space (a seed paces its answers).
+        self.link_ready_pulls();
         self.flush_outbox();
         self.flush_dialed_backlog();
+        self.arm_dial_rounds();
     }
 
     /// The re-lease is due: introduce again (which also re-arms it), and send any writes still
@@ -1281,11 +1349,14 @@ impl Actor {
     }
 
     fn send_digest(&mut self, streams: &[&str]) -> Result<(), PeerError> {
-        let digests: Map = streams
-            .iter()
-            .map(|stream| (*stream, Vec::<u8>::new()))
-            .collect();
-        self.send(KIND_DIGEST, &bodies::digest_body(&digests), None)
+        let body = self.pull_body(streams);
+        self.reset_continuations();
+        if let Some(seed) = self.seed_peer.clone()
+            && self.partner_audits(&seed)
+        {
+            self.note_budgeted_pull(&seed);
+        }
+        self.send(KIND_DIGEST, &body, None)
     }
 
     fn send_revocation_digest(&mut self) -> Result<(), PeerError> {
@@ -1393,7 +1464,7 @@ impl Actor {
         match kind.as_str() {
             KIND_PING => {
                 let nonce = bodies::parse_ping(&body).ok_or(Malformed)?;
-                let ack = bodies::ack_body(nonce);
+                let ack = self.on_ping(&sender, &body, nonce);
                 // Java answers `send(group, from, ACK)`: addressed to the prober, and back through
                 // the relay when the PING came inside a RELAY_FRAME, else the seed takes an ACK it
                 // never asked for and the prober evicts this peer.
@@ -1439,12 +1510,7 @@ impl Actor {
             }
             KIND_GROUP_AD => self.on_group_ad(&body)?,
             KIND_RUMOR => self.on_rumor(bodies::parse_rumor(&body).ok_or(Malformed)?, via)?,
-            KIND_PULL_RESP => {
-                let deltas = bodies::parse_pull_resp(&body).ok_or(Malformed)?;
-                if self.pull_resp_wanted(&sender, via) {
-                    self.on_pull_resp(deltas)?;
-                }
-            }
+            KIND_PULL_RESP => self.on_pull_resp_frame(&sender, &body, via)?,
             // A dial-only peer serves no digests and no foundings; a listening one answers both.
             KIND_DIGEST if self.hub.listening => self.on_digest(&sender, &body, via)?,
             KIND_GROUP_AD_WANT if self.hub.listening => {
@@ -1706,6 +1772,7 @@ impl Actor {
         if revocation::STREAMS.contains(&stream) {
             let now = self.now();
             if self.registry.accept(stream, &rumor.payload, now) {
+                self.dial_rounds.note_activity();
                 // The revoked member's advertisements leave the cache now, as in Java.
                 self.ads.purge(&self.registry);
                 if stream == revocation::PEER_STREAM {
@@ -1732,11 +1799,22 @@ impl Actor {
             self.replicate_space(space);
             let mut verified = true;
             // Claim before state: a completion authenticates against the holder's claim.
-            if let Some((entry_id, signed)) = delta.claim {
-                verified &= serve::forwardable(self.fold_claim(space, &entry_id, &signed));
+            let mut claim_folded = false;
+            if let Some((entry_id, signed)) = &delta.claim {
+                let outcome = self.fold_claim(space, entry_id, signed);
+                claim_folded = outcome.is_some_and(|outcome| !outcome.is_refused());
+                verified &= serve::forwardable(outcome);
             }
             if let Some(state) = delta.state {
-                verified &= serve::forwardable(self.fold_remote_state(space, &state));
+                let outcome = self.fold_remote_state(space, &state);
+                // A completion the claim held here displaces (SPEC §7.4, the settle guarantee).
+                if claim_folded
+                    && outcome.is_some_and(FoldOutcome::is_refused)
+                    && let Some((entry_id, signed)) = &delta.claim
+                {
+                    self.note_outbid_completion(space, entry_id, signed, &state);
+                }
+                verified &= serve::forwardable(outcome);
             }
             Ok(verified)
         } else {
@@ -1781,6 +1859,7 @@ impl Actor {
             }
         }
         if revoked_any {
+            self.dial_rounds.note_activity();
             self.ads.purge(&self.registry);
         }
         if revoked_peers {
@@ -1807,7 +1886,12 @@ impl Actor {
                     self.accept_peer_ad(payload);
                 }
             }
-            if !deltas.is_empty() {
+            // The view carries advertisements, which are liveness and never activity (SPEC §5.3,
+            // the idle floor): a pull that brought nothing else leaves the rounds stretched.
+            if deltas
+                .iter()
+                .any(|(stream, _)| stream.as_str() != Some(serving::STREAM_VIEW))
+            {
                 self.hub.activity = true;
             }
         }
@@ -1820,11 +1904,28 @@ impl Actor {
             };
             match records::decode_sync_delta(bytes) {
                 Some(sync) => {
+                    let mut folded: HashSet<&str> = HashSet::new();
                     for (entry_id, signed) in &sync.claims {
-                        self.fold_claim(space, entry_id, signed);
+                        if self
+                            .fold_claim(space, entry_id, signed)
+                            .is_some_and(|outcome| !outcome.is_refused())
+                        {
+                            folded.insert(entry_id.as_str());
+                        }
                     }
                     for state in &sync.states {
-                        self.fold_remote_state(space, state);
+                        let outcome = self.fold_remote_state(space, state);
+                        // A completion the claim held here displaces (SPEC §7.4).
+                        if outcome.is_some_and(FoldOutcome::is_refused)
+                            && let Some(entry_id) = records::state_entry_id(state)
+                            && folded.contains(entry_id)
+                            && let Some((_, signed)) = sync
+                                .claims
+                                .iter()
+                                .find(|(claimed, _)| claimed.as_str() == entry_id)
+                        {
+                            self.note_outbid_completion(space, entry_id, signed, state);
+                        }
                     }
                 }
                 // Counted as an undecodable delta; the other streams still apply.
@@ -1917,7 +2018,7 @@ impl Actor {
             return true;
         }
         self.refresh_member(&issuer, &ad, payload, issued);
-        self.members.hold_ad(issuer, ad);
+        self.members.hold_ad(issuer, ad, now);
         true
     }
 
@@ -1942,19 +2043,24 @@ impl Actor {
     /// [`PeerCounters::unopened_space_items`]): remote data never opens a space.
     ///
     /// A fold that was not refused wakes the waiting reads and takes; one that applied derives
-    /// the entry's transitions for the watches ([`Actor::after_state`]).
+    /// the entry's transitions for the watches ([`Actor::after_state`]). Under `wire.ae=2` a
+    /// state whose entry id holds a control character is dropped first, uncounted and
+    /// unacknowledged (SPEC annex I.6); a verified state refused for its actor's revocation or its
+    /// stamps is acknowledged in the space's digest (SPEC §7.3).
     fn fold_state(&mut self, space: &str, dto: &Map) -> Option<FoldOutcome> {
         let now = self.now();
-        let Some(slot) = self.spaces.get_mut(space) else {
+        if !self.spaces.contains(space) {
             bump(&mut self.counters.unopened_space_items);
             return None;
-        };
+        }
         let record = dto.get("record");
-        let entry_id = record
-            .and_then(|record| record.get("entryId"))
-            .and_then(Value::as_str)
+        let entry_id = agentspaces_wire::records::state_entry_id(dto)
             .unwrap_or_default()
             .to_owned();
+        if self.drops_control_id(&entry_id) {
+            return Some(FoldOutcome::Refused(Refusal::ControlId));
+        }
+        let slot = self.spaces.get_mut(space)?;
         let known = slot.store.state(&entry_id).is_some();
         let size = serve::state_size(dto);
         if !known && slot.bytes.saturating_add(size) > self.settings.space_max_bytes {
@@ -1970,6 +2076,17 @@ impl Actor {
         }
         let ctx = FoldContext::new(now, &self.registry).with_space(&slot.space_id);
         let outcome = slot.store.fold_state(dto, &ctx);
+        if matches!(
+            outcome,
+            FoldOutcome::Refused(
+                Refusal::Revoked | Refusal::StampLogical | Refusal::StampFarFuture
+            )
+        ) {
+            self.acknowledge_refused_state(space, &entry_id, dto);
+        }
+        let Some(slot) = self.spaces.get_mut(space) else {
+            return Some(outcome);
+        };
         if outcome.is_applied() {
             let held = slot.sizes.insert(entry_id.clone(), size).unwrap_or(0);
             slot.bytes = slot.bytes.saturating_sub(held).saturating_add(size);
@@ -2002,6 +2119,7 @@ impl Actor {
             self.bump_folds();
         }
         if outcome.is_applied() {
+            self.dial_rounds.note_activity();
             self.after_state(space, &entry_id, !known);
             if self.hub.listening {
                 self.fetch_payload(space, &entry_id);
@@ -2015,12 +2133,21 @@ impl Actor {
     /// derives `Taken` for the watches ([`Actor::after_claim`]).
     fn fold_claim(&mut self, space: &str, entry_id: &str, signed: &Map) -> Option<FoldOutcome> {
         let now = self.now();
-        let Some(slot) = self.spaces.get_mut(space) else {
+        if !self.spaces.contains(space) {
             bump(&mut self.counters.unopened_space_items);
             return None;
-        };
+        }
+        if self.drops_control_id(entry_id) {
+            return Some(FoldOutcome::Refused(Refusal::ControlId));
+        }
+        let slot = self.spaces.get_mut(space)?;
         let ctx = FoldContext::new(now, &self.registry).with_space(&slot.space_id);
         let outcome = slot.store.fold_claim(entry_id, signed, &ctx);
+        if outcome == FoldOutcome::Refused(Refusal::Revoked) {
+            // SPEC §9.2 R7: a revoked holder's claim is acknowledged with an `a:c:` line.
+            self.acknowledge_refused_claim(space, entry_id, signed);
+        }
+        let slot = self.spaces.get_mut(space)?;
         if outcome.is_applied()
             && let Some(span) = space_ops::claim_lease_span(signed)
         {
@@ -2043,6 +2170,7 @@ impl Actor {
             self.bump_folds();
         }
         if outcome.is_applied() {
+            self.dial_rounds.note_activity();
             self.after_claim(space, entry_id);
         }
         Some(outcome)
@@ -2165,6 +2293,9 @@ impl Actor {
         }
         counters.send_dropped = self.send_dropped.load(Ordering::Relaxed);
         counters.listen = self.hub.counters.clone();
+        counters.audit = self.audit.counters();
+        counters.dial_rounds = self.dial_rounds.rounds();
+        counters.dial_round_period_millis = self.dial_rounds.period_millis();
         // This peer's own writes refused for room, and what each store refused.
         counters.space_refused_inserts = self
             .spaces
@@ -2303,6 +2434,13 @@ impl Actor {
             }
         };
         let entry_id = uuid_v4()?;
+        if agentspaces_wire::trie::has_control(&entry_id) {
+            // SPEC annex I.6: an id holding a control character is refused where it is built for
+            // a write. A version 4 UUID never holds one; the check keeps the rule if ids change.
+            return Err(PeerError::InvalidArgument(format!(
+                "entry id {entry_id:?} holds a control character"
+            )));
+        }
         if !self.space_has_room(space, now) {
             bump(&mut self.counters.space_refused_inserts);
             return Err(PeerError::Refused {
@@ -2438,6 +2576,21 @@ impl Actor {
             .get(space)
             .map(|slot| slot.store.state_values().cloned().collect())
             .unwrap_or_default()
+    }
+
+    pub(super) fn space_horizon(&mut self, space: &str) -> Option<super::HorizonStatus> {
+        let now = self.now();
+        let rule = self.horizon_rule(space, now);
+        let slot = self.spaces.get(space)?;
+        Some(super::HorizonStatus {
+            mode: slot.gate.mode(),
+            rule,
+            engagements: slot.gate.engagements(),
+            settlements: slot.gate.settlements(),
+            disengagements: slot.gate.disengagements(),
+            max_lease_millis: slot.max_lease,
+            acknowledged_lines: slot.store.acknowledged_count(),
+        })
     }
 
     pub(super) fn space_claims(&self, space: &str) -> Vec<(String, Map)> {
@@ -2617,6 +2770,7 @@ impl Actor {
         }
         self.lose_link();
         self.stop_listening();
+        self.disarm_dial_rounds();
         self.next_want = None;
         self.outbox.clear();
         self.clear_dialed_backlog();
@@ -2701,6 +2855,29 @@ fn fits_a_frame(body: &[u8]) -> Result<(), PeerError> {
     } else {
         Ok(())
     }
+}
+
+/// The resource hints a peer advertises, with `wire.ae=2` when it audits (SPEC annex I.6).
+fn with_audit_level(mut hints: Map, audit: bool) -> Map {
+    if audit && !hints.contains_key(agentspaces_wire::audit::HINT_AE) {
+        hints.insert(
+            agentspaces_wire::audit::HINT_AE,
+            agentspaces_wire::audit::AE_LEVEL,
+        );
+    }
+    hints
+}
+
+/// The resource hints a peer advertises, with `wire.horizon=1` when it keeps the renewal rule of
+/// SPEC §7.2 and applies the per-entry horizon of §7.3.
+fn with_horizon_level(mut hints: Map, horizon: bool) -> Map {
+    if horizon && !hints.contains_key(agentspaces_wire::horizon::HINT_HORIZON) {
+        hints.insert(
+            agentspaces_wire::horizon::HINT_HORIZON,
+            agentspaces_wire::horizon::HORIZON_LEVEL,
+        );
+    }
+    hints
 }
 
 /// The resource hints a peer advertises, with the AppCard level it reads (SPEC §6.1a.2, §9:

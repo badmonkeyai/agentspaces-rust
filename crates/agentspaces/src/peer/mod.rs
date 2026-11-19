@@ -235,6 +235,25 @@ pub struct PeerConfig {
     /// The listening role: listeners, required attestation, replicated spaces, bounds, and
     /// timers ([`ListenConfig`]). Without listeners the peer is dial-only.
     pub listen: ListenConfig,
+    /// Whether the peer advertises `wire.ae=2` and repairs spaces by the trie audit of SPEC
+    /// annex I.6 toward members whose current card carries it (default `true`). Off, the peer
+    /// sends and reads today's digest forms only, and drops a body carrying an audit field.
+    pub audit: bool,
+    /// The bytes this peer asks a partner's answers to hold at most (`budget`, SPEC annex I.6;
+    /// default 1 MiB, clamped to 4 KiB ..= 4 MiB).
+    pub audit_budget: usize,
+    /// Whether the peer advertises `wire.horizon=1` and lets its spaces collect a withdrawn
+    /// entry by the per-entry horizon of SPEC §7.3 while every member in view advertises it too
+    /// (default `true`). The hint promises that every renewal this peer makes keeps the rule of
+    /// §7.2, which this crate always does, and that no identity this peer renews for is renewed
+    /// from a second node at the same time: a deployment that runs one identity (one keystore)
+    /// on two nodes at once turns this off. Off, every space keeps the legacy horizon.
+    pub horizon: bool,
+    /// The fully hinted rounds of anti-entropy the view must hold before the per-entry horizon
+    /// engages (default 3, clamped to 1 ..= 64), each one gossip period of the founding, or of
+    /// [`ListenConfig::anti_entropy_period`] when that is slower. It comes into force
+    /// one longest lease plus five minutes after it engages.
+    pub horizon_engage_rounds: u32,
 }
 
 impl PeerConfig {
@@ -260,6 +279,10 @@ impl PeerConfig {
             fetched_block_bytes: blocks::MAX_FETCHED_BLOCK_BYTES,
             space_max_bytes: DEFAULT_SPACE_MAX_BYTES,
             listen: ListenConfig::default(),
+            audit: true,
+            audit_budget: 1 << 20,
+            horizon: true,
+            horizon_engage_rounds: agentspaces_wire::horizon::DEFAULT_ENGAGE_ROUNDS,
         }
     }
 
@@ -460,6 +483,25 @@ pub struct PeerCounters {
     /// Received states refused at the door because they were already past the collection
     /// horizon: a member re-offering a tombstone this peer collects (SPEC §7.3).
     pub space_reoffers_refused: u64,
+    /// Door refusals acknowledged in the space's digest (`collectedReoffersAcknowledged`, SPEC
+    /// §7.3): the entry held no state here and the refused state verified. A refusal of a line
+    /// already acknowledged only renews its hold.
+    pub reoffers_acknowledged: u64,
+    /// Renewals (of a write, a take, or a subscription) asked for less than the lease had left,
+    /// which kept the longer lease (`renewShortenings`, SPEC §7.2).
+    pub renew_shortenings: u64,
+    /// Takes here whose claim won the lattice after a holder it displaced had completed the
+    /// entry: each acknowledged that completion under its own claim, with no result, instead of
+    /// doing the work again (SPEC §7.4, the settle guarantee). The take came back empty, or its
+    /// completion failed with [`SpaceError::CompletedByDisplaced`].
+    ///
+    /// [`SpaceError::CompletedByDisplaced`]: crate::space::SpaceError::CompletedByDisplaced
+    pub outbid_acknowledged: u64,
+    /// Entries one of this peer's holders completed with its own work whose displaced rival's
+    /// authentic completion arrived afterwards (`duplicateCompletions`, SPEC §7.4): both did the
+    /// work, which a claim delivered later than the settle window allows. The shared state keeps
+    /// one completion; this counts the duplicate once per entry, at the replica whose claim won.
+    pub duplicate_completions: u64,
     /// Space deltas and pulled sync deltas that did not decode under the wire encoding (SPEC
     /// §9.1), a stamp outside the canonical grammar included (`deltasUndecodable`). Each is
     /// dropped whole and strikes nobody.
@@ -486,8 +528,96 @@ pub struct PeerCounters {
     /// New entries a space refused because its states held [`PeerConfig::space_max_bytes`]
     /// bytes, received or this peer's own, over every space.
     pub space_bytes_refused: u64,
+    /// Periodic anti-entropy rounds this peer ran toward its seed as a dial-only peer (SPEC
+    /// §5.3); a listening peer counts its rounds in [`ListenCounters::rounds`].
+    pub dial_rounds: u64,
+    /// The period of a dial-only peer's next round, milliseconds (a gauge): the base period
+    /// after activity, doubled per idle round up to 32 times it.
+    pub dial_round_period_millis: u64,
     /// What the listening role counted (all zero on a dial-only peer).
     pub listen: ListenCounters,
+    /// What the trie audit of SPEC annex I.6 counted.
+    pub audit: AuditCounters,
+}
+
+/// Where one space stands on the collection rule of SPEC §7.3 ([`Peer::space_horizon`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct HorizonStatus {
+    /// The per-entry horizon's mode: `Legacy` while this peer or a member in view lacks
+    /// `wire.horizon=1`, `Waiting` while it counts the fully hinted rounds, `Settling` for one
+    /// longest lease plus five minutes after it engaged, then `PerEntry`.
+    pub mode: agentspaces_wire::horizon::Mode,
+    /// The rule the space applies now.
+    pub rule: agentspaces_wire::horizon::Rule,
+    /// How many times the per-entry horizon engaged.
+    pub engagements: u64,
+    /// How many times it came into force.
+    pub settlements: u64,
+    /// How many times a member without the hint disengaged it from settling or in force.
+    pub disengagements: u64,
+    /// The longest lease the space has observed, milliseconds (capped at 24 hours).
+    pub max_lease_millis: i64,
+    /// The lines the space acknowledges in its digest now (at most 8192).
+    pub acknowledged_lines: usize,
+}
+
+/// What the trie audit of SPEC annex I.6 counted ([`PeerCounters::audit`]); the counters only
+/// grow, the gauges say what holds now.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AuditCounters {
+    /// Rounds this peer opened by the audit (`hashes` toward a member on `wire.ae=2`).
+    pub openings_sent: u64,
+    /// Openings this peer answered with a root or a `want`.
+    pub openings_answered: u64,
+    /// Roots this peer answered.
+    pub roots_answered: u64,
+    /// Sessions this peer opened as the partner.
+    pub sessions_opened: u64,
+    /// Sessions open now (a gauge).
+    pub open_sessions: u64,
+    /// Request bodies this peer answered within a session.
+    pub requests_answered: u64,
+    /// Nodes those answers carried.
+    pub nodes_answered: u64,
+    /// Request bodies this peer sent as the asker.
+    pub requests_sent: u64,
+    /// Root answers this peer accepted as the asker.
+    pub roots_received: u64,
+    /// Answer nodes this peer accepted as the asker.
+    pub answers_received: u64,
+    /// Entry ids asked for in fetch bodies, each ask counted.
+    pub ids_requested: u64,
+    /// Fetch bodies this peer answered.
+    pub fetches_answered: u64,
+    /// Ids a budget-cut answer left out that went to the same partner at once.
+    pub fetch_continued: u64,
+    /// Ids queued again for another member (not sent, or the answer did not come).
+    pub fetch_requeued: u64,
+    /// Fetch bodies whose answer did not come within the wait.
+    pub fetch_timed_out: u64,
+    /// Ids every member in view left out, kept for an audit to name again.
+    pub fetch_parked: u64,
+    /// Ids the fetch queue's bound turned away.
+    pub fetch_queue_full: u64,
+    /// Ids wanted now (a gauge).
+    pub fetch_queued: u64,
+    /// Budgeted `PULL_RESP`s this peer sent.
+    pub budgeted_answers: u64,
+    /// States partners counted as left out for the budget in their answers.
+    pub remainder_received: u64,
+    /// Budgeted pulls continued at once after a remainder.
+    pub pulls_continued: u64,
+    /// Audited slots derived from a space's store into its trie: each store change and each
+    /// write lease that lapses derives its own entry's slot again, and only a space's first
+    /// audit (or a store that replaced it) derives them all.
+    pub slots_derived: u64,
+    /// Refusals and fallbacks by key (`undecodable`, `lacks-hint`, `request-without-session`,
+    /// `session-busy`, `session-cooling`, `session-capped`, `unsolicited-answer`,
+    /// `fingerprint-mismatch`, `shape-mismatch`, `descent-capped`, `repeated-request`,
+    /// `text-fallback`).
+    pub refusals: BTreeMap<String, u64>,
 }
 
 impl PeerCounters {

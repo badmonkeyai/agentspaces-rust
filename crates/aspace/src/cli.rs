@@ -126,6 +126,11 @@ pub struct Global {
     /// join-timeout-millis).
     #[arg(long, global = true, value_name = "DURATION", value_parser = parse_duration)]
     pub join_timeout: Option<Duration>,
+    /// The base period of this peer's own anti-entropy rounds, in milliseconds, 100 to 3600000
+    /// (over ASPACE_ANTI_ENTROPY_PERIOD_MILLIS and the file's gossip.anti-entropy-period-millis;
+    /// default: the founding's gossip period).
+    #[arg(long, global = true, value_name = "MILLIS")]
+    pub anti_entropy_period_millis: Option<u64>,
     /// Accept a private key file its group or others may read.
     #[arg(long, global = true)]
     pub allow_readable_key: bool,
@@ -150,6 +155,9 @@ impl Global {
             socket: self.socket.clone(),
             join_timeout: self.join_timeout,
             invite: self.invite.clone(),
+            anti_entropy_period: self
+                .anti_entropy_period_millis
+                .map(std::time::Duration::from_millis),
             ..Overrides::default()
         }
     }

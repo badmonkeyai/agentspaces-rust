@@ -28,6 +28,8 @@
 //! The frame kinds are the variants of Java `Envelope.Kind` ([`FRAME_KINDS`]).
 #![warn(missing_docs)]
 
+use std::collections::BTreeMap;
+
 use crate::cbor::{self, Map, Value};
 use crate::crypto;
 use crate::envelope::envelope;
@@ -209,6 +211,182 @@ pub fn ack_body(nonce: i64) -> Vec<u8> {
     let mut body = Map::with_capacity(2);
     body.insert("nonce", nonce);
     body.insert("onBehalf", Value::Null);
+    encode_map(&body)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Probe hashes (SPEC §5.2, v0.1.35)
+
+/// The streams a probe names one by one at most by default before it sends `root` alone (SPEC
+/// §5.2: the bound SHOULD default to at least 32).
+pub const PROBE_STREAMS_DEFAULT: usize = 32;
+/// The largest bound this crate accepts (the reference implementation accepts 0 to 256).
+pub const PROBE_STREAMS_MAX: usize = 256;
+/// The most items a probe's `have` names (SPEC §5.2).
+pub const PROBE_HAVE_MAX: usize = 32;
+
+/// The digest hashes a `PING` or an `ACK` carries (SPEC §5.2): per stream, or one `root` over
+/// them in place of the per-stream hashes. Both absent is no information, never agreement.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProbeHashes {
+    /// SHA-256 over the sender's per-stream hashes ([`probe_root`]).
+    pub root: Option<[u8; 32]>,
+    /// The sender's hash per stream it names.
+    pub hashes: Option<BTreeMap<String, [u8; 32]>>,
+}
+
+impl ProbeHashes {
+    /// Whether the probe carried neither field.
+    pub fn is_empty(&self) -> bool {
+        self.root.is_none() && self.hashes.is_none()
+    }
+
+    /// The hashes a sender attaches for its `streams` under the bound `bound`: each stream one
+    /// by one while there are at most `bound` of them, else `root` alone.
+    pub fn of(streams: BTreeMap<String, [u8; 32]>, bound: usize) -> ProbeHashes {
+        if streams.len() <= bound {
+            ProbeHashes {
+                root: None,
+                hashes: Some(streams),
+            }
+        } else {
+            ProbeHashes {
+                root: Some(probe_root(&streams)),
+                hashes: None,
+            }
+        }
+    }
+}
+
+/// Why a probe's piggyback was refused: each breaks a form rule of SPEC §5.2's fields, and each
+/// has its own name for counters and logs. The probe itself still counts as a probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum ProbeRefusal {
+    /// A per-stream hash is not 32 bytes.
+    HashLength,
+    /// `root` is not 32 bytes.
+    RootLength,
+    /// Both `root` and `hashes` are present; `root` stands in place of `hashes`.
+    RootAndHashes,
+    /// A stream id in `hashes` or `have` is empty.
+    EmptyStream,
+    /// A `have` item's hash is not 32 bytes.
+    HaveHashLength,
+    /// `have` names more than [`PROBE_HAVE_MAX`] items.
+    HaveTooMany,
+}
+
+impl ProbeRefusal {
+    /// A stable kebab-case name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProbeRefusal::HashLength => "probe-hash-length",
+            ProbeRefusal::RootLength => "probe-root-length",
+            ProbeRefusal::RootAndHashes => "probe-root-and-hashes",
+            ProbeRefusal::EmptyStream => "probe-empty-stream",
+            ProbeRefusal::HaveHashLength => "probe-have-hash-length",
+            ProbeRefusal::HaveTooMany => "probe-have-too-many",
+        }
+    }
+}
+
+fn hash32(value: &Value) -> Option<[u8; 32]> {
+    value.as_bytes()?.try_into().ok()
+}
+
+/// The digest hashes of a decoded `PING` or `ACK` body ([`decode_body`]), judged strictly: every
+/// hash and `root` 32 bytes, not both `root` and `hashes`, no empty stream id, and `have` within
+/// its bound with 32-byte hashes. An absent field is no information.
+pub fn probe_hashes(body: &Map) -> Result<ProbeHashes, ProbeRefusal> {
+    if let Some(have) = body.get("have").and_then(Value::as_array) {
+        if have.len() > PROBE_HAVE_MAX {
+            return Err(ProbeRefusal::HaveTooMany);
+        }
+        for item in have {
+            if item
+                .get("streamId")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                return Err(ProbeRefusal::EmptyStream);
+            }
+            if item.get("hash").and_then(hash32).is_none() {
+                return Err(ProbeRefusal::HaveHashLength);
+            }
+        }
+    }
+    let root = match body.get("root") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(hash32(value).ok_or(ProbeRefusal::RootLength)?),
+    };
+    let hashes = match body.get("hashes").and_then(Value::as_map) {
+        None => None,
+        Some(map) => {
+            let mut hashes = BTreeMap::new();
+            for (stream, hash) in map.iter() {
+                let stream = stream.as_str().unwrap_or_default();
+                if stream.is_empty() {
+                    return Err(ProbeRefusal::EmptyStream);
+                }
+                hashes.insert(
+                    stream.to_owned(),
+                    hash32(hash).ok_or(ProbeRefusal::HashLength)?,
+                );
+            }
+            Some(hashes)
+        }
+    };
+    if root.is_some() && hashes.is_some() {
+        return Err(ProbeRefusal::RootAndHashes);
+    }
+    Ok(ProbeHashes { root, hashes })
+}
+
+/// The `root` over per-stream hashes (SPEC annex I.6, as the reference implementation takes it):
+/// the SHA-256 over, for each stream in ascending order of its id as Java orders strings, the id
+/// in UTF-8, a zero byte, its 32-byte hash, and a zero byte.
+pub fn probe_root(hashes: &BTreeMap<String, [u8; 32]>) -> [u8; 32] {
+    let mut streams: Vec<(&String, &[u8; 32])> = hashes.iter().collect();
+    streams.sort_by(|(a, _), (b, _)| a.encode_utf16().cmp(b.encode_utf16()));
+    let mut preimage = Vec::new();
+    for (stream, hash) in streams {
+        preimage.extend_from_slice(stream.as_bytes());
+        preimage.push(0);
+        preimage.extend_from_slice(hash);
+        preimage.push(0);
+    }
+    crypto::port().sha256(&preimage)
+}
+
+fn with_probe_hashes(body: &mut Map, probe: &ProbeHashes) {
+    if let Some(root) = &probe.root {
+        body.insert("root", root.to_vec());
+    }
+    if let Some(hashes) = &probe.hashes {
+        let mut map = Map::with_capacity(hashes.len());
+        for (stream, hash) in hashes {
+            map.insert(stream.as_str(), hash.to_vec());
+        }
+        body.insert("hashes", cbor::canonical_map(&map));
+    }
+}
+
+/// The `ACK` body `{nonce, onBehalf: null, root?, hashes?}` answering a `PING` with its nonce and
+/// this member's digest hashes (SPEC §5.2): the fields omitted when absent, and no `have`.
+pub fn ack_body_with(nonce: i64, probe: &ProbeHashes) -> Vec<u8> {
+    let mut body = Map::with_capacity(4);
+    body.insert("nonce", nonce);
+    body.insert("onBehalf", Value::Null);
+    with_probe_hashes(&mut body, probe);
+    encode_map(&body)
+}
+
+/// The `PING` body `{nonce, root?, hashes?}` with this member's digest hashes (SPEC §5.2).
+pub fn ping_body_with(nonce: i64, probe: &ProbeHashes) -> Vec<u8> {
+    let mut body = Map::with_capacity(3);
+    body.insert("nonce", nonce);
+    with_probe_hashes(&mut body, probe);
     encode_map(&body)
 }
 

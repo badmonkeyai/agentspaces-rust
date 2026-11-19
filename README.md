@@ -607,10 +607,12 @@ A Rust member is a member like any other, so the repository proves it against th
 
 **Golden vectors.** `crates/agentspaces-wire/tests/golden.json` is a copy of the vectors in the [AgentSpaces specification](https://github.com/badmonkeyai/agentspaces-spec), which the Java codec produced.
 
-- The suite covers 174 of the 232 vectors. It reproduces their encodings and signatures byte for byte (Ed25519 signing is deterministic) and re-encodes each to its own bytes.
-- It refuses all 39 hostile inputs, as Java does.
-- The other 58 vectors belong to features this peer does not have, such as DTLS, WebRTC, and the content swarm.
+- The suite covers 231 of the 324 vectors. It reproduces their encodings and signatures byte for byte (Ed25519 signing is deterministic) and re-encodes each to its own bytes.
+- It refuses all 68 hostile inputs, as Java does, each `DIGEST` and `PULL_RESP` carrier of SPEC annex I.6 for its own form rule.
+- The other 93 vectors belong to features this peer does not have yet, such as DTLS, WebRTC, the content swarm, and the renewal and horizon rules of SPEC §7.2 and §7.3.
 - A coverage test fails when a vector is neither tested nor listed as skipped with its reason.
+
+**The audit vectors.** `crates/agentspaces-wire/tests/audit-vectors.json` is a copy of the specification's vectors for the fingerprinted trie of SPEC annex I.6. This crate's trie, partner answers, and asker fold all 32 sets and 9 descents, and all 1,255 rows agree.
 
 **Around a Rust seed.** `crates/aspace/tests/clients_seed.rs` starts `aspace seed` and joins the Python, TypeScript, and Ruby clients (each through its public API, the drivers in `interop/clients`) and a Rust peer to it, over `tcp` (the group joined by id) and over `tls` with required attestation:
 
@@ -624,6 +626,7 @@ A Rust member is a member like any other, so the repository proves it against th
 - writes, takes, and completions crossing both ways, and races for one task among three Rust peers and Java, each task completed exactly once;
 - a crashed Rust worker's task reappearing for a Java agent;
 - Rust AgentCards admitted by Java's discovery, and Rust and Java agents calling each other's actions, with replicas collapsing across languages;
+- a space reconciled by the trie audit of SPEC annex I.6 (`wire.ae=2`) both ways, Java asking Rust and Rust asking Java, and by today's digests with a member of either language that lacks the hint;
 - `aspace cards`, `aspace call`, and `aspace work` against Java agents, and the `rust-fleet` example beside the Java research fleet.
 
 ## Security
@@ -665,6 +668,11 @@ ASPACE_INTEROP_REQUIRED=1 cargo test --workspace
 - `cargo test -p aspace --test two_peers` runs the two-peer example with nothing but the build's `aspace`.
 - Three more Java checks are opt-in: `cargo test --workspace -- --ignored java`.
 - `quickstart/verify.sh` runs the quick start end to end in a scratch copy of the repository.
+- The audit vectors (SPEC annex I.6) are checked by `cargo test -p agentspaces-wire --test audit_vectors`. For the cross-language conformance table, the `audit_conformance` example writes the same rows as JSON, one `"agree"` or `"disagree: ..."` per row:
+
+```sh
+cargo run -q -p agentspaces-wire --example audit_conformance -- <audit-vectors.json> <out/audit-rust.json>
+```
 - On a machine with few cores, `CARGO_BUILD_JOBS=4` keeps a build from taking every one.
 
 ## Releasing

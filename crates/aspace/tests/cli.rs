@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use agentspaces::wire::ids;
 
-const CONFIG_VARIABLES: [&str; 13] = [
+const CONFIG_VARIABLES: [&str; 14] = [
     "ASPACE_SEEDS",
     "ASPACE_INVITE",
     "ASPACE_LISTEN",
@@ -40,6 +40,7 @@ const CONFIG_VARIABLES: [&str; 13] = [
     "ASPACE_SOCKET",
     "XDG_CONFIG_HOME",
     "HOME",
+    "ASPACE_ANTI_ENTROPY_PERIOD_MILLIS",
 ];
 
 /// A scratch HOME under Cargo's per-target space, removed on drop.

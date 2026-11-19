@@ -548,10 +548,35 @@ pub enum SpaceError {
         /// Who tried to act on it.
         actor: String,
     },
+    /// A take's lease is no longer than the time from its claim to its judgement (the settle
+    /// window and the follow-up wait for a fold): its claim would always have lapsed when the race
+    /// is judged, so the take could never win (SPEC §7.4). Refused at once, before any claim is
+    /// published; leave a margin above the bound, since a busy host wakes a take late.
+    #[error(
+        "a take lease of {lease_millis} ms cannot outlast the settle window of {window_millis} ms: \
+         the claim would lapse before the take is judged (the lease must exceed the window)"
+    )]
+    TakeLeaseWithinSettle {
+        /// The take lease asked for, milliseconds.
+        lease_millis: i64,
+        /// The time from a claim to its judgement, milliseconds: the settle window plus the
+        /// follow-up wait.
+        window_millis: i64,
+    },
     /// The take's hold lapsed or was lost (another holder won, or the entry was completed or
     /// withdrawn): it can no longer be renewed or completed (Java `LeaseExpiredException`).
     #[error("the take of {0} lapsed or was lost")]
     NotHeld(EntryId),
+    /// A holder this take's claim displaced completed the entry first (its claim reached this
+    /// peer later than the settle window, SPEC §7.4): the work is done, so this completion
+    /// acknowledged that one under this take's claim and wrote no result (Java
+    /// `LeaseExpiredException`). Counted in
+    /// [`PeerCounters::outbid_acknowledged`](crate::peer::PeerCounters::outbid_acknowledged).
+    #[error(
+        "{0} was completed first by the holder this take outbid or out-raced; this take \
+         acknowledged that completion and wrote no result"
+    )]
+    CompletedByDisplaced(EntryId),
     /// The entry's write lease already lapsed, or the entry is completed or withdrawn: it cannot
     /// be renewed (Java `LeaseExpiredException`).
     #[error("the write lease of {0} lapsed, or the entry is no longer live")]

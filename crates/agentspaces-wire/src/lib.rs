@@ -32,6 +32,11 @@
 //!   attestation (`session.rb`), invite keys, beacon documents.
 //! - [`serving`]: the digest and delta encodings a node that answers anti-entropy produces and
 //!   reads (`ReplicatedSpace`, `AdCache`, the revocation registries, and the membership view).
+//! - [`horizon`]: the renewal that never shortens and the collection horizons of SPEC §7.2 and
+//!   §7.3 (v0.1.35), with the drift floor and the per-entry horizon under `wire.horizon=1`.
+//! - [`trie`], [`audit`], [`reconcile`]: the fingerprinted trie of a space, the `DIGEST` fields
+//!   `tree`, `ids`, `budget`, and `sketch` with `PULL_RESP.remainder` and their form rules, and
+//!   the audit's sessions, descent, and fetch queue (SPEC annex I.6, v0.1.35, `wire.ae=2`).
 //!
 //! # What SPEC v0.1.29 to v0.1.33 changed here
 //!
@@ -56,12 +61,14 @@
 //!   every member holds Java's type ([`beacon`]).
 //!
 //! Persistent data trees (annex H and PDT 2), the content swarm and its `pdt` level, fetching a
-//! spilled card's parts, the hashed digest exchange, and the lazy-push tree's waits (§9.4) are not
-//! implemented: this crate serves a dial-only member and a hub-and-spoke listening member (which
-//! answers full digests), which run none of them.
+//! spilled card's parts, the hashed text-digest round of v0.1.17 (`wire.hashes=1`) as an opener,
+//! and the lazy-push tree's waits (§9.4) are not implemented: this crate serves a dial-only member
+//! and a hub-and-spoke listening member, which run none of them. The listening member answers
+//! full digests, and audits by the trie toward a member whose card carries `wire.ae=2`.
 #![forbid(unsafe_code)]
 
 pub mod ads;
+pub mod audit;
 pub mod base58;
 pub mod beacon;
 pub mod bodies;
@@ -72,10 +79,13 @@ pub mod filters;
 pub mod fold;
 pub mod founding;
 pub mod hlc;
+pub mod horizon;
 pub mod identity;
 pub mod ids;
 pub mod limits;
+pub mod reconcile;
 pub mod records;
+pub mod ref_heads;
 pub mod revocation;
 pub mod schema;
 pub mod seed;
@@ -83,5 +93,6 @@ pub mod serving;
 pub mod session;
 pub mod social;
 pub mod time;
+pub mod trie;
 mod util;
 pub mod vote;

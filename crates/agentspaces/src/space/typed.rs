@@ -460,7 +460,8 @@ impl<T> TypedTaken<T> {
         self.taken.complete_with(result, result_lease, tags).await
     }
 
-    /// Renews the hold to `lease` from now ([`Taken::renew`]); answers the new expiry.
+    /// Renews the hold to at least `lease` from now, never shortening it ([`Taken::renew`]);
+    /// answers the expiry in force.
     ///
     /// # Errors
     ///

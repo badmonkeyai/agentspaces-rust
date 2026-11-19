@@ -20,7 +20,8 @@
 //! - A write or a completion's result that every fold would refuse (a tag that is not text, a
 //!   full space) fails before anything is folded or sent, and a completion keeps its take.
 //! - Spaces collect their tombstones (SPEC §7.3), so a full space takes entries again once its
-//!   dead ones are past their horizon, and a member refuses re-offered tombstones at the door.
+//!   dead ones are past their horizon, and a member refuses re-offered tombstones at the door and
+//!   acknowledges them; a new entry a full member refused arrives again by its own rounds.
 //! - Takes and reads on a closed peer answer `Closed` at once; a take with a zero timeout makes
 //!   one attempt; `Duration::MAX` waits with no deadline.
 //! - Cancelling an entry another member completed is `Ok`.
@@ -466,6 +467,10 @@ async fn a_full_member_collects_and_refuses_tombstones_offered_again() {
     let a = net.member(fresh()).await;
     let mut config = net.config(fresh());
     config.space_max_entries = 8;
+    // B's own rounds (SPEC §5.3) would re-offer it the refused ninth entry at times of their own,
+    // each making the full space collect then (at most once a second for received entries), so
+    // when the tenth arrives is no longer what decides; an hour apart, none runs here.
+    config.listen.anti_entropy_period = Some(Duration::from_secs(3600));
     let b = net.member_with(config).await;
     let tasks_a = a.space(SPACE);
     let tasks_b = b.space(SPACE);
@@ -513,6 +518,58 @@ async fn a_full_member_collects_and_refuses_tombstones_offered_again() {
     })
     .await;
     assert!(b.peer().space_states(SPACE).await.len() <= 2);
+    // Each refusal is acknowledged once (SPEC §7.3): B holds no state of those entries and they
+    // verify, so a partner that reads B's digest stops re-offering them.
+    wait_for("B to acknowledge the re-offered tombstones", async || {
+        b.peer().counters().await.reoffers_acknowledged >= 8
+    })
+    .await;
+    let status = b.peer().space_horizon(SPACE).await.expect("open");
+    assert!(status.acknowledged_lines >= 8, "{status:?}");
+    a.close().await.expect("close");
+    b.close().await.expect("close");
+}
+
+/// A new entry that reaches a full member before any of its tombstones is past its horizon is
+/// refused (counted), and is not lost: the member's own rounds, at their real period, bring it
+/// again, and it folds at the first of them after the space has room, well inside its lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_member_folds_a_refused_new_entry_at_a_later_round() {
+    let net = Net::new();
+    let a = net.member(fresh()).await;
+    let mut config = net.config(fresh());
+    config.space_max_entries = 8;
+    let b = net.member_with(config).await;
+    let tasks_a = a.space(SPACE);
+    let tasks_b = b.space(SPACE);
+    b.peer().pull_space(SPACE).await.expect("B opens the space");
+    // Each lapses a second after its write and is past its horizon two seconds later.
+    for n in 0..8 {
+        tasks_a
+            .write_value(TASK, task("short", n), lease("1s"), Map::new())
+            .await
+            .expect("write");
+    }
+    wait_for("B to hold the eight entries", async || {
+        b.peer().space_states(SPACE).await.len() == 8
+    })
+    .await;
+    let refused = b.peer().counters().await.space_refused_inserts;
+    let late = tasks_a
+        .write_value(TASK, task("late", 9), lease("30s"), Map::new())
+        .await
+        .expect("write");
+    wait_for("B to refuse the new entry", async || {
+        b.peer().counters().await.space_refused_inserts > refused
+    })
+    .await;
+    let seen = tasks_b
+        .read(&on_topic("late"), PATIENCE)
+        .await
+        .expect("read")
+        .map(|view| view.entry_id().clone());
+    assert_eq!(seen, Some(late));
+    assert!(b.peer().counters().await.space_collected >= 8);
     a.close().await.expect("close");
     b.close().await.expect("close");
 }

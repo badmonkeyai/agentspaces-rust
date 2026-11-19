@@ -934,6 +934,176 @@ fn keystore_from_vars_reads_only_the_keystore() {
 // ---------------------------------------------------------------------------------------------
 // Refusals of the layered configuration
 
+/// The base period of this peer's own anti-entropy rounds (`.wfcont/ANTI-ENTROPY-PERIOD-PLAN.md`):
+/// unset at every layer it stays `None`, so the peer keeps the founding's gossip period as before;
+/// the file's `gossip.anti-entropy-period-millis`, the variable, and the flag layer as the other
+/// settings do; the value reaches the peer's [`ListenConfig`]; outside 100 ms to one hour it is
+/// refused, naming where it was read; other keys under `gossip` are ignored.
+#[test]
+fn the_anti_entropy_period_layers_reaches_the_peer_and_is_bounded() {
+    let scratch = Scratch::new("anti-entropy");
+    let write = |name: &str, gossip: &str| {
+        let path = scratch.path().join(name);
+        fs::write(
+            &path,
+            format!(
+                "agentspaces:\n{gossip}  groups:\n    - name: research\n      founding: research\n      \
+                 seeds: [ \"127.0.0.1:7711\" ]\n"
+            ),
+        )
+        .expect("write");
+        path.display().to_string()
+    };
+    let resolve = |overrides: &Overrides, pairs: &[(&str, &str)]| {
+        let mut pairs = pairs.to_vec();
+        pairs.push(("HOME", "/home/ada"));
+        Config::from_vars(overrides, vars(&pairs))
+    };
+    let identity = || Identity::from_seed(&[3; 32]);
+
+    // Unset everywhere: today's behaviour, the founding's period.
+    let plain = write("plain.yaml", "");
+    let config = resolve(&Overrides::default(), &[("ASPACE_CONFIG", &plain)]).expect("resolves");
+    assert_eq!(config.anti_entropy_period, None);
+    assert_eq!(config.origin("anti_entropy_period"), None);
+    let peer = config.peer_config(identity()).expect("peer config");
+    assert_eq!(peer.listen.anti_entropy_period, None);
+    assert_eq!(
+        peer.listen.anti_entropy_period,
+        agentspaces::peer::ListenConfig::default().anti_entropy_period,
+        "unset keeps the peer's own default"
+    );
+
+    // The file.
+    let tuned = write(
+        "tuned.yaml",
+        "  gossip:\n    anti-entropy-period-millis: 2000\n    audit: true\n",
+    );
+    let config = resolve(&Overrides::default(), &[("ASPACE_CONFIG", &tuned)]).expect("resolves");
+    assert_eq!(config.anti_entropy_period, Some(Duration::from_secs(2)));
+    assert!(
+        config
+            .ignored
+            .iter()
+            .any(|key| key.ends_with("gossip.audit")),
+        "other gossip keys are ignored: {:?}",
+        config.ignored
+    );
+    assert!(matches!(
+        config.origin("anti_entropy_period"),
+        Some(Origin::Key { key, .. }) if key == "agentspaces.gossip.anti-entropy-period-millis"
+    ));
+    let peer = config.peer_config(identity()).expect("peer config");
+    assert_eq!(
+        peer.listen.anti_entropy_period,
+        Some(Duration::from_secs(2))
+    );
+
+    // The variable over the file, the flag over both.
+    let config = resolve(
+        &Overrides::default(),
+        &[
+            ("ASPACE_CONFIG", &tuned),
+            ("ASPACE_ANTI_ENTROPY_PERIOD_MILLIS", " 5000 "),
+        ],
+    )
+    .expect("resolves");
+    assert_eq!(config.anti_entropy_period, Some(Duration::from_secs(5)));
+    assert_eq!(
+        config.origin("anti_entropy_period"),
+        Some(&Origin::Variable("ASPACE_ANTI_ENTROPY_PERIOD_MILLIS"))
+    );
+    let flagged = Overrides {
+        anti_entropy_period: Some(Duration::from_millis(250)),
+        ..Overrides::default()
+    };
+    let config = resolve(
+        &flagged,
+        &[
+            ("ASPACE_CONFIG", &tuned),
+            ("ASPACE_ANTI_ENTROPY_PERIOD_MILLIS", "5000"),
+        ],
+    )
+    .expect("resolves");
+    assert_eq!(config.anti_entropy_period, Some(Duration::from_millis(250)));
+    assert_eq!(
+        config.origin("anti_entropy_period"),
+        Some(&Origin::Flag("--anti-entropy-period-millis"))
+    );
+
+    // The bounds, inclusive, and the refusals name where the value was read.
+    for millis in [100_u64, 3_600_000] {
+        let config = resolve(
+            &Overrides::default(),
+            &[
+                ("ASPACE_CONFIG", &plain),
+                ("ASPACE_ANTI_ENTROPY_PERIOD_MILLIS", &millis.to_string()),
+            ],
+        )
+        .expect("within the bounds");
+        assert_eq!(
+            config.anti_entropy_period,
+            Some(Duration::from_millis(millis))
+        );
+    }
+    let error = resolve(
+        &Overrides::default(),
+        &[
+            ("ASPACE_CONFIG", &plain),
+            ("ASPACE_ANTI_ENTROPY_PERIOD_MILLIS", "99"),
+        ],
+    )
+    .expect_err("below the floor");
+    assert_mentions(
+        &error,
+        &["ASPACE_ANTI_ENTROPY_PERIOD_MILLIS", "99", "100 to 3600000"],
+    );
+    let error = resolve(
+        &Overrides::default(),
+        &[
+            ("ASPACE_CONFIG", &plain),
+            ("ASPACE_ANTI_ENTROPY_PERIOD_MILLIS", "two seconds"),
+        ],
+    )
+    .expect_err("not a number");
+    assert_mentions(
+        &error,
+        &["ASPACE_ANTI_ENTROPY_PERIOD_MILLIS", "milliseconds"],
+    );
+    let error = resolve(
+        &Overrides {
+            anti_entropy_period: Some(Duration::from_millis(3_600_001)),
+            ..Overrides::default()
+        },
+        &[("ASPACE_CONFIG", &plain)],
+    )
+    .expect_err("above the ceiling");
+    assert_mentions(&error, &["--anti-entropy-period-millis", "3600001"]);
+    let slow = write(
+        "slow.yaml",
+        "  gossip:\n    antiEntropyPeriodMillis: 7200000\n",
+    );
+    let error = resolve(&Overrides::default(), &[("ASPACE_CONFIG", &slow)])
+        .expect_err("above the ceiling in the file");
+    assert_mentions(
+        &error,
+        &["agentspaces.gossip.anti-entropy-period-millis", "7200000"],
+    );
+    let zero = write(
+        "zero.yaml",
+        "  gossip:\n    anti-entropy-period-millis: 0\n",
+    );
+    let error =
+        resolve(&Overrides::default(), &[("ASPACE_CONFIG", &zero)]).expect_err("zero in the file");
+    assert_mentions(
+        &error,
+        &[
+            "anti-entropy-period-millis",
+            "positive number of milliseconds",
+        ],
+    );
+}
+
 #[test]
 fn layered_refusals_name_the_flag_variable_or_key() {
     let scratch = Scratch::new("refusals");

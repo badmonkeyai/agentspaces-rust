@@ -271,20 +271,24 @@ async fn a_lost_link_is_redialed_and_the_peer_reintroduces_and_repulls() {
     // The seed drops the link: a network hiccup from the peer's point of view.
     seed.close_link(0);
     next_event(&mut events, "the loss", |e| *e == PeerEvent::Disconnected).await;
-    let second = seed.wait_kinds(1, 4).await;
+    let second = seed.wait_kinds(1, 2).await;
     assert_eq!(
-        second[..4],
-        [KIND_RUMOR, KIND_DIGEST, KIND_DIGEST, KIND_DIGEST],
-        "re-introduced, revocations, ads, and the space pulled again"
+        second[..2],
+        [KIND_RUMOR, KIND_DIGEST],
+        "re-introduced, then one packed pull of everything pulled before"
     );
     let digests: Vec<Vec<String>> = seed
         .of_kind(1, KIND_DIGEST)
         .iter()
         .map(|digest| digest_streams(digest.body()))
         .collect();
-    assert_eq!(digests[0], revocation::STREAMS);
-    assert_eq!(digests[1], [STREAM_ADS]);
-    assert!(digests[2].contains(&"space:work".to_owned()));
+    let pulled = &digests[0];
+    for stream in revocation::STREAMS {
+        assert!(pulled.contains(&stream.to_owned()), "{pulled:?}");
+    }
+    assert!(pulled.contains(&STREAM_ADS.to_owned()), "{pulled:?}");
+    assert!(pulled.contains(&"space:work".to_owned()), "{pulled:?}");
+    assert_eq!(pulled.len(), 4, "{pulled:?}");
     let reconnected = next_event(&mut events, "the reconnect", |e| {
         matches!(e, PeerEvent::Reconnected { .. })
     })

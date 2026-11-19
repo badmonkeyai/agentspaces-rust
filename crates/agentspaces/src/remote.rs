@@ -237,6 +237,21 @@ pub struct RemoteAction {
 }
 
 impl RemoteAction {
+    /// The tags an invocation writes (SPEC §10.6, v0.1.35): an `embabel-action` that names its
+    /// space is an implied take on the advertising peer, addressed by
+    /// `aspace.action=<agent>.<action>`; every other action is invoked untagged.
+    pub fn address_tags(&self) -> Map {
+        let mut tags = Map::new();
+        if let Some(declared) = self.declared.as_ref() {
+            if declared.kind == ads::ACTION_EMBABEL && declared.space.is_some() {
+                let local = self.card.agent().rsplit('/').next().unwrap_or("").to_owned();
+                let name = declared.name.split('(').next().unwrap_or("").to_owned();
+                tags.insert("aspace.action", format!("{local}.{name}"));
+            }
+        }
+        tags
+    }
+
     /// The advertising agent's card.
     pub fn card(&self) -> &AgentCard {
         &self.card
@@ -615,7 +630,7 @@ impl RemoteActions {
                 &action.consumes,
                 input.clone(),
                 self.write_lease,
-                Map::new(),
+                action.address_tags(),
             )
             .await?;
         let written = tasks

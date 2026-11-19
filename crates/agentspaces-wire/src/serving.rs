@@ -242,6 +242,26 @@ pub fn space_digest<'a>(
     digest_text(&mut lines).into_bytes()
 }
 
+/// [`space_digest`] with the lines the replica refused and acknowledges (SPEC §7.3, §9.2 R7):
+/// after the entry and claim lines, each acknowledged line as `a:<line>`, in Java string order
+/// of the line, a newline after each (Java `HashTrie.legacyDigest`).
+pub fn space_digest_acked<'a>(
+    states: impl Iterator<Item = (&'a str, &'a Map)>,
+    claims: impl Iterator<Item = (&'a str, &'a Map)>,
+    acks: impl Iterator<Item = &'a str>,
+) -> Vec<u8> {
+    let mut digest = space_digest(states, claims);
+    let mut acks: Vec<&str> = acks.collect();
+    acks.sort_by(|a, b| java_order(a, b));
+    acks.dedup();
+    for line in acks {
+        digest.extend_from_slice(b"a:");
+        digest.extend_from_slice(line.as_bytes());
+        digest.push(b'\n');
+    }
+    digest
+}
+
 /// A `SpaceWire.SyncDelta` `{states, claims}`: the signed states and the signed claims by entry
 /// id, the claims written in canonical key order (SPEC §9.1).
 pub fn sync_delta(states: &[&Map], claims: &[(&str, &Map)]) -> Vec<u8> {

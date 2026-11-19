@@ -24,6 +24,7 @@
 //! dial the members it learns of: a full mesh is not its job. It may itself dial seeds (another
 //! listening peer, a Java node) and then forwards between that link and its accepted ones too.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -178,8 +179,10 @@ pub struct ListenConfig {
     /// See [`ListenConfig::admission_burst`].
     pub admissions_per_second: u32,
     /// The base period of this peer's own anti-entropy rounds (default: the founding's gossip
-    /// period, one second for a group founded from text). While nothing moves it doubles per
-    /// round up to 32 times (SPEC §5.3).
+    /// period, one second for a group founded from text), a dial-only peer's toward its seed
+    /// included. While nothing moves it doubles per round up to 32 times; the rounds never stop
+    /// (SPEC §5.3). A period shorter than the founding's never shortens the rounds the per-entry
+    /// horizon counts ([`PeerConfig::horizon_engage_rounds`](crate::peer::PeerConfig::horizon_engage_rounds)).
     pub anti_entropy_period: Option<Duration>,
     /// How long an accepted link may stay without a verified introduction before it is closed
     /// (default 30 s).
@@ -187,6 +190,11 @@ pub struct ListenConfig {
     /// How long an accepted link may stay silent before it is closed (default 120 s; keep it
     /// above the members' advertisement interval, which every member refreshes on its link).
     pub link_idle_timeout: Duration,
+    /// The most streams the acknowledgement of a probe names one by one before it carries one
+    /// `root` over them instead (SPEC §5.2; default 32, at most 256, 0 always sends `root`).
+    /// Raise it to the most streams one member of the group holds, so members whose sets of
+    /// streams differ still compare the streams they share.
+    pub probe_streams: usize,
 }
 
 impl Default for ListenConfig {
@@ -204,6 +212,7 @@ impl Default for ListenConfig {
             anti_entropy_period: None,
             introduction_timeout: Duration::from_secs(30),
             link_idle_timeout: Duration::from_secs(120),
+            probe_streams: agentspaces_wire::bodies::PROBE_STREAMS_DEFAULT,
         }
     }
 }
@@ -306,6 +315,18 @@ pub struct ListenCounters {
     pub pull_resps_unsolicited: u64,
     /// This peer's own anti-entropy rounds (periodic and targeted).
     pub rounds: u64,
+    /// Targeted rounds a probe started: its hashes differed from this peer's on a stream both
+    /// hold, or its `root` from this peer's, while this peer's rounds had backed off (SPEC §5.2).
+    pub probe_rounds: u64,
+    /// Probes whose `root`, `hashes`, or `have` broke a form rule, by reason
+    /// (`probe-hash-length`, `probe-root-length`, `probe-root-and-hashes`, `probe-empty-stream`,
+    /// `probe-have-hash-length`, `probe-have-too-many`): read as carrying no information, and
+    /// still answered.
+    pub probe_hashes_refused: BTreeMap<String, u64>,
+    /// Probes that carried hashes answered with a bare acknowledgement because their sender
+    /// probed with hashes faster than its pace allows: each hashed answer reads every stream
+    /// this peer serves (SPEC §5.2 makes the hashes optional).
+    pub probe_hashes_paced: u64,
     /// RELAY_FRAMEs delivered to a member on a link this peer holds, or passed to the next relay
     /// of their path.
     pub relays_forwarded: u64,

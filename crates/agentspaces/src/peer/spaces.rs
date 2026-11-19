@@ -26,6 +26,7 @@ use std::collections::HashMap;
 
 use agentspaces_wire::bodies::STREAM_SPACE_PREFIX;
 use agentspaces_wire::fold::SpaceStore;
+use agentspaces_wire::horizon::HorizonGate;
 use agentspaces_wire::ids;
 use tokio::time::Instant;
 
@@ -53,12 +54,108 @@ pub(super) struct Slot {
     pub bytes: usize,
     /// Each held entry's state size, as counted when it last applied.
     pub sizes: HashMap<String, usize>,
+    /// The view's half of the per-entry horizon of SPEC §7.3: this space's mode and its
+    /// hysteresis.
+    pub gate: HorizonGate,
+    /// What the settle guarantee of SPEC §7.4 remembers of this peer's own takes ([`SettleBook`]).
+    pub settle: SettleBook,
+}
+
+/// The most entries each half of a [`SettleBook`] remembers; past it the oldest goes.
+pub(super) const SETTLE_BOOK_CAP: usize = 1024;
+
+/// What a space remembers, per entry, of the settle guarantee of SPEC §7.4 beyond its window,
+/// for the claims this peer's own holders hold (Java `outbidCompletions`, `completedHere`). Each
+/// half holds at most [`SETTLE_BOOK_CAP`] entries.
+#[derive(Debug, Default)]
+pub(super) struct SettleBook {
+    /// The claim epoch at which a holder this peer's claim displaces in the lattice completed the
+    /// entry while this peer still holds it present: this peer's take, when it is judged, or its
+    /// completion, when it comes, acknowledges that completion with no result.
+    outbid: Bounded,
+    /// The claim epoch at which one of this peer's holders completed the entry with its own work:
+    /// a displaced holder's authentic completion arriving after it is a duplicate.
+    completed_here: Bounded,
+}
+
+impl SettleBook {
+    /// The epoch of a displaced holder's completion noted for `entry_id`.
+    pub fn outbid(&self, entry_id: &str) -> Option<i64> {
+        self.outbid.get(entry_id)
+    }
+
+    /// Notes a displaced holder's completion of `entry_id` under this peer's claim at `epoch`.
+    pub fn note_outbid(&mut self, entry_id: &str, epoch: i64) {
+        self.outbid.insert(entry_id, epoch);
+    }
+
+    /// Forgets and answers the outbid completion noted for `entry_id`.
+    pub fn take_outbid(&mut self, entry_id: &str) -> Option<i64> {
+        self.outbid.remove(entry_id)
+    }
+
+    /// The epoch at which one of this peer's holders completed `entry_id` with its own work.
+    pub fn completed_here(&self, entry_id: &str) -> Option<i64> {
+        self.completed_here.get(entry_id)
+    }
+
+    /// Notes that one of this peer's holders completed `entry_id` with its work at `epoch`.
+    pub fn note_completed_here(&mut self, entry_id: &str, epoch: i64) {
+        self.completed_here.insert(entry_id, epoch);
+    }
+
+    /// Forgets the completion noted for `entry_id` when it was at `epoch`; whether it was.
+    pub fn take_completed_here(&mut self, entry_id: &str, epoch: i64) -> bool {
+        if self.completed_here.get(entry_id) == Some(epoch) {
+            self.completed_here.remove(entry_id);
+            return true;
+        }
+        false
+    }
+
+    /// Forgets an entry that left the store.
+    pub fn forget(&mut self, entry_id: &str) {
+        self.outbid.remove(entry_id);
+        self.completed_here.remove(entry_id);
+    }
+}
+
+/// Epochs by entry id in insertion order, at most [`SETTLE_BOOK_CAP`] of them.
+#[derive(Debug, Default)]
+struct Bounded {
+    epochs: HashMap<String, (i64, u64)>,
+    next: u64,
+}
+
+impl Bounded {
+    fn get(&self, entry_id: &str) -> Option<i64> {
+        self.epochs.get(entry_id).map(|(epoch, _)| *epoch)
+    }
+
+    fn insert(&mut self, entry_id: &str, epoch: i64) {
+        self.next = self.next.wrapping_add(1);
+        self.epochs.insert(entry_id.to_owned(), (epoch, self.next));
+        if self.epochs.len() > SETTLE_BOOK_CAP
+            && let Some(oldest) = self
+                .epochs
+                .iter()
+                .min_by_key(|(_, (_, order))| *order)
+                .map(|(id, _)| id.clone())
+        {
+            self.epochs.remove(&oldest);
+        }
+    }
+
+    fn remove(&mut self, entry_id: &str) -> Option<i64> {
+        self.epochs.remove(entry_id).map(|(epoch, _)| epoch)
+    }
 }
 
 /// The cap on the lease that feeds a space's collection horizon (Java
 /// `ReplicatedSpace.MAX_TRACKED_LEASE_MILLIS`, 24 hours): one entry with a century-long lease
 /// cannot stop the collection; a longer lease still keeps its own entry until it lapses.
-pub(super) const MAX_TRACKED_LEASE_MILLIS: i64 = 24 * 60 * 60 * 1000;
+pub(super) const MAX_TRACKED_LEASE_MILLIS: i64 =
+    agentspaces_wire::horizon::MAX_TRACKED_LEASE_MILLIS;
 
 impl Slot {
     /// Forgets the size of an entry that left the store.
@@ -175,6 +272,8 @@ impl Spaces {
                     full_collected: None,
                     bytes: 0,
                     sizes: HashMap::new(),
+                    gate: HorizonGate::new(),
+                    settle: SettleBook::default(),
                 },
             );
         }

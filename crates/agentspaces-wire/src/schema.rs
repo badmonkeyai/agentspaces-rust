@@ -64,8 +64,9 @@ Bodies.Ping { nonce: long, root: bytes ?null, hashes: map<String,bytes> ?null, h
 Bodies.PingReq { target: PeerId, nonce: long }
 Bodies.Ack { nonce: long, onBehalf: PeerId, root: bytes ?null, hashes: map<String,bytes> ?null, have: list<Bodies.HaveItem> ?null }
 Bodies.Rumor { streamId: String, itemId: String, hopsRemaining: int, payload: bytes }
-Bodies.Digest { digests: map<String,bytes>, hashes: map<String,bytes> ?null, want: list<String> ?null }
-Bodies.PullResp { deltas: map<String,bytes> }
+Bodies.Digest { digests: map<String,bytes>, hashes: map<String,bytes> ?null, want: list<String> ?null, tree: map<String,list<Bodies.TreeNode>> ?null, ids: map<String,list<EntryId>> ?null, budget: Long ?null, sketch: map<String,bytes> ?null }
+Bodies.TreeNode { path: bytes, count: Long ?null, nodes: bytes ?null, lines: String ?null }
+Bodies.PullResp { deltas: map<String,bytes>, remainder: map<String,Long> ?null }
 Bodies.RelayFrame { target: PeerId, frame: bytes, path: list<PeerId> ?null, hop: Integer ?null }
 Bodies.Batch { frames: list<bytes> }
 Bodies.Have { items: list<Bodies.HaveItem> }
@@ -580,6 +581,11 @@ fn invariant(record: &str, map: &Map) -> bool {
             list(map, "reads").len() <= UI_MAX_ENTRIES
                 && list(map, "writes").len() <= UI_MAX_ENTRIES
         }
+        // The form rules of the audit (annex I.6, v0.1.35): a carrier that breaks one is
+        // undecodable whoever reads it.
+        "Bodies.Digest" => crate::audit::digest_form(map).is_ok(),
+        "Bodies.TreeNode" => crate::audit::tree_node_form(map).is_ok(),
+        "Bodies.PullResp" => crate::audit::pull_resp_form(map).is_ok(),
         "AppCard" => app_card_holds(map),
         "AppCard.Ui" => app_ui_holds(map),
         "AppCard.Host" => host_holds(map),

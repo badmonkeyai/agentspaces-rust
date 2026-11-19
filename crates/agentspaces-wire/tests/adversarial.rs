@@ -39,7 +39,7 @@ use common::{golden, hex, s};
 const ENTRY: &str = "11111111-2222-3333-4444-555555555555";
 
 /// Every `adv_*` key this suite and `fold_golden.rs` assert (`founding_test.rb`'s list).
-const COVERED: [&str; 57] = [
+const COVERED: [&str; 68] = [
     "adv_claim_bad_signature_delta",
     "adv_claim_transplanted_delta",
     "adv_claim_nan_bid_delta",
@@ -97,6 +97,17 @@ const COVERED: [&str; 57] = [
     "adv_app_card_spill_root_codec_cbor",
     "adv_app_card_spill_size_zero_cbor",
     "adv_agent_card_spill_actions_cbor",
+    "adv_digest_tree_path_nibble_body",
+    "adv_digest_tree_path_long_body",
+    "adv_digest_tree_nodes_length_body",
+    "adv_digest_tree_nodes_few_body",
+    "adv_digest_tree_two_forms_body",
+    "adv_digest_tree_no_form_body",
+    "adv_digest_tree_lines_order_body",
+    "adv_digest_tree_lines_empty_line_body",
+    "adv_digest_ids_twice_body",
+    "adv_digest_budget_zero_body",
+    "adv_pull_resp_remainder_negative_body",
 ];
 
 // ------------------------------------------------------------------------- helpers
@@ -781,6 +792,47 @@ fn hostile_cards_are_undecodable_for_their_own_rule() {
     ] {
         assert!(schema::decode(&hex(name), record).is_some(), "{name}");
     }
+}
+
+// ------------------------------------------------------------------------- the audit's carriers
+
+#[test]
+fn hostile_audit_carriers_are_undecodable_for_their_own_rule() {
+    use agentspaces_wire::audit::{self, FormError};
+    use agentspaces_wire::bodies::{KIND_DIGEST, KIND_PULL_RESP, decode_body};
+    let cases = [
+        ("adv_digest_tree_path_nibble_body", FormError::PathNibble),
+        ("adv_digest_tree_path_long_body", FormError::PathLong),
+        ("adv_digest_tree_nodes_length_body", FormError::NodesLength),
+        ("adv_digest_tree_nodes_few_body", FormError::NodesFew),
+        ("adv_digest_tree_two_forms_body", FormError::TwoForms),
+        ("adv_digest_tree_no_form_body", FormError::NoForm),
+        ("adv_digest_tree_lines_order_body", FormError::LinesOrder),
+        (
+            "adv_digest_tree_lines_empty_line_body",
+            FormError::LinesEmptyLine,
+        ),
+        ("adv_digest_ids_twice_body", FormError::IdsTwice),
+        ("adv_digest_budget_zero_body", FormError::BudgetNotPositive),
+    ];
+    for (name, rule) in cases {
+        let bytes = hex(name);
+        assert_eq!(audit::parse_digest(&bytes), Err(rule), "{name}");
+        assert!(decode_body(KIND_DIGEST, &bytes).is_none(), "{name}");
+        // Every truncation is refused without a panic.
+        for cut in 0..bytes.len() {
+            assert!(
+                audit::parse_digest(&bytes[..cut]).is_err(),
+                "{name} cut at {cut}"
+            );
+        }
+    }
+    let bytes = hex("adv_pull_resp_remainder_negative_body");
+    assert_eq!(
+        audit::parse_pull_resp(&bytes),
+        Err(FormError::RemainderNegative)
+    );
+    assert!(decode_body(KIND_PULL_RESP, &bytes).is_none());
 }
 
 // ------------------------------------------------------------------------- coverage
