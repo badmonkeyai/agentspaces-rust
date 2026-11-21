@@ -61,6 +61,7 @@
 //! ```
 #![forbid(unsafe_code)]
 
+mod artifacts;
 mod cli;
 mod commands;
 mod daemon;
@@ -187,6 +188,11 @@ async fn run(mut cli: Cli) -> Result<(), Failure> {
             space,
         } => commands::watch(global, &schema, &kinds, count, &clauses, space.as_deref()).await,
         Command::Cards { json, only } => commands::cards(global, json, &only).await,
+        Command::Put { path, piece_size, name, in_place, exit } => {
+            artifacts::put(global, &path, piece_size, name, in_place, exit).await
+        }
+        Command::Get { root, out, store, timeout } => artifacts::get(global, &root, &out, store, timeout).await,
+        Command::Content { command: cli::ContentCommand::Ls { json } } => artifacts::ls(global, json).await,
         Command::Call {
             target,
             json,

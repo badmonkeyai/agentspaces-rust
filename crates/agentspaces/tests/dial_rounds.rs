@@ -321,10 +321,14 @@ async fn fifty_spaces_go_in_one_digest_per_round() {
             .filter(|named| named.len() > 3) // a pull names one space and the revocations
             .collect()
     };
+    // a round that fired while the pulls above were still running names only the spaces pulled
+    // by then, so only the rounds after the last pull are judged
+    let after_pulls = fake.received().len();
+    let since = |received: &[Received]| received[after_pulls.min(received.len())..].to_vec();
     let received = fake
-        .wait_for("ten rounds", |received| rounds_of(received).len() >= 10)
+        .wait_for("ten rounds", |received| rounds_of(&since(received)).len() >= 10)
         .await;
-    for named in rounds_of(&received) {
+    for named in rounds_of(&since(&received)) {
         assert_eq!(named.len(), streams, "one round, one DIGEST: {named:?}");
     }
     let rounds = peer.counters().await.dial_rounds;

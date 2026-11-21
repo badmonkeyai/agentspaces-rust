@@ -646,6 +646,15 @@ impl Peer {
         self.call(move |actor| actor.probe_block(&cid, &to)).await?
     }
 
+    /// Asks member `from` (and the seed) for the block `cid`; once it arrives and verifies,
+    /// [`Peer::block`] returns it and [`PeerEvent::Block`] announces it. Ask again after a while
+    /// when it has not come.
+    pub async fn fetch_block(&self, cid: &str, from: Option<&str>) -> Result<(), PeerError> {
+        let cid = cid.to_owned();
+        let from = from.map(str::to_owned);
+        self.call(move |actor| actor.fetch_block(&cid, from.as_deref())).await?
+    }
+
     /// Closes the peer for good: the link closes and no redial follows. Idempotent.
     pub async fn close(&self) -> Result<(), PeerError> {
         match self.call(|actor| actor.close()).await {

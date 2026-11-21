@@ -337,3 +337,52 @@ async fn trees_move_both_ways_between_rust_and_java() {
     content.close().await.expect("close");
     let _ = peer.close().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn artifacts_move_both_ways_between_rust_and_java() {
+    use agentspaces::content::PublishOptions;
+    let Some(classpath) = classpath_or_skip() else { return };
+    let mut java = JavaNode::listen(&classpath, &["--content"], "artifacts").await;
+    let peer = dial_only(java.port).await;
+    let config = ContentConfig { tick: Duration::from_millis(100), ..ContentConfig::default() };
+    let content = Content::start(peer.clone(), Arc::new(MemoryNodes::new()), config).await.expect("content");
+    let opts = || FetchOptions { timeout: Some(Duration::from_secs(60)), ..Default::default() };
+
+    // Java publishes an artifact with its table inline and one with its table as a block
+    for (size, seed) in [(3_000_000, 11), (5_500_000, 12)] {
+        let put = java.ask(&format!("art-put {size} {seed} 65536")).await;
+        let root = put["root"].as_str().expect("root").to_owned();
+        content.fetch_artifact(&root, opts()).await.expect("the Rust peer fetches Java's artifact");
+        let mut out = Vec::new();
+        content.read_artifact(&root, &mut out).expect("read");
+        assert_eq!(hex(&sha256(&out)), put["sha"].as_str().expect("sha"), "{put}");
+    }
+
+    // the Rust peer publishes the same two shapes; Java fetches them
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("interop-artifacts-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    for (name, size, seed) in [("inline.bin", 4_000_000usize, 21u32), ("block.bin", 6_000_000, 22)] {
+        let bytes = data(size, seed);
+        std::fs::write(dir.join(name), &bytes).expect("write");
+        let m = content
+            .publish_file(&dir.join(name), PublishOptions { piece_size: 64 * 1024, ..PublishOptions::default() })
+            .await
+            .expect("publish");
+        assert_eq!(m.table_ref.is_some(), size > 64 * 64 * 1024);
+        let mut got = Json::Null;
+        for _ in 0..10 {
+            got = java.ask(&format!("art-fetch {} 20000", m.root)).await;
+            if got["ok"] == true {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        assert_eq!(got["ok"], true, "{got}");
+        assert_eq!(got["sha"].as_str(), Some(hex(&sha256(&bytes)).as_str()), "{got}");
+    }
+    let counters = content.counters().await.expect("counters");
+    assert!(counters.pieces_served > 0 && counters.pieces_fetched > 0 && counters.pieces_refused == 0, "{counters:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+    content.close().await.expect("close");
+    let _ = peer.close().await;
+}

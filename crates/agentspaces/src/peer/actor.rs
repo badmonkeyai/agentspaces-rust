@@ -2733,6 +2733,34 @@ impl Actor {
         self.send_addressed_frame(KIND_BLOCK_WANT, &bodies::block_want_body(cid), to)
     }
 
+    /// Asks member `from` (and the seed) for a block by id; the answer is held among the fetched
+    /// blocks and announced as [`PeerEvent::Block`] once it verifies.
+    pub(super) fn fetch_block(&mut self, cid: &str, from: Option<&str>) -> Result<(), PeerError> {
+        self.check_open()?;
+        let now = Instant::now();
+        if !self.block_asked.contains_key(cid) && self.block_asked.len() >= MAX_ASKED_BLOCKS {
+            self.block_asked
+                .retain(|_, asked| now.duration_since(*asked) < Duration::from_secs(60));
+            if self.block_asked.len() >= MAX_ASKED_BLOCKS {
+                return Err(PeerError::SendOverflow);
+            }
+        }
+        self.block_asked.insert(cid.to_owned(), now);
+        let mut targets: Vec<String> = from.map(str::to_owned).into_iter().collect();
+        if let Some(seed) = &self.seed_peer
+            && !targets.contains(seed)
+        {
+            targets.push(seed.clone());
+        }
+        let body = bodies::block_want_body(cid);
+        for target in targets {
+            if target != self.peer_id {
+                let _ = self.send_addressed_frame(KIND_BLOCK_WANT, &body, &target);
+            }
+        }
+        Ok(())
+    }
+
     /// The payload bytes of an entry's record: inline, a held block, or the CBOR null; a block
     /// not yet held is asked for and `None` returned (`Peer.payload_of`). A content-swarm root
     /// is not resolved here.

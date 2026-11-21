@@ -1,0 +1,47 @@
+# Copyright 2026 Bad Monkey, Inc.
+# Author: Al Baker
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[package]
+name = "spacewalk"
+description = "A terminal UI that shares files from a local directory into an agent space, and pulls them back (AgentSpaces for Rust)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "README.md"
+homepage.workspace = true
+keywords = ["agents", "p2p", "file-sharing", "tui", "terminal"]
+categories = ["command-line-utilities", "network-programming"]
+
+[[bin]]
+name = "spacewalk"
+path = "src/main.rs"
+
+[dependencies]
+agentspaces = { version = "0.5.0", path = "../agentspaces" }
+agentspaces-pdt = { version = "0.5.0", path = "../agentspaces-pdt" }
+clap = { version = "4.6.7", features = ["derive", "wrap_help"] }
+ratatui = "0.30"
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std", "env-filter"] }
+unicode-width = "0.2"
+
+[lints]
+workspace = true

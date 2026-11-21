@@ -356,6 +356,69 @@ Examples:
         only: Vec<String>,
     },
 
+    /// Publish a file as an artifact on the content swarm and serve it until interrupted.
+    #[command(after_help = "\
+Prints {\"root\", \"size\", \"pieceSize\", \"pieces\", \"name\"}: the root is what a member fetches
+with aspace get. The file is hashed into pieces, a manifest entry goes into the group's content
+space, and this process serves the pieces to every member that asks until Ctrl-C (or leaves at
+once with --exit). --in-place serves the file where it is; a change to it stops the serving.
+
+Examples:
+  aspace put model.bin
+  aspace put dataset.parquet --piece-size 4194304 --name dataset
+  aspace put big.iso --in-place")]
+    Put {
+        /// The file.
+        path: PathBuf,
+        /// The piece size in bytes: a power of two from 65536 to 4194304 (default 1048576).
+        #[arg(long, value_name = "BYTES")]
+        piece_size: Option<u64>,
+        /// The artifact's name (default: the file name).
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// Serve the file where it is instead of copying its pieces.
+        #[arg(long)]
+        in_place: bool,
+        /// Leave right after publishing.
+        #[arg(long)]
+        exit: bool,
+    },
+
+    /// Fetch an artifact by its root from the members that hold it.
+    #[command(after_help = "\
+Prints {\"root\", \"path\", \"size\", \"piecesFetched\"}. Every piece is checked against the
+manifest's table; progress goes to standard error. With --store DIR the pieces are kept there, so
+a fetch that stopped resumes from what it held. Exit 3 when the artifact does not complete within
+--timeout.
+
+Examples:
+  aspace get bafkrei... -o model.bin
+  aspace get bafkrei... -o model.bin --store ~/.cache/aspace/pieces --timeout 30m")]
+    Get {
+        /// The artifact's root.
+        root: String,
+        /// The file to write.
+        #[arg(short, long, value_name = "FILE")]
+        out: PathBuf,
+        /// A directory that keeps the pieces, so an interrupted fetch resumes.
+        #[arg(long, value_name = "DIR")]
+        store: Option<PathBuf>,
+        /// How long the fetch may take (default 10m).
+        #[arg(long, value_parser = parse_duration, default_value = "10m")]
+        timeout: Duration,
+    },
+
+    /// The content swarm's artifacts.
+    #[command(after_help = "\
+Examples:
+  aspace content ls
+  aspace content ls --json | jq -r .root")]
+    Content {
+        /// What to do.
+        #[command(subcommand)]
+        command: ContentCommand,
+    },
+
     /// Invoke a remote action through the fleet catalogue and print its result.
     #[command(after_help = "\
 The target is an offering's name (aspace cards), or the schema it consumes when exactly one
@@ -1062,4 +1125,22 @@ mod tests {
             );
         }
     }
+}
+
+/// `aspace content` commands.
+#[derive(Debug, Subcommand)]
+pub enum ContentCommand {
+    /// List the artifacts the group's content space describes, with their holders.
+    #[command(after_help = "\
+Prints one line per artifact: its root, size, holders, and name; --json prints
+{\"root\", \"size\", \"pieces\", \"name\", \"mediaType\", \"origin\", \"holders\", \"complete\"} per line.
+
+Examples:
+  aspace content ls
+  aspace content ls --json | jq 'select(.complete > 0) | .root'")]
+    Ls {
+        /// Print JSON Lines instead of text.
+        #[arg(long)]
+        json: bool,
+    },
 }

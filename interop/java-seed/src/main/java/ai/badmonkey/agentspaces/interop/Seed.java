@@ -403,13 +403,14 @@ public final class Seed {
         Content content = null;
         Pdt pdt = null;
         if (withContent) {
+            BlockExchange contentBlocks = new BlockExchange(runtime, CborCodec.defaultCodec());
             ReplicatedSpace contentSpace = ReplicatedSpace.builder(runtime, "content", identity, "content")
-                    .blocks(new BlockExchange(runtime, CborCodec.defaultCodec())).build();
+                    .blocks(contentBlocks).build();
             ReplicatedSpace refSpace = ReplicatedSpace.builder(runtime, "pdt", identity, "pdt")
                     .settleWindow(Duration.ofMillis(settleMs)).build();
             pdt = Pdt.builder(refSpace).store(nodes).loadTimeout(Duration.ofSeconds(20)).build();
             content = Content.builder(new CapabilityPipes(runtime, CborCodec.defaultCodec()), runtime, contentSpace,
-                    identity.peerId()).discovery(discovery).treeStore(pdt.treeStore()).build();
+                    identity.peerId()).discovery(discovery).blocks(contentBlocks).treeStore(pdt.treeStore()).build();
             CapabilityRuntime capabilities = new CapabilityRuntime(runtime, discovery, identity);
             capabilities.register(content);
             capabilities.refreshTick();
@@ -812,6 +813,46 @@ public final class Seed {
                     case "tree-sha" -> {
                         byte[] data = PBlob.load(nodes, cmd[1]).bytes();
                         System.out.println("{\"size\":" + data.length + ",\"sha\":" + q(sha(data)) + "}");
+                    }
+                    case "art-put" -> {
+                        // art-put <bytes> <seed> <piece size>: java.util.Random(seed) bytes published as an artifact
+                        String[] parts = cmd[2].split("\\s+");
+                        byte[] data = new byte[Integer.parseInt(cmd[1])];
+                        new java.util.Random(Long.parseLong(parts[0])).nextBytes(data);
+                        ai.badmonkey.agentspaces.content.PublishOptions options = new ai.badmonkey.agentspaces.content.PublishOptions(
+                                Lease.of(Duration.ofDays(1)), Integer.parseInt(parts[1]), "java.bin", "application/octet-stream",
+                                null, false, true);
+                        var manifest = content.publish(data, options);
+                        System.out.println("{\"root\":" + q(manifest.root()) + ",\"pieces\":" + manifest.pieces()
+                                + ",\"tableRef\":" + (manifest.tableRef() != null) + ",\"sha\":" + q(sha(data)) + "}");
+                    }
+                    case "art-fetch" -> {
+                        // art-fetch <root> <timeout millis>: the artifact fetched from its holders, and its sha
+                        var fetch = content.fetch(cmd[1], ai.badmonkey.agentspaces.content.FetchOptions.defaults());
+                        boolean done;
+                        try {
+                            done = fetch.await(Duration.ofMillis(Long.parseLong(cmd[2])));
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            done = false;
+                        }
+                        if (done && fetch.complete()) {
+                            var out = new java.io.ByteArrayOutputStream();
+                            try (var channel = content.openPlain(cmd[1])) {
+                                var buffer = java.nio.ByteBuffer.allocate(1 << 16);
+                                while (channel.read(buffer) > 0) {
+                                    out.write(buffer.array(), 0, buffer.position());
+                                    buffer.clear();
+                                }
+                            } catch (java.io.IOException e) {
+                                throw new java.io.UncheckedIOException(e);
+                            }
+                            System.out.println("{\"ok\":true,\"size\":" + out.size() + ",\"sha\":" + q(sha(out.toByteArray())) + "}");
+                        } else {
+                            List<String> trace = fetch.trace();
+                            System.out.println("{\"ok\":false,\"failure\":" + q(String.valueOf(fetch.failure().orElse(null)))
+                                    + ",\"trace\":" + q(trace.isEmpty() ? "" : trace.get(trace.size() - 1)) + "}");
+                        }
                     }
                     case "share-put" -> {
                         // share-put <key> <bytes> <seed>: what the console's Add to space does with a project

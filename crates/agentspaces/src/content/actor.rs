@@ -22,6 +22,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+mod artifacts;
+
 use super::{
     CAPABILITY, Command, ContentConfig, ContentCounters, ContentError, FetchOptions, FetchReport, HOLDING_TYPE,
     TREES_PARAMETER, TREES_VERSION,
@@ -193,10 +195,13 @@ pub(super) struct Actor {
     upload_window: Instant,
     upload_used: u64,
     advertised_at: Instant,
+    shared: Arc<super::Shared>,
+    held_artifacts: HashMap<String, artifacts::HeldArtifact>,
+    artifact_fetches: Vec<artifacts::ArtifactFetch>,
 }
 
 impl Actor {
-    pub(super) fn new(peer: Peer, nodes: Arc<dyn Nodes>, config: ContentConfig) -> Actor {
+    pub(super) fn new(peer: Peer, nodes: Arc<dyn Nodes>, shared: Arc<super::Shared>, config: ContentConfig) -> Actor {
         let space = peer.space(&config.space);
         Actor {
             peer,
@@ -213,6 +218,9 @@ impl Actor {
             upload_window: Instant::now(),
             upload_used: 0,
             advertised_at: Instant::now(),
+            shared,
+            held_artifacts: HashMap::new(),
+            artifact_fetches: Vec::new(),
         }
     }
 
@@ -283,6 +291,9 @@ impl Actor {
         for root in held {
             self.release(&root).await;
         }
+        self.close_artifact_fetches();
+        self.release_artifacts().await;
+        self.shared.pieces.flush();
     }
 
     async fn command(&mut self, command: Command) {
@@ -307,6 +318,10 @@ impl Actor {
             Command::Counters { reply } => {
                 let _ = reply.send(self.counters.clone());
             }
+            Command::HoldArtifact { manifest, table, lease, reply } => {
+                let _ = reply.send(self.hold_artifact(*manifest, table, lease).await);
+            }
+            Command::FetchArtifact { root, options, reply } => self.start_artifact(root, options, reply).await,
             Command::Close { .. } => {}
         }
     }
@@ -432,6 +447,9 @@ impl Actor {
             let _ = self.advertise().await;
         }
         self.renew_holdings().await;
+        if !self.held_artifacts.is_empty() || !self.artifact_fetches.is_empty() {
+            self.tick_artifacts().await;
+        }
         if !self.fetches.is_empty() {
             self.refresh_members(false).await;
             for i in (0..self.fetches.len()).rev() {
@@ -465,17 +483,17 @@ impl Actor {
             }
         };
         match message {
-            Message::PieceWant { root, index, .. } => {
-                self.counters.piece_messages_dropped += 1;
-                self.reject(&from, &root, index, forms::REASON_UNKNOWN_ROOT).await;
+            Message::PieceWant { root, index, offset, length, req } => {
+                self.serve_piece(&from, &root, index, offset, length, req).await;
             }
-            Message::ManifestWant { root } => {
-                self.counters.piece_messages_dropped += 1;
-                self.reject(&from, &root, -1, forms::REASON_UNKNOWN_ROOT).await;
+            Message::ManifestWant { root } => self.serve_manifest(&from, &root).await,
+            Message::Piece { root, index, offset, bytes, req } => {
+                self.on_piece(&from, &root, index, offset, bytes, req).await;
             }
-            Message::Piece { .. } | Message::Have { .. } | Message::Cancel { .. } | Message::Manifest { .. } => {
-                self.counters.piece_messages_dropped += 1;
-            }
+            Message::Have { root, have, complete } => self.on_have(&from, &root, have, complete),
+            // requests are answered at once, so a cancel finds nothing queued
+            Message::Cancel { .. } => {}
+            Message::Manifest { root, record } => self.on_manifest(&root, &record).await,
             Message::NodeWant { req, cids } => {
                 if !self.is_tree_member(&from).await {
                     self.counters.tree_messages_dropped += 1;
@@ -500,8 +518,10 @@ impl Actor {
                 self.on_nodes(&from, req, nodes.unwrap_or_default(), missing).await;
             }
             Message::TreeEnd { req, frontier, .. } => self.on_tree_end(&from, req, frontier).await,
-            Message::Reject { root, index, .. } => {
-                if index == -1 {
+            Message::Reject { root, index, reason } => {
+                if self.artifact_fetches.iter().any(|f| f.root_is(&root)) {
+                    self.on_artifact_reject(&from, &root, index, reason).await;
+                } else if index == -1 {
                     self.on_reject(&from, &root).await;
                 } else {
                     self.counters.piece_messages_dropped += 1;

@@ -26,9 +26,15 @@
 //! head whose `base` lists the heads it read; [`Pdt::tick`] renews the heads this member wrote at
 //! half their lease and withdraws its superseded heads after a grace of two gossip rounds.
 //!
+//! [`FileShare`] is the Groovy console's file share on these refs, with download and withdraw.
+//!
 //! The values here are the level-1 map kinds (`map`, `set`, `tree`) of
 //! [`agentspaces::wire::pdt`]. A ref whose heads say `linear` reads here and refuses a swap.
 
+pub mod files;
 mod refs;
+pub mod store;
 
+pub use files::{FileShare, FileShareConfig, Inspected, Listed, Receipt, ShareError};
 pub use refs::{Head, Pdt, PdtConfig, PdtError, Ref, RefStats, Swapped};
+pub use store::FileNodes;

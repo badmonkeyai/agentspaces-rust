@@ -379,6 +379,9 @@ Next, roughly in this order:
 | `aspace watch SCHEMA` | Stream the transitions of a schema's entries: written, taken, completed, expired, reappeared. |
 | `aspace cards` | List the offerings of the fleet catalogue. |
 | `aspace call TARGET --json OBJECT` | Invoke an offering, by name or by the schema it consumes, and print its result. |
+| `aspace put FILE` | Publish a file as an artifact on the content swarm, print its root, and serve its pieces until interrupted (`--exit` leaves at once, `--in-place` serves the file where it is). |
+| `aspace get ROOT -o FILE` | Fetch an artifact by its root from the members that hold it, every piece checked; `--store DIR` keeps the pieces so an interrupted fetch resumes. |
+| `aspace content ls` | List the artifacts the group's content space describes, with their holders. |
 | `aspace work --take SCHEMA --space SPACE -- PROGRAM` | Run a program for each task taken, as an agent with a card. |
 | `aspace seed` | Listen and serve a group as its seed: one it founds (`--found NAME`), one founded from a text (`--group`), or another seed's (`--join`). See [docs/seed.md](docs/seed.md). |
 | `aspace invite --found NAME` | Print an invite key of an invite group this keystore founded; joiners pass it with `--invite` or `ASPACE_INVITE`. |
@@ -416,6 +419,15 @@ Every command's `--help` ends with examples.
 **The daemon.** Each command joins the fleet on its own, unless `aspace daemon` runs. While it runs, `status`, `write`, `read`, `take`, `complete`, `watch`, `cards`, and `call` go through it when they name the same group, keystore, and profile. They answer in milliseconds, with the same output and exit codes. Its socket is owner-only and serves only processes of the same user. Run it under systemd or launchd, or with `setsid`. `--no-daemon` makes a command join on its own.
 
 **Several peers from a shell.** [A fleet from the shell](#a-fleet-from-the-shell-the-multiple-peer-example) runs a seed, a writer, a worker, a caller, and a late visitor with nothing but `aspace`.
+
+## spacewalk: share files from a terminal
+
+[`crates/spacewalk`](crates/spacewalk/README.md) is a terminal UI that shares files from a local directory into an agent space and pulls them back, writing and reading exactly what the Groovy console's **Add to space…** does. It runs on the content swarm (`agentspaces::content`, which moves persistent trees by the tree exchange and artifacts by the piece exchange) and the persistent data trees of the `agentspaces-pdt` crate. It joins by seeds, fleet YAML, group id, or a beacon URL, and with `--store` it keeps what it shared and fetched across runs.
+
+```bash
+cargo build --release -p spacewalk
+spacewalk --seeds tcp://127.0.0.1:7880 --group team-files --space shared -C ~/proj
+```
 
 ## MCP: the fleet as tools
 
