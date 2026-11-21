@@ -41,8 +41,8 @@
 //!
 //! The schemas are annex I.1's, which Java's own serializers generated. `PRef.attrs` follows rule
 //! R1: a value under `pdt.issued` or `pdt.issuer` is any item (the head falls back when it is no
-//! text), and every other value is text. The content swarm's messages (annex I.1a) are not read
-//! here: this peer runs no content swarm.
+//! text), and every other value is text. The content swarm's records and level-1 messages
+//! (annex I.1a) read here too, for [`crate::content`].
 #![warn(missing_docs)]
 
 use std::collections::HashMap;
@@ -137,6 +137,20 @@ PushSumAggregate.Share { epochId: String, value: double, weight: double }
 PushSumAggregate.Extremum { epochId: String, max: boolean, value: double }
 PushSumAggregate.Histogram { epochId: String, lo: double, hi: double, buckets: list<double> }
 PushSumAggregate.Roster { epochId: String, members: list<long> }
+Manifest { v: int, root: String, size: long, pieceSize: int, pieces: int, table: bytes, tableRef: String, tableRefs: list<String>, name: String, mediaType: String, sealing: String, keyEpoch: Long, hashing: String, origin: PeerId, created: long, attrs: map<String,String>, layout: String ?null }
+Holding { v: int, root: String, holder: PeerId, complete: boolean, have: bytes, count: int, via: list<PeerId>, cost: map<String,String> }
+Messages.PieceWant { t: int, root: String, index: int, offset: int, length: int, req: int }
+Messages.Piece { t: int, root: String, index: int, offset: int, bytes: bytes, req: int }
+Messages.Have { t: int, root: String, have: bytes, complete: boolean }
+Messages.Cancel { t: int, root: String, index: int, req: int }
+Messages.Reject { t: int, root: String, index: int, reason: int }
+Messages.ManifestWant { t: int, root: String }
+Messages.ManifestReply { t: int, root: String, record: bytes }
+Messages.NodeWant { t: int, req: int, cids: list<String> }
+Messages.Nodes { t: int, req: int, nodes: list<bytes>, sealed: bytes, epoch: Long, missing: list<String>, deltas: list<Messages.NodeDelta> ?null }
+Messages.NodeDelta { cid: String, base: String, dcz: bytes }
+Messages.TreeWant { t: int, req: int, root: String, haves: list<String>, budget: long, sketch: bytes }
+Messages.TreeEnd { t: int, req: int, frontier: list<String>, reason: int, sketch: bytes ?null }
 ";
 
 /// The advertisement type tags of a stored advertisement, each the name of its record schema

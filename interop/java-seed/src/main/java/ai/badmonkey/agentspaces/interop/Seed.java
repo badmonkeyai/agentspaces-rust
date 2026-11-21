@@ -38,7 +38,18 @@ import ai.badmonkey.agentspaces.api.space.Template;
 import ai.badmonkey.agentspaces.common.codec.CborCodec;
 import ai.badmonkey.agentspaces.common.id.GroupId;
 import ai.badmonkey.agentspaces.common.id.PeerId;
+import ai.badmonkey.agentspaces.capabilities.runtime.CapabilityPipes;
+import ai.badmonkey.agentspaces.capabilities.runtime.CapabilityRuntime;
+import ai.badmonkey.agentspaces.content.Content;
+import ai.badmonkey.agentspaces.content.tree.TreeFetch;
 import ai.badmonkey.agentspaces.discovery.DiscoveryService;
+import ai.badmonkey.agentspaces.groovy.console.files.SharedFile;
+import ai.badmonkey.agentspaces.pdt.NodeStore;
+import ai.badmonkey.agentspaces.pdt.Pdt;
+import ai.badmonkey.agentspaces.pdt.blob.FileEntry;
+import ai.badmonkey.agentspaces.pdt.values.PMap;
+import ai.badmonkey.agentspaces.pdt.blob.PBlob;
+import ai.badmonkey.agentspaces.pdt.swarm.PdtSwarm;
 import ai.badmonkey.agentspaces.identity.PeerIdentity;
 import ai.badmonkey.agentspaces.peering.membership.GroupMembership;
 import ai.badmonkey.agentspaces.peering.node.GroupRuntime;
@@ -292,6 +303,15 @@ public final class Seed {
         }
     }
 
+    /** The lower-case hex sha-256 of bytes. */
+    static String sha(byte[] data) {
+        try {
+            return java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(data));
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
     private Seed() {
     }
 
@@ -308,6 +328,7 @@ public final class Seed {
         boolean audit = true;
         boolean horizon = true;
         int engageRounds = 3;
+        boolean withContent = false;
         for (int i = 1; i < args.length; i++) {
             switch (args[i]) {
                 case "--tls" -> tls = true;
@@ -321,6 +342,7 @@ public final class Seed {
                 case "--no-audit" -> audit = false;
                 case "--no-horizon" -> horizon = false;
                 case "--engage-rounds" -> engageRounds = Integer.parseInt(args[++i]);
+                case "--content" -> withContent = true;
                 default -> throw new IllegalArgumentException("unknown argument " + args[i]);
             }
         }
@@ -374,6 +396,26 @@ public final class Seed {
             taskEvents.computeIfAbsent(topic, t -> java.util.Collections.synchronizedList(new ArrayList<>()))
                     .add(event.kind() + " by " + event.actor().encoded());
         }, Lease.of(Duration.ofDays(1)));
+        // The content swarm over an in-memory node store, as the Groovy console's tutorial peer runs it:
+        // the "content" space for manifests and holdings, the tree exchange, and the advertisement.
+        // and persistent trees over the "pdt" ref space, attached to the swarm as the runtime attaches them
+        NodeStore nodes = withContent ? NodeStore.inMemory() : null;
+        Content content = null;
+        Pdt pdt = null;
+        if (withContent) {
+            ReplicatedSpace contentSpace = ReplicatedSpace.builder(runtime, "content", identity, "content")
+                    .blocks(new BlockExchange(runtime, CborCodec.defaultCodec())).build();
+            ReplicatedSpace refSpace = ReplicatedSpace.builder(runtime, "pdt", identity, "pdt")
+                    .settleWindow(Duration.ofMillis(settleMs)).build();
+            pdt = Pdt.builder(refSpace).store(nodes).loadTimeout(Duration.ofSeconds(20)).build();
+            content = Content.builder(new CapabilityPipes(runtime, CborCodec.defaultCodec()), runtime, contentSpace,
+                    identity.peerId()).discovery(discovery).treeStore(pdt.treeStore()).build();
+            CapabilityRuntime capabilities = new CapabilityRuntime(runtime, discovery, identity);
+            capabilities.register(content);
+            capabilities.refreshTick();
+            pdt.attach(content).start();
+            runtime.onTick(pdt::tick);
+        }
         node.startTicking(Duration.ofMillis(250));
         if (dial == null) {
             System.out.println("{\"event\":\"listening\",\"port\":" + port + ",\"peer\":" + q(identity.peerId().value())
@@ -739,6 +781,97 @@ public final class Seed {
                                 "{\"peer\":" + q(peer.value()) + ",\"scheme\":" + q(scheme)
                                         + ",\"mode\":" + q(modes.getOrDefault(peer, "?")) + "}"));
                         System.out.println("{\"links\":[" + String.join(",", links.values()) + "]}");
+                    }
+                    case "tree-put" -> {
+                        // tree-put <bytes> <seed>: java.util.Random(seed) bytes as a blob, held and served
+                        byte[] data = new byte[Integer.parseInt(cmd[1])];
+                        new java.util.Random(Long.parseLong(cmd[2])).nextBytes(data);
+                        PBlob blob = PBlob.of(data, nodes);
+                        content.holdTree(blob.root());
+                        System.out.println("{\"root\":" + q(blob.root()) + ",\"size\":" + blob.size() + ",\"sha\":" + q(sha(data)) + "}");
+                    }
+                    case "tree-fetch" -> {
+                        // tree-fetch <root> <timeout millis>: fetch the tree from its holders, then its blob's sha
+                        TreeFetch fetch = content.fetchTree(cmd[1]);
+                        boolean done;
+                        try {
+                            done = fetch.await(Duration.ofMillis(Long.parseLong(cmd[2])));
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            done = false;
+                        }
+                        if (done && fetch.complete()) {
+                            byte[] data = PBlob.load(nodes, cmd[1]).bytes();
+                            System.out.println("{\"ok\":true,\"size\":" + data.length + ",\"sha\":" + q(sha(data)) + "}");
+                        } else {
+                            List<String> trace = fetch.trace();
+                            System.out.println("{\"ok\":false,\"failure\":" + q(String.valueOf(fetch.failure().orElse(null)))
+                                    + ",\"trace\":" + q(trace.isEmpty() ? "" : trace.get(trace.size() - 1)) + "}");
+                        }
+                    }
+                    case "tree-sha" -> {
+                        byte[] data = PBlob.load(nodes, cmd[1]).bytes();
+                        System.out.println("{\"size\":" + data.length + ",\"sha\":" + q(sha(data)) + "}");
+                    }
+                    case "share-put" -> {
+                        // share-put <key> <bytes> <seed>: what the console's Add to space does with a project
+                        // file: the bytes as a blob, held; the file-share map swapped under <space>/<key>; a
+                        // SharedFile record in the space, leased 30 minutes and tagged location and key
+                        String[] parts = cmd[2].split("\\s+");
+                        byte[] data = new byte[Integer.parseInt(parts[0])];
+                        new java.util.Random(Long.parseLong(parts[1])).nextBytes(data);
+                        PBlob blob = PBlob.of(data, nodes);
+                        content.holdTree(blob.root());
+                        String key = spaceName + "/" + cmd[1];
+                        FileEntry entry = new FileEntry(blob.root(), blob.size(), FileEntry.REGULAR, "application/octet-stream");
+                        pdt.treeRef("file-share").swap(map -> map.assoc(key, entry));
+                        String name = cmd[1].substring(cmd[1].lastIndexOf('/') + 1);
+                        space.write(new SharedFile("file-share", key, name, blob.root(), blob.size(), "application/octet-stream",
+                                System.currentTimeMillis()), Lease.of(Duration.ofMinutes(30)),
+                                Map.of("location", "file-share", "key", key));
+                        System.out.println("{\"key\":" + q(key) + ",\"root\":" + q(blob.root()) + ",\"size\":" + blob.size()
+                                + ",\"sha\":" + q(sha(data)) + "}");
+                    }
+                    case "share-list" -> {
+                        // the file-share map as this node merges it, and the SharedFile records of the space
+                        PMap<String, FileEntry> map = pdt.treeRef("file-share").deref();
+                        StringBuilder out = new StringBuilder("{\"count\":" + map.count() + ",\"root\":" + q(map.root()) + ",\"files\":{");
+                        String sep = "";
+                        for (Map.Entry<String, FileEntry> e : map) {
+                            out.append(sep).append(q(e.getKey())).append(":{\"root\":").append(q(e.getValue().root()))
+                                    .append(",\"size\":").append(e.getValue().size()).append("}");
+                            sep = ",";
+                        }
+                        out.append("},\"records\":[");
+                        sep = "";
+                        for (SharedFile f : space.readAll(Template.of(SharedFile.class), 1000)) {
+                            out.append(sep).append(q(f.key()));
+                            sep = ",";
+                        }
+                        System.out.println(out.append("]}"));
+                    }
+                    case "share-get" -> {
+                        // share-get <key> <timeout millis>: the key's blob fetched from its holders, and its sha
+                        Optional<FileEntry> entry = pdt.treeRef("file-share").deref().get(cmd[1]);
+                        if (entry.isEmpty()) {
+                            System.out.println("{\"ok\":false,\"failure\":\"no such key\"}");
+                        } else {
+                            String root = entry.get().root();
+                            TreeFetch fetch = content.fetchTree(root);
+                            boolean done;
+                            try {
+                                done = fetch.await(Duration.ofMillis(Long.parseLong(cmd[2])));
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                                done = false;
+                            }
+                            if (done && fetch.complete()) {
+                                byte[] data = PBlob.load(nodes, root).bytes();
+                                System.out.println("{\"ok\":true,\"size\":" + data.length + ",\"sha\":" + q(sha(data)) + "}");
+                            } else {
+                                System.out.println("{\"ok\":false,\"failure\":" + q(String.valueOf(fetch.failure().orElse(null))) + "}");
+                            }
+                        }
                     }
                     case "quit" -> {
                         agents.close();

@@ -38,5 +38,8 @@
     <dependency><groupId>ai.badmonkey.agentspaces</groupId><artifactId>agentspaces-discovery</artifactId><version>${agentspaces.version}</version></dependency>
     <dependency><groupId>ai.badmonkey.agentspaces</groupId><artifactId>agentspaces-capabilities</artifactId><version>${agentspaces.version}</version></dependency>
     <dependency><groupId>ai.badmonkey.agentspaces</groupId><artifactId>agentspaces-agent</artifactId><version>${agentspaces.version}</version></dependency>
+    <!-- the content swarm and persistent trees for the content option; agentspaces-pdt is the jar the Groovy console runs -->
+    <dependency><groupId>ai.badmonkey.agentspaces</groupId><artifactId>agentspaces-content</artifactId><version>${agentspaces.version}</version></dependency>
+    <dependency><groupId>ai.badmonkey.agentspaces</groupId><artifactId>agentspaces-pdt</artifactId><version>${agentspaces.version}</version></dependency>
   </dependencies>
 </project>

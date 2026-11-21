@@ -104,6 +104,7 @@ pub mod catalog;
 pub mod channel_cert;
 pub mod clock;
 pub mod config;
+pub mod content;
 pub mod entry;
 pub mod group;
 pub mod json;
