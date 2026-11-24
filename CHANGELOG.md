@@ -108,6 +108,153 @@ What a dial-only member of layers 0 to 3 must do, brought up to SPEC v0.1.33:
 - **Agent ids (SPEC §9.2 R5).** A local name holds no `:`.
 - **Java interop** runs against the AgentSpaces 0.6.0 core.
 
+### SPEC v0.1.36: timing and loops
+
+No frame, field, hint, or vector changed; these are the behaviours SPEC
+v0.1.36 restates in time and the reference node's loop changes a peer can
+observe.
+
+- **The settle guarantee's pairing (§7.4).** A peer whose holder keeps the
+  better claim remembers, per entry and bounded, the claims it displaced and
+  the completions it dropped for want of their claim, and pairs them from any
+  frames; a displaced holder that completed offers its claim again (at once,
+  then no sooner than 1 s, 2 s, 4 s, ... after the previous offer, six offers
+  at most). `PeerCounters::displaced_reoffers` counts the offers.
+- **Due work, not fixed ticks.** The listening role's housekeeping runs when
+  its earliest concern falls due (a 15 s backstop, with a missed-wake count in
+  `ListenCounters`); the watch sweep runs at the earliest lapse it tells; a
+  lone listening peer's rounds back off like an idle one's, and the first
+  activity asks for a round at once; the content swarm and the persistent
+  values' ticker sleep to their next renewal while idle.
+- **Time.** Local periods run on the monotonic clock (the audit's timeouts
+  included). A push subscription's lease is one of them: it is judged on
+  `Clock::local_ms` (new, defaulted to `now_ms`; the system clock reads the
+  monotonic clock), so a laptop sleep or a forward NTP step lapses no
+  subscription, where it used to lapse every one at once.
+  `Subscription::expires_at_millis` still reads in wall time. A wall-clock step
+  re-anchors the wall deadlines, and a forward step past the 30 s keepalive (a
+  suspend) re-introduces the peer at once (`PeerCounters::wall_steps`,
+  `resumes`). A changed card or self-advertisement is issued at least a
+  millisecond after the last one under its id.
+- **Loop health.** `Peer::loop_health()` reads the loop's heartbeat, which a
+  watchdog thread per process checks every 2 s for slow and wedged turns and
+  missed deadlines (it nudges the loop); a panicking turn is contained and
+  counted. The same thread watches for a wall step and nudges every loop, so a
+  peer back from a suspend reads it within 2 s rather than at its next
+  deadline.
+- **The TTL floor.** A configured card TTL, holding lease, or head lease under
+  60 s warns, and refuses under `AGENTSPACES_TTL_STRICT=true` unless
+  `AGENTSPACES_TTL_OVERRIDES` names it (`agentspaces::ttl`).
+- **A silent seed is left.** When nothing has come over the dialed link for
+  45 s (1.5 times the 30 s keepalive bound), the peer sends its seed a `PING`;
+  when the link is still silent at the 2 s ping timeout, it closes the link and
+  redials, another seed first, instead of waiting minutes for TCP to give up
+  (`PeerCounters::seed_pings`, `links_silent`). Bytes of a frame still
+  arriving count as an answer (`FrameReceiver::progress`), so a large frame on
+  a slow link is no dead seed. A wake from a suspend asks the seed at once, and
+  a peer waiting out a reconnect pause dials again at once.
+- **A dial-only peer answers its seed's `DIGEST`.** Its own rumors lost on
+  its only link are repaired when the seed's anti-entropy round reaches it.
+  Only the seed's own `DIGEST`, read directly off the dialed link, is answered;
+  a relayed one, or another member's forwarded copy, is ignored and counted as
+  before, so no other member can make the peer upload.
+- **One redial table.** After a round of dials in which no seed answered, the
+  next round waits 5 s, 10 s, 20 s, 30 s, then 5 s again (the steps are 1, 2,
+  4 and 6 times `reconnect_interval`), each spread at random by ±10 % so peers
+  that lost the same seed do not redial in lockstep. A link that held for
+  `reconnect_interval` (5 s), whatever it carried, starts the table over when
+  it is lost and is redialed at once; a link lost sooner is a quick drop and
+  counts as a failed round. A wake from a suspend starts the table over: with
+  no link it redials at once, with a link it pings the seed (a PING already
+  waiting is not sent again) and fails over at once, however young the link,
+  when no answer comes within the 2 s ping timeout. This replaces the fixed
+  `reconnect_interval` between rounds (owner decisions of 2026-11-23, the same
+  rules in every client).
+- **Seeds dialed concurrently.** A join and each redial round dial their seeds
+  at once, staggered 250 ms apart in list order (RFC 8305), with the seed just
+  lost last, at most 16 in flight, and the first to answer wins (the others
+  are cancelled and a late connection is closed): a dead first seed costs a quarter
+  second, not its connect timeout, while a list of live seeds still links to
+  the first.
+- **A listening peer rounds with dial-only links.** Its periodic anti-entropy
+  partner is drawn from every member it holds a link to (as the reference node
+  draws from its view), not only from members that name `view`. One round per
+  period either way, so a dial-only member's own rumors lost on its link reach
+  a Rust seed too, with no extra rounds.
+- **Targeted rounds toward displaced holders.** While one of this peer's
+  holders holds an entry's winning claim and the entry is still present, each
+  holder that claim displaced is sent an anti-entropy round of its own (the
+  usual `DIGEST`): at once, then 1, 2, 4, 8 and 16 s after the one before, at
+  most six, on the monotonic clock, ending once the take is no longer open
+  (`PeerCounters::displaced_pull_rounds`). A displaced holder's completion may
+  have only one source, so the winner learns it within one round instead of
+  waiting for its periodic round to pick that holder (owner decision 4 of
+  2026-11-23, as the reference node).
+- **A peer never gives up redialing.** The reconnect window ends nothing: a
+  whole window without a link is said once per window
+  (`PeerEvent::Unreachable`, `PeerCounters::windows_lapsed`) and a join
+  waiting for its seed is answered `NotConnected`, while the redial goes on
+  until the peer is closed; a wake after any outage redials at once.
+  `PeerEvent::GaveUp` is no longer sent and is kept for one release. The
+  `aspace` residents (daemon, MCP gateway, worker) therefore run on through an
+  outage (owner decision 3 of 2026-11-23).
+- **One set of redial counters.** `PeerCounters::wake_pings` (the
+  `seed_pings` sent on a wake), `seed_dials` (seed dials started) and
+  `late_seed_channels` (channels that answered after another seed won, closed
+  unused), beside `seed_pings`, `links_silent` and `resumes`: the names every
+  client keeps (owner decision 4 of 2026-11-23).
+- **A take context renews only while its agent is bound.** Once the agent is
+  revoked, abandoned past a stop's grace, or every loop ended,
+  `TakeContext::renew` refuses from every clone (`TakeContext::renewable`), so
+  a handler that renews its own take from a task it spawned cannot keep the
+  entry after its agent is gone (as the reference binder).
+- **A wake re-checks held takes.** The keepalive's period runs on the
+  monotonic clock, the take's lease on wall time; on every wall-clock step the
+  peer sees, `keepalive` re-checks the hold at once: a hold still running is
+  renewed now, and one that lapsed while the host slept renews no more. Its
+  handler's result is late: nothing is completed, and `Bound::late_takes`
+  counts it (owner decision 5 of 2026-11-23).
+- **When a take has lapsed.** A take has lapsed once its claim is no longer
+  its holder's at its epoch on this peer's replica (a better claim displaced
+  it, or the entry was completed or withdrawn) or its wall-time lease has
+  passed (`TakeContext::lapsed`); a result arriving after that completes
+  nothing and is counted in `Bound::late_takes`, the name every implementation
+  counts it by (owner decision 2 of 2026-11-23).
+- **A dial-only displaced holder answers the winner's round.** A `DIGEST` a
+  relay carried to a dial-only peer from a member other than its seed is
+  answered as the core answers it: only for the spaces where the peer holds a
+  claim made here that a better claim displaced, with or without its
+  completion, and with only those entries (each displaced claim, and the
+  entry's state where the asker lacks it); `hashes` draw `want`, `digests` a
+  `PULL_RESP`, and `ids` and `tree` nothing. Another completion of its own
+  work draws nothing. All of it is under an answer pace of its own per asker, 16 at once and 4 a
+  second, apart from the seed's (`PeerCounters::displaced_digest_answers`,
+  `relayed_answers_paced`), so one member flooding such rounds starves neither
+  another winner's nor the seed's; the seed's own `DIGEST` is answered as
+  before. A winner whose claim displaced a dial-only holder learns that
+  holder's completion from its targeted round (owner decision 1 of
+  2026-11-23).
+- **A frozen process is a wake.** A loop wake more than 30 s past its
+  deadline with no wall-clock step (SIGSTOP, a long collection or VM pause),
+  or the process watchdog's own tick that late, is a wake as a suspend is
+  (`PeerCounters::late_wakes`, also counted in `resumes`): the seed is PINGed
+  again with a fresh answer window, held takes re-check at once, and a
+  listening peer probes each member whose link the freeze left silent past
+  the idle timeout and judges it only after the answer window
+  (`ListenCounters::wake_probes`), so the freeze drops nobody. After any wake
+  a dial-only peer re-pulls the view naming only the cards still live, and
+  until the answer (or 11.25 s) keeps a member whose card lapsed only while it
+  was away in the per-entry horizon's view, as lacking the hint
+  (`PeerCounters::view_reprobes`). The watchdog's check after such a tick
+  judges no loop (owner decision 3 of 2026-11-23).
+- **The dead-link rule on every dialed seed link.** A listening peer that
+  also dialed a seed watches that link by the same 45 s and 2 s rule as a
+  dial-only peer (owner decision 5 of 2026-11-23).
+- **A dial-only idle member for the mixed idle run.**
+  `cargo run --example idle_member -- HOST PORT FOUNDING` joins through one
+  seed over TCP, names it in `relay.via`, stays idle, and answers `view`,
+  `counters` and `quit` on standard input.
+
 ### `agentspaces-wire`
 
 The protocol core, with no I/O, no threads, no async runtime, and no clock of

@@ -21,6 +21,8 @@
 //! final shutdown) is raced against the channel's [`Closer`], so the stream is dropped and the
 //! socket closed instead of a task, the socket, and its queued frames outliving the close.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use agentspaces_wire::limits::MAX_FRAME_BYTES;
@@ -53,11 +55,13 @@ where
     let (in_tx, in_rx) = mpsc::channel(CHANNEL_QUEUE);
     let (out_tx, out_rx) = mpsc::channel(CHANNEL_QUEUE);
     let (closer, closed) = Closer::new();
+    let progress = Arc::new(AtomicU64::new(0));
     tokio::spawn(read_frames(
         read_half,
         in_tx,
         closed.clone(),
         closer.clone(),
+        Arc::clone(&progress),
     ));
     tokio::spawn(write_frames(write_half, out_rx, closed, closer.clone()));
     Channel {
@@ -65,7 +69,7 @@ where
         remote: remote.to_owned(),
         attested,
         sender: FrameSender::new(out_tx, closer.watch()),
-        receiver: FrameReceiver::new(in_rx, closer.watch()),
+        receiver: FrameReceiver::new(in_rx, closer.watch()).with_progress(progress),
         closer,
     }
 }
@@ -83,11 +87,14 @@ async fn until_closed(closed: &mut watch::Receiver<bool>) {
     }
 }
 
+/// Reads frames off `reader` into `frames`, counting every byte read in `progress` as it
+/// arrives (a frame still arriving included: [`FrameReceiver::progress`]).
 async fn read_frames<R: AsyncRead + Send + Unpin>(
     mut reader: R,
     frames: mpsc::Sender<Vec<u8>>,
     mut closed: watch::Receiver<bool>,
     closer: Closer,
+    progress: Arc<AtomicU64>,
 ) {
     loop {
         let mut head = [0u8; 4];
@@ -98,6 +105,7 @@ async fn read_frames<R: AsyncRead + Send + Unpin>(
         if read.is_err() {
             break;
         }
+        progress.fetch_add(4, Ordering::Relaxed);
         let length = i32::from_be_bytes(head);
         let Ok(length) = usize::try_from(length) else {
             break;
@@ -106,11 +114,21 @@ async fn read_frames<R: AsyncRead + Send + Unpin>(
             break; // a hostile prefix cannot be resynchronized
         }
         let mut frame = vec![0u8; length];
-        let read = tokio::select! {
-            r = reader.read_exact(&mut frame) => r,
-            () = until_closed(&mut closed) => break,
-        };
-        if read.is_err() {
+        let mut filled = 0;
+        while filled < length {
+            let read = tokio::select! {
+                r = reader.read(&mut frame[filled..]) => r,
+                () = until_closed(&mut closed) => break,
+            };
+            match read {
+                Ok(0) | Err(_) => break, // the stream ended (or failed) inside the frame
+                Ok(read) => {
+                    filled += read;
+                    progress.fetch_add(read as u64, Ordering::Relaxed);
+                }
+            }
+        }
+        if filled < length {
             break;
         }
         let queued = tokio::select! {
@@ -204,6 +222,49 @@ mod tests {
             None,
             "a zero length prefix closes the link"
         );
+    }
+
+    /// The receiver's progress counts the bytes of a frame still arriving, prefix included,
+    /// before the frame is whole; a frame split at every boundary still arrives whole and once.
+    #[tokio::test]
+    async fn progress_counts_the_bytes_of_a_frame_still_arriving() {
+        let (mut raw, other) = tokio::io::duplex(64);
+        let mut channel = spawn_stream_channel(other, "tcp", "raw", None);
+        let progress = channel
+            .receiver
+            .progress()
+            .expect("a stream counts its bytes");
+        let read = || progress.load(Ordering::Relaxed);
+        let settle = || async {
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+        };
+        assert_eq!(read(), 0);
+        raw.write_all(&10u32.to_be_bytes()).await.expect("prefix");
+        settle().await;
+        assert_eq!(read(), 4, "the prefix");
+        raw.write_all(&[1, 2, 3]).await.expect("part");
+        settle().await;
+        assert_eq!(read(), 7, "part of the frame, before it is whole");
+        let early = tokio::select! {
+            biased;
+            frame = channel.receiver.recv() => frame,
+            () = std::future::ready(()) => None,
+        };
+        assert_eq!(early, None, "no frame yet");
+        raw.write_all(&[4, 5, 6, 7, 8, 9, 10]).await.expect("rest");
+        assert_eq!(
+            channel.receiver.recv().await,
+            Some(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+        );
+        assert_eq!(read(), 14);
+        // A stream that ends inside a frame delivers nothing of it.
+        raw.write_all(&8u32.to_be_bytes()).await.expect("prefix");
+        raw.write_all(&[1, 2]).await.expect("part");
+        drop(raw);
+        assert_eq!(channel.receiver.recv().await, None);
+        assert_eq!(read(), 20);
     }
 
     /// A far end that accepts and never reads parks the writer on a full socket. Closing the

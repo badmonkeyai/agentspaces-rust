@@ -200,7 +200,6 @@ async fn kinds_this_peer_does_not_speak_are_ignored_and_counted() {
         "PRUNE",
         "BATCH",
         "SESSION_HELLO",
-        "DIGEST",
         "CHANNEL_HELLO",
         "QUERY",
     ];
@@ -208,6 +207,10 @@ async fn kinds_this_peer_does_not_speak_are_ignored_and_counted() {
         let body = cbor::encode(&cbor_map! { "anything" => i });
         seed.send(0, kind, &body, Some(peer.peer_id())).await;
     }
+    // A dial-only peer answers its seed's DIGEST (owner decision of 2026-11-23): one whose body
+    // is no digest is malformed, not ignored, and draws no answer.
+    let body = cbor::encode(&cbor_map! { "anything" => 99 });
+    seed.send(0, KIND_DIGEST, &body, Some(peer.peer_id())).await;
     // A kind outside wire version 3's names is no envelope (`Envelope.kind` is an enum, SPEC
     // §9.1 P2): the frame does not decode and counts as malformed.
     seed.send(
@@ -220,12 +223,16 @@ async fn kinds_this_peer_does_not_speak_are_ignored_and_counted() {
     seed.ping(0, 9, Some(peer.peer_id())).await;
     wait_ack(&seed, 0, 9).await;
     let counters = peer.counters().await;
-    assert_eq!(counters.ignored_total(), 8);
+    assert_eq!(counters.ignored_total(), 7);
     for kind in kinds {
         assert_eq!(counters.ignored_kinds.get(kind), Some(&1), "{kind}");
     }
     assert_eq!(counters.ignored_kinds.get("NOT_A_KIND"), None);
-    assert_eq!(counters.malformed, 1);
+    assert_eq!(counters.ignored_kinds.get(KIND_DIGEST), None);
+    assert_eq!(
+        counters.malformed, 2,
+        "NOT_A_KIND and the DIGEST that is no digest"
+    );
     assert!(
         seed.kinds(0)
             .iter()
@@ -288,7 +295,10 @@ async fn a_lost_link_is_redialed_and_the_peer_reintroduces_and_repulls() {
     }
     assert!(pulled.contains(&STREAM_ADS.to_owned()), "{pulled:?}");
     assert!(pulled.contains(&"space:work".to_owned()), "{pulled:?}");
-    assert_eq!(pulled.len(), 4, "{pulled:?}");
+    // The membership view rides along on every link-ready pull of a dial-only peer (SPEC §5.2,
+    // v0.1.21; the mixed idle run of 2026-11-23).
+    assert!(pulled.contains(&"view".to_owned()), "{pulled:?}");
+    assert_eq!(pulled.len(), 5, "{pulled:?}");
     let reconnected = next_event(&mut events, "the reconnect", |e| {
         matches!(e, PeerEvent::Reconnected { .. })
     })
@@ -298,6 +308,43 @@ async fn a_lost_link_is_redialed_and_the_peer_reintroduces_and_repulls() {
     assert!(peer.is_connected());
     peer.close().await.expect("close");
     assert!(!peer.is_connected());
+}
+
+/// The mixed idle run of 2026-11-23: a dial-only member of another implementation that joined
+/// earlier refreshes its advertisement to its seed alone, unforwarded, so a later joiner holds it
+/// only from the seed's answer to the `view` pull the link-ready pulls carry (SPEC §5.2, v0.1.21).
+#[tokio::test]
+async fn a_join_pulls_the_view_and_holds_a_member_that_joined_before_it() {
+    let (_network, seed, peer) = joined().await;
+    let first = seed.wait_kinds(0, 2).await;
+    assert_eq!(first, [KIND_RUMOR, KIND_DIGEST]);
+    let pulled = digest_streams(seed.of_kind(0, KIND_DIGEST)[0].body());
+    assert!(pulled.contains(&"view".to_owned()), "{pulled:?}");
+    let earlier = fresh();
+    let issued = time::instant_iso(system().now_ms());
+    let ad = ads::peer_advertisement(&text_group_id(), &earlier, &issued, None);
+    let payload = ads::signed_peer_ad(&ad, &earlier);
+    let mut deltas = Map::new();
+    deltas.insert(
+        "view",
+        agentspaces::wire::serving::view_delta(&[payload.as_slice()]),
+    );
+    seed.send(
+        0,
+        KIND_PULL_RESP,
+        &bodies::pull_resp_body(&deltas),
+        Some(peer.peer_id()),
+    )
+    .await;
+    let earlier_id = earlier.peer_id().to_owned();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !peer.members().await.contains(&earlier_id) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the earlier member is held from the view answer"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test]
@@ -349,11 +396,12 @@ async fn a_seed_that_is_down_is_retried_until_it_listens_again() {
 }
 
 /// A seed that accepts every link and drops it at once (a `tls` seed dialed over `tcp`, as the
-/// Java interop test found): each dial succeeds, so the peer must still pace its rounds by
-/// `reconnect_interval` rather than redial in a loop, and a link that never carried a frame does
-/// not restart the reconnect window, so the peer gives up when it runs out.
+/// Java interop test found): each dial succeeds, so the peer must still pace its redials on the
+/// redial table (1, 2, 4, 6 times `reconnect_interval`, each a quick drop) rather than redial in a
+/// loop, and a link that never carried a frame does not restart the reconnect window, so the peer
+/// says it is unreachable when the window runs out and redials on, still on the table.
 #[tokio::test]
-async fn a_seed_that_drops_every_link_at_once_is_redialed_once_per_interval_then_given_up() {
+async fn a_seed_that_drops_every_link_at_once_is_redialed_on_the_table_past_the_window() {
     let network = MemoryNetwork::new();
     let listener = network.listen(SEED);
     let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -373,28 +421,39 @@ async fn a_seed_that_drops_every_link_at_once_is_redialed_once_per_interval_then
 
     tokio::time::sleep(Duration::from_millis(500)).await;
     let early = accepted.load(std::sync::atomic::Ordering::SeqCst);
+    // Links at 0, ~100 and ~300 ms (the waits 100 and 200 ms, ±10 %); the next is not before
+    // 630 ms.
     assert!(
-        (2..=7).contains(&early),
-        "{early} links in 500 ms: about one per 100 ms interval, not one per round trip"
+        (2..=3).contains(&early),
+        "{early} links in 500 ms: on the table, not one per round trip"
     );
 
-    next_event(&mut events, "giving up", |e| *e == PeerEvent::GaveUp).await;
+    next_event(&mut events, "a window without a link", |e| {
+        *e == PeerEvent::Unreachable
+    })
+    .await;
     let took = started.elapsed();
     let links = accepted.load(std::sync::atomic::Ordering::SeqCst);
     assert!(
         took >= Duration::from_millis(900),
-        "gave up after {took:?}, before the 1 s window"
+        "unreachable after {took:?}, before the 1 s window"
     );
+    // The fourth link comes at 630 to 770 ms; the round after it waits 540 ms or more, past the
+    // window, which is judged as that round starts: the lapse is said and the round dials at
+    // once, so the fifth link may already be in (3 only if a slow host put the fourth past the
+    // window).
     assert!(
-        (5..=13).contains(&links),
-        "{links} links over a 1 s window at a 100 ms interval"
+        (3..=5).contains(&links),
+        "{links} links over a 1 s window on a table of 100, 200, 400, 600 ms"
     );
     assert!(!peer.is_connected());
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(
-        accepted.load(std::sync::atomic::Ordering::SeqCst),
-        links,
-        "no dial after giving up"
+    // The redial goes on past the window, still paced by the table (100, 200, 400, 600 ms,
+    // wrapping): within 1.5 s more, at least one link and no loop.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let later = accepted.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        later > links && later <= links + 6,
+        "{links} links in the window, {later} 1.5 s after: redialed on, on the table"
     );
     peer.close().await.expect("close");
     acceptor.abort();
@@ -1301,8 +1360,11 @@ async fn the_self_advertisement_is_re_leased_on_its_interval() {
     assert!(items.iter().all(|item| item.starts_with("peer:")));
 }
 
+/// Owner decision 3 of 2026-11-23: the reconnect window ends nothing. A peer whose seed is gone
+/// for a whole window says it is unreachable (once per window) and goes on redialing, so a seed
+/// that comes back hours later still gets the peer back.
 #[tokio::test]
-async fn a_peer_gives_up_when_the_reconnect_window_runs_out() {
+async fn a_peer_redials_on_past_its_reconnect_window_and_says_it_is_unreachable() {
     let network = MemoryNetwork::new();
     let seed = FakeSeed::start(&network, SEED, &text_group_id(), system());
     let mut config = config(&network, fresh(), text_group(), &[SEED], system());
@@ -1311,7 +1373,10 @@ async fn a_peer_gives_up_when_the_reconnect_window_runs_out() {
     seed.wait_kinds(0, 2).await;
     let mut events = peer.subscribe();
     seed.stop();
-    next_event(&mut events, "giving up", |e| *e == PeerEvent::GaveUp).await;
+    next_event(&mut events, "a window without a link", |e| {
+        *e == PeerEvent::Unreachable
+    })
+    .await;
     assert!(!peer.is_connected());
     assert_eq!(peer.counters().await.reconnects, 0);
     // A pull without a link is not an error; a pipe is.
@@ -1323,6 +1388,21 @@ async fn a_peer_gives_up_when_the_reconnect_window_runs_out() {
         peer.send_pipe(&to, "aspace:cap/test", b"x").await,
         Err(PeerError::NotConnected)
     ));
+    next_event(&mut events, "the next window without a link", |e| {
+        *e == PeerEvent::Unreachable
+    })
+    .await;
+    assert!(peer.counters().await.windows_lapsed >= 2);
+
+    // The seed comes back: the redial that never gave up finds it.
+    let back = FakeSeed::start(&network, SEED, &text_group_id(), system());
+    next_event(&mut events, "the reconnect", |e| {
+        matches!(e, PeerEvent::Reconnected { .. })
+    })
+    .await;
+    assert!(peer.is_connected());
+    back.wait_kinds(0, 1).await;
+    peer.close().await.expect("close");
 }
 
 #[tokio::test]

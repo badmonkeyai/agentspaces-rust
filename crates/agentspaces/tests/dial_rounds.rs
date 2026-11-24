@@ -23,7 +23,9 @@
 //!   20 rounds without a pace refusal;
 //! - the pulls on link-ready are packed the same way: 50 spaces cost at most two `DIGEST`s on a
 //!   reconnect, each an empty digest per stream (send everything), and a Rust seed paces none;
-//! - the pulls on link-ready and the paced pulls of a waiting read still go out.
+//! - the pulls on link-ready and the paced pulls of a waiting read still go out;
+//! - a dial-only peer's own write whose rumor its link lost reaches its Rust seed by the seed's
+//!   rounds, which reach dial-only links too (owner decision of 2026-11-23).
 
 mod support;
 
@@ -181,6 +183,74 @@ async fn a_rumor_the_link_lost_arrives_by_the_next_rounds() {
     let _ = hub.close().await;
 }
 
+// ------------------------------------------------------------------------------- a lost own rumor
+
+/// The link drops the dial-only peer's own rumor of a write, so its Rust seed never hears it. The
+/// peer's rounds cannot repair that (they bring the peer what the seed holds), and the peer never
+/// names `view`; the seed's periodic rounds, which reach its dial-only links, draw the write in
+/// the peer's answer, and a third member then pulls it from the seed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dial_only_peers_lost_own_rumor_is_repaired_by_its_rust_seeds_rounds() {
+    let network = MemoryNetwork::new();
+    let address = "127.0.0.1:7806";
+    let hub = seed(&network, address).await;
+    write(&hub, SPACE, "before").await;
+    let lossy = LossyDialer::outbound(
+        Arc::new(network.dialer()),
+        &format!("{STREAM_SPACE_PREFIX}{SPACE}"),
+    );
+    let period = Duration::from_millis(100);
+    let peer = client(address, Arc::new(lossy.clone()), period).await;
+    peer.pull_space(SPACE).await.expect("pull");
+    within(Duration::from_secs(5), "the pull on link-ready", || {
+        holds(&peer, SPACE, 1)
+    })
+    .await;
+    // The seed holds a link to the peer as a member.
+    let member = peer.peer_id().to_owned();
+    within(Duration::from_secs(5), "the peer's admission", || async {
+        hub.linked_members().await.contains(&member)
+    })
+    .await;
+
+    lossy.set_dropping(true);
+    write(&peer, SPACE, "mine").await;
+    within(
+        Duration::from_secs(5),
+        "the peer's own rumor to be lost",
+        || async { lossy.dropped() >= 1 },
+    )
+    .await;
+    assert!(
+        !holds(&hub, SPACE, 2).await,
+        "the seed has not heard of the write"
+    );
+
+    // The seed's period is 100 ms, stretched to at most 32 times while idle.
+    within(
+        Duration::from_millis(100) * 32 * 3,
+        "the lost write at the seed by its rounds",
+        || holds(&hub, SPACE, 2),
+    )
+    .await;
+    let other = client(address, Arc::new(network.dialer()), Duration::from_secs(1)).await;
+    other.pull_space(SPACE).await.expect("pull");
+    within(
+        Duration::from_secs(5),
+        "the write at a third member",
+        || holds(&other, SPACE, 2),
+    )
+    .await;
+    assert_eq!(
+        peer.counters().await.reconnects,
+        0,
+        "no reconnect brought it"
+    );
+    let _ = other.close().await;
+    let _ = peer.close().await;
+    let _ = hub.close().await;
+}
+
 // ------------------------------------------------------------------------------- the idle floor
 
 /// Idle, the period doubles to exactly 32 times the base and stays there with the rounds still
@@ -321,12 +391,24 @@ async fn fifty_spaces_go_in_one_digest_per_round() {
             .filter(|named| named.len() > 3) // a pull names one space and the revocations
             .collect()
     };
-    // a round that fired while the pulls above were still running names only the spaces pulled
-    // by then, so only the rounds after the last pull are judged
-    let after_pulls = fake.received().len();
-    let since = |received: &[Received]| received[after_pulls.min(received.len())..].to_vec();
+    // A round that fired while the pulls above were still running names only the spaces pulled
+    // by then, so only the rounds from the first that names every stream on are judged. Its
+    // place in what the fake received is the cut, not the count received when the last pull
+    // returned: a round the peer sent before that pull may still be on the link then, and land
+    // after the count (the flake of 2026-11-23). Rounds go out in order on the one link, so every
+    // round after the first full one was sent after the last pull; a peer that split its rounds
+    // would never send a full one, and the wait below would fail.
+    let since = |received: &[Received]| {
+        let first_full = received
+            .iter()
+            .position(|frame| frame.kind() == KIND_DIGEST && digest_streams(frame).len() == streams)
+            .unwrap_or(received.len());
+        received[first_full..].to_vec()
+    };
     let received = fake
-        .wait_for("ten rounds", |received| rounds_of(&since(received)).len() >= 10)
+        .wait_for("ten rounds", |received| {
+            rounds_of(&since(received)).len() >= 10
+        })
         .await;
     for named in rounds_of(&since(&received)) {
         assert_eq!(named.len(), streams, "one round, one DIGEST: {named:?}");

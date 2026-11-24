@@ -18,7 +18,9 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use tokio::time::Instant;
 
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -253,11 +255,15 @@ impl Actor {
         Ok(())
     }
 
+    /// The service's loop: commands, the peer's pipe frames, and its due work. The due work runs
+    /// when it falls due ([`Actor::next_due`]): every [`ContentConfig::tick`] while a fetch is
+    /// driven, otherwise only at the next renewal or advertisement (SPEC v0.1.36 §9.5: due
+    /// work, not a fixed tick, so an idle swarm member sleeps for minutes).
     pub(super) async fn run(mut self, mut commands: mpsc::Receiver<Command>, mut events: broadcast::Receiver<PeerEvent>) {
-        let mut tick = tokio::time::interval(self.config.tick);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         self.advertised_at = Instant::now();
+        let mut last_tick = Instant::now();
         loop {
+            let due = self.next_due(last_tick);
             tokio::select! {
                 command = commands.recv() => match command {
                     None => break,
@@ -275,7 +281,10 @@ impl Actor {
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
-                _ = tick.tick() => self.on_tick().await,
+                () = tokio::time::sleep_until(due) => {
+                    last_tick = Instant::now();
+                    self.on_tick().await;
+                }
             }
         }
         self.shutdown().await;
@@ -441,7 +450,24 @@ impl Actor {
         }
     }
 
+    /// When the due work runs next, the last run having been at `last_tick`: a [`tick`] after
+    /// it while any fetch is driven, else the earliest renewal (a tree holding at half its lease,
+    /// an artifact's holding and manifest at half theirs) or the next advertisement.
+    ///
+    /// [`tick`]: ContentConfig::tick
+    fn next_due(&self, last_tick: Instant) -> Instant {
+        if !self.fetches.is_empty() || !self.artifact_fetches.is_empty() {
+            return last_tick + self.config.tick;
+        }
+        let half = self.config.holding_lease / 2;
+        let advertise = self.advertised_at + self.config.advertise_every;
+        let holdings = self.held.values().map(|held| held.renewed + half);
+        let artifacts = self.artifact_renewals(half);
+        holdings.chain(artifacts).fold(advertise, Instant::min)
+    }
+
     async fn on_tick(&mut self) {
+        self.counters.due_runs += 1;
         if self.advertised_at.elapsed() >= self.config.advertise_every {
             self.advertised_at = Instant::now();
             let _ = self.advertise().await;

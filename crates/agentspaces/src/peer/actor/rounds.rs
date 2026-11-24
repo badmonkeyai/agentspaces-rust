@@ -16,7 +16,9 @@
 //! The periodic rounds of a dial-only peer (SPEC §5.3, the idle floor).
 //!
 //! A listening peer runs its rounds from the listening role's tick ([`serve`](super::serve)). A
-//! dial-only peer holds one link, to its seed, and answers no `DIGEST`; it reconciles what it
+//! dial-only peer holds one link, to its seed, and answers the `DIGEST`s its seed sends on it (so a
+//! seed's round repairs this peer's own rumors lost on that link; another member's, relayed, is
+//! answered only with this peer's displaced claims made here); it reconciles what it
 //! pulled by rounds of its own toward the seed, so a rumor it missed arrives by the next round
 //! rather than by the next reconnect.
 //!
@@ -50,13 +52,15 @@
 
 use std::time::Duration;
 
+use agentspaces_wire::ads as wire_ads;
 use agentspaces_wire::audit::DigestBody;
 use agentspaces_wire::bodies::{KIND_DIGEST, STREAM_ADS, STREAM_SPACE_PREFIX};
 use agentspaces_wire::revocation;
+use agentspaces_wire::serving;
 use tokio::time::Instant;
 
-use super::Actor;
 use super::serve::{jittered, next_period, pack_digests};
+use super::{Actor, VIEW_REPROBE_WAIT, bump};
 
 /// The state of a dial-only peer's periodic rounds ([module docs](self)).
 #[derive(Debug)]
@@ -94,6 +98,14 @@ impl DialRounds {
     /// Notes something that counts as activity ([module docs](self#what-counts-as-activity)).
     pub fn note_activity(&mut self) {
         self.active = true;
+    }
+
+    /// Brings an armed round forward to `at` (a resume asks for a round at once); unarmed rounds
+    /// stay unarmed.
+    pub fn bring_forward(&mut self, at: Instant) {
+        if let Some(next) = self.next.as_mut() {
+            *next = (*next).min(at);
+        }
     }
 
     /// The rounds run so far.
@@ -171,13 +183,65 @@ impl Actor {
     /// spaces cost one or two `DIGEST`s of the seed's paced answers rather than one each. Toward a
     /// seed whose card carries `wire.ae=2` each body carries this peer's budget, and an answer cut
     /// short by it continues as every budgeted pull does.
+    ///
+    ///
+    /// A dial-only peer also pulls the membership view (SPEC §5.2, v0.1.17; v0.1.21: the `view`
+    /// stream is pulled by a joining client), so a late joiner behind a seed learns the members
+    /// whose introductions it never saw. A dial-only member of another implementation refreshes
+    /// its advertisement to its seed alone, unforwarded, so without this pull a member that
+    /// joined after it never held it (the mixed idle run of 2026-11-23).
     pub(super) fn link_ready_pulls(&mut self) {
-        let digests: Vec<(String, Vec<u8>)> = self
+        let mut digests: Vec<(String, Vec<u8>)> = self
             .pulled_streams()
             .into_iter()
             .map(|stream| (stream, Vec::new()))
             .collect();
+        if !self.hub.listening {
+            digests.push((serving::STREAM_VIEW.to_owned(), Vec::new()));
+        }
         self.send_packed(digests);
+    }
+
+    /// After a wake (a suspend's wall step, or a late wake of a frozen process; owner decision 3
+    /// of 2026-11-23), before a dial-only peer judges its members by their cards' lapse: it
+    /// re-pulls the view from its seed, naming only the cards still live (and itself), so the
+    /// seed sends the current card of every member whose card lapsed only while this peer was
+    /// away; until that answer folds, or [`VIEW_REPROBE_WAIT`] passes, a member whose card was
+    /// live when this peer went quiet stays in its view for the per-entry horizon, counted as
+    /// lacking the hint (the cautious side). With no link, the link-ready pull asks for the
+    /// whole view when the link comes back.
+    /// `away_ms` is how long the peer was away (the wall step, or how late the wake was).
+    pub(super) fn reprobe_view(&mut self, now: Instant, away_ms: i64) {
+        if self.hub.listening || self.closed {
+            return;
+        }
+        let wall = self.now();
+        let quiet_since = wall.saturating_sub(away_ms.max(0));
+        let until = now.checked_add(VIEW_REPROBE_WAIT).unwrap_or(now);
+        self.view_reprobe = Some((quiet_since, until));
+        self.horizon_view_changed();
+        bump(&mut self.counters.view_reprobes);
+        if self.link.is_none() || self.joining {
+            return;
+        }
+        let live: Vec<String> = self
+            .members
+            .iter()
+            .filter(|(_, ad)| {
+                wire_ads::ad_expires_at_millis(ad).is_some_and(|expires| expires > wall)
+            })
+            .map(|(peer, _)| peer.to_owned())
+            .chain(std::iter::once(self.peer_id.clone()))
+            .collect();
+        let digest = serving::view_digest(live.iter().map(String::as_str));
+        self.send_packed(vec![(serving::STREAM_VIEW.to_owned(), digest)]);
+    }
+
+    /// Ends a wake's view re-probe ([`Actor::reprobe_view`]).
+    pub(super) fn end_view_reprobe(&mut self) {
+        if self.view_reprobe.take().is_some() {
+            self.horizon_view_changed();
+        }
     }
 
     /// One round toward the seed ([module docs](self#one-round)).

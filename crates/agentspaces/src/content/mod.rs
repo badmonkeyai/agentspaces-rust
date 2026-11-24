@@ -220,6 +220,9 @@ pub struct ContentCounters {
     pub rejects_sent: u64,
     /// Holding entries written or renewed.
     pub holdings_written: u64,
+    /// Runs of the service's due work (renewals, advertisements, fetch drives): every tick
+    /// while a fetch is driven, otherwise only when a renewal or advertisement falls due.
+    pub due_runs: u64,
     /// Requests that timed out.
     pub request_timeouts: u64,
     /// Pieces served.
@@ -325,6 +328,9 @@ impl Content {
         pieces: Arc<dyn PieceStore>,
         config: ContentConfig,
     ) -> Result<Content, ContentError> {
+        // SPEC v0.1.36 §9.5: a holding lease under the 60 s floor warns, or refuses when strict.
+        crate::ttl::check("content.holding-lease", config.holding_lease, &crate::ttl::TtlPolicy::from_env())
+            .map_err(|error| ContentError::Invalid(error.to_string()))?;
         let (commands, receiver) = mpsc::channel(64);
         let events = peer.subscribe();
         let shared = Arc::new(Shared { pieces, in_place: std::sync::Mutex::new(std::collections::HashMap::new()) });

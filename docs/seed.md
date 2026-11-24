@@ -127,7 +127,7 @@ aspace --keystore keys/seed2 --seeds tls://seed1.example.com:7500 --join aspace:
        --listen tls://0.0.0.0:7501 --advertise seed2.example.com:7501
 ```
 
-It links to the first seed and forwards between that link and the members it accepts. Entries written through either seed reach the members of both. It redials the other seeds after a lost link, every 5 s, for as long as it runs. A seed of a group it founds, or of one founded from a text, serves its own members while no other seed answers.
+It links to the first seed that answers (it dials them all, a quarter second apart in list order) and forwards between that link and the members it accepts. Entries written through either seed reach the members of both. It redials the seeds after a lost link, in list order with the one it lost last, waiting 5, 10, 20, then 30 s between rounds and starting over at 5 s, for as long as it runs. A seed of a group it founds, or of one founded from a text, serves its own members while no other seed answers.
 
 ## What it replicates, and its bounds
 

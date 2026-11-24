@@ -26,7 +26,11 @@
 //! - the Java claim is earlier and held from the Rust peer, and the Java node's window is long:
 //!   the Rust completion reaches Java within it, and Java acknowledges it and takes nothing;
 //! - the Java claim is earlier and held from the Rust peer, and both complete: Java counts the
-//!   duplicate (`duplicateCompletions`), the Rust peer counts nothing.
+//!   duplicate (`duplicateCompletions`), the Rust peer counts nothing;
+//! - the Rust claim is earlier and held from Java, and the frame carrying Java's completion with
+//!   its claim is lost: the Rust winner pairs the evidence from other frames (SPEC v0.1.36 §7.4,
+//!   *Pairing the evidence*), Java's claim alone and its re-offer of it, and Java's completion
+//!   under the Rust claim from a later pull, and its take stands down.
 //!
 //! The seed is built on first use with `mvn -q -o` when its classes are missing or older than its
 //! source. When `java` or the build is unavailable the test says why and passes, unless
@@ -634,5 +638,78 @@ async fn a_duplicate_completion_is_counted_where_the_java_claim_won() {
         "the Rust peer was displaced"
     );
     assert_eq!(counters.outbid_acknowledged, 0);
+    let _ = peer.close().await;
+}
+
+/// The Rust claim is the earlier one, held from Java; Java judges itself the winner and
+/// completes, and the frame carrying its completion with its claim never reaches the Rust peer
+/// (every space state Java sends is dropped meanwhile). Once Java has merged the Rust claim, the
+/// evidence reaches the Rust winner only in separate frames: Java's claim alone (as it claimed,
+/// and as it offers it again once displaced, SPEC v0.1.36 §7.4) and Java's completion under the
+/// Rust claim, from a later pull, which does not authenticate on its own. The Rust winner pairs
+/// them, acknowledges Java's completion, and its take, still in its window, stands down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_java_completion_in_another_frame_than_its_claim_is_paired_by_the_rust_winner() {
+    let Some(classpath) = classpath_or_skip() else {
+        return;
+    };
+    let mut java = JavaNode::listen(&classpath, &[], "rust-pairing").await;
+    let holding = holding_tcp();
+    let peer = dial_only(java.port, &holding).await;
+    contested(&mut java, &peer).await;
+
+    holding.hold();
+    holding.drop_inbound_states(true);
+    let space = tasks(&peer, Duration::from_secs(6));
+    let take = tokio::spawn(async move {
+        space
+            .take(&Template::new(TASK), take_lease(), Duration::ZERO)
+            .await
+    });
+    until("the Rust claim", || async {
+        !peer.space_claims(SPACE).await.is_empty()
+    })
+    .await;
+    let took = java.ask("take-task 0 java-worker").await;
+    assert_eq!(
+        took["took"], "contested",
+        "Java never heard of the Rust claim"
+    );
+
+    // Java hears of the Rust claim, which displaces its own completed one.
+    holding.release();
+    let rust = peer.peer_id().to_owned();
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let state = java.ask("task-state contested").await;
+        if state["holder"]
+            .as_str()
+            .is_some_and(|holder| holder.starts_with(rust.as_str()))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Java never merged the Rust claim: {state}\n{}",
+            java.log_tail()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        holding.dropped_inbound() >= 1,
+        "the frame carrying Java's completion was dropped"
+    );
+    // From now on Java offers its completion under the Rust claim only.
+    holding.drop_inbound_states(false);
+
+    let taken = take.await.expect("the take").expect("take");
+    assert!(
+        taken.is_none(),
+        "the work is done: the Rust take stands down"
+    );
+    assert_eq!(peer.counters().await.outbid_acknowledged, 1);
+    converge(&mut java, &peer, &[("contested", "done by java")]).await;
+    assert_eq!(java.duplicate_completions().await, 0);
+    assert_eq!(peer.counters().await.duplicate_completions, 0);
     let _ = peer.close().await;
 }

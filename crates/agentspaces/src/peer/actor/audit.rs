@@ -45,12 +45,17 @@
 //! (SPEC §9.4). A budgeted pull that comes back with a remainder continues at once, at most 64
 //! times per partner per round.
 //!
-//! A dial-only peer answers no `DIGEST`; toward a seed whose card carries the hint, its pulls of a
+//! A dial-only peer answers its seed's `DIGEST`s on its one link, as the partner above, so its own
+//! rumors lost on that link are repaired by the seed's rounds; it opens no audit itself and
+//! keeps no round partners. Toward a seed whose card carries the hint, its pulls of a
 //! whole space carry a budget and continue with its own text digest while a remainder comes back.
 //! Every refusal and fallback is counted under one key ([`AuditRefusal`]) and logged once per
 //! member and reason.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use agentspaces_wire::audit::{
     self, BUDGET_CEILING, DigestBody, Offer, PULL_RESP_BASE, PullRespBody, TreeForm, TreeNode,
@@ -224,13 +229,13 @@ impl Actor {
     }
 
     /// The SHA-256 of this peer's text digest of a stream it serves.
-    fn text_hash(&self, stream: &str) -> Option<[u8; 32]> {
+    pub(super) fn text_hash(&self, stream: &str) -> Option<[u8; 32]> {
         self.stream_digest(stream)
             .map(|digest| crypto::port().sha256(&digest))
     }
 
     /// Sends a DIGEST body to `partner`, on the link it is reached by.
-    fn send_digest_to(&mut self, partner: &str, body: &DigestBody, via: Option<Via>) {
+    pub(super) fn send_digest_to(&mut self, partner: &str, body: &DigestBody, via: Option<Via>) {
         let bytes = body.encode();
         let sent = match via {
             Some(via) => self.reply_with(via, KIND_DIGEST, &bytes, partner, Budget::Half),
@@ -272,7 +277,9 @@ impl Actor {
                 .flatten()
                 .any(|(stream, _)| stream == serving::STREAM_VIEW)
         };
-        let owed = (names_view(&digest.digests) || names_view(&digest.hashes))
+        // A dial-only peer runs no rounds of its own with the members that send it DIGESTs.
+        let owed = self.hub.listening
+            && (names_view(&digest.digests) || names_view(&digest.hashes))
             && self.note_digester(sender);
         if let Some(hashes) = &digest.hashes {
             self.on_opening(sender, hashes, via);
@@ -309,6 +316,7 @@ impl Actor {
         }
         let audits = self.partner_audits(sender);
         let now = self.now();
+        let local = self.local_ms();
         let mut want = Vec::new();
         let mut differs = Vec::new();
         let mut equal = Vec::new();
@@ -347,7 +355,7 @@ impl Actor {
             self.audit.sessions.close(sender, stream);
         }
         let mut tree: Vec<(String, Vec<TreeNode>)> = Vec::new();
-        let start = self.audit.sessions.rotation(sender, differs.len(), now);
+        let start = self.audit.sessions.rotation(sender, differs.len(), local);
         for index in 0..differs.len() {
             let stream = differs[(start + index) % differs.len()].clone();
             let Some(space) = stream.strip_prefix(STREAM_SPACE_PREFIX) else {
@@ -358,7 +366,7 @@ impl Actor {
             };
             let root = audit::answer_root(trie);
             if matches!(root.form, TreeForm::Nodes(_)) {
-                match self.audit.sessions.open_root(sender, &stream, now) {
+                match self.audit.sessions.open_root(sender, &stream, local) {
                     RootVerdict::Answer { capped } => {
                         if capped {
                             self.audit_refuse(sender, Some(&stream), AuditRefusal::SessionCapped);
@@ -393,7 +401,7 @@ impl Actor {
     }
 
     /// The streams the partner of a round this peer opened wants the text of.
-    fn on_want(&mut self, sender: &str, want: &[String]) {
+    pub(super) fn on_want(&mut self, sender: &str, want: &[String]) {
         if want.is_empty() || !self.awaits(sender) {
             return; // nobody but the partner of a round this peer opened is answered
         }
@@ -424,6 +432,7 @@ impl Actor {
         via: Via,
     ) {
         let now = self.now();
+        let local = self.local_ms();
         let mut replies: Vec<(String, Vec<TreeNode>)> = Vec::new();
         let mut requests: Vec<(String, Vec<TreeNode>)> = Vec::new();
         let mut fetches: Vec<(String, Vec<String>)> = Vec::new();
@@ -446,14 +455,14 @@ impl Actor {
                     refused.push((stream.clone(), AuditRefusal::RequestWithoutSession));
                 }
                 if answered.iter().any(|node| node.path.is_empty())
-                    && self.audit.asker.opened(sender, now)
+                    && self.audit.asker.opened(sender, local)
                 {
                     fallback.push(stream);
                 }
                 continue;
             };
             if !asked.is_empty() && !paced {
-                match self.audit.sessions.request(sender, &stream, now) {
+                match self.audit.sessions.request(sender, &stream, local) {
                     Err(reason) => refused.push((stream.clone(), reason)),
                     Ok(capped) => {
                         if capped {
@@ -481,7 +490,7 @@ impl Actor {
                 let step = self
                     .audit
                     .asker
-                    .on_answers(sender, &stream, &answered, trie, now);
+                    .on_answers(sender, &stream, &answered, trie, local);
                 self.audit.counters.answers_received +=
                     (answered.len() as u64).saturating_sub(step.refusals.len() as u64);
                 self.audit.counters.roots_received += accepted_roots as u64;
@@ -528,8 +537,13 @@ impl Actor {
             self.send_digest_to(sender, &body, None);
         }
         for (stream, ids) in fetches {
-            let batches = self.audit.fetch.want(sender, &stream, &ids, now);
+            let batches = self.audit.fetch.want(sender, &stream, &ids, local);
             self.send_fetches(batches);
+        }
+        if self.audit_waiting() {
+            // The fetch queue asks again on the housekeeping (SPEC v0.1.36 §9.5: due work).
+            let at = Instant::now();
+            self.lower_housekeeping(at.checked_add(Duration::from_millis(500)).unwrap_or(at));
         }
         if !fallback.is_empty() {
             for stream in &fallback {
@@ -558,8 +572,8 @@ impl Actor {
     fn send_fetches(&mut self, batches: Vec<FetchBatch>) {
         for batch in batches {
             if !self.partner_audits(&batch.partner) {
-                let now = self.now();
-                self.audit.fetch.forget_partner(&batch.partner, now);
+                let local = self.local_ms();
+                self.audit.fetch.forget_partner(&batch.partner, local);
                 continue;
             }
             let body = DigestBody {
@@ -701,7 +715,7 @@ impl Actor {
             deltas,
             remainder: digest.budget.map(|_| remainder),
         };
-        self.hub.activity = true;
+        self.note_hub_activity();
         if self
             .reply_with(via, KIND_PULL_RESP, &body.encode(), sender, Budget::Half)
             .is_ok()
@@ -796,7 +810,7 @@ impl Actor {
                 return Err(Malformed);
             }
         };
-        let now = self.now();
+        let local = self.local_ms();
         let named: Vec<&str> = resp
             .deltas
             .iter()
@@ -808,7 +822,7 @@ impl Actor {
                     .map(|(stream, _)| stream.as_str()),
             )
             .collect();
-        let fetch_stream = self.audit.fetch.answer_for(sender, &named, now);
+        let fetch_stream = self.audit.fetch.answer_for(sender, &named, local);
         if fetch_stream.is_none() && !self.pull_resp_wanted(sender, via) {
             return Ok(());
         }
@@ -829,12 +843,12 @@ impl Actor {
         }
         let applied = self.on_pull_resp(deltas);
         if let Some(stream) = fetch_stream {
-            if let Some(batch) = self.audit.fetch.settle(sender, &stream, &received, now) {
+            if let Some(batch) = self.audit.fetch.settle(sender, &stream, &received, local) {
                 let left = resp.remainder_of(&stream);
                 let next = self
                     .audit
                     .fetch
-                    .fetched(sender, &batch, &received, left, now);
+                    .fetched(sender, &batch, &received, left, local);
                 self.send_fetches(next);
             }
         } else if let Some(remainder) = &resp.remainder
@@ -910,6 +924,7 @@ impl Actor {
             return false;
         }
         let now = self.now();
+        let local = self.local_ms();
         let mut hashes = Vec::new();
         for stream in self.served_streams() {
             let hash = match stream.strip_prefix(STREAM_SPACE_PREFIX) {
@@ -921,7 +936,7 @@ impl Actor {
                 hashes.push((stream, hash.to_vec()));
             }
         }
-        self.audit.asker.opening(partner, now);
+        self.audit.asker.opening(partner, local);
         self.audit.continuations.remove(partner);
         bump(&mut self.audit.counters.openings_sent);
         let body = DigestBody {
@@ -982,17 +997,23 @@ impl Actor {
         }
     }
 
-    /// The audit's turn on the listening role's tick: the fetch queue asks again what is due, of
+    /// Whether the audit waits on anything the housekeeping asks again: a queued fetch, an
+    /// open session.
+    pub(super) fn audit_waiting(&self) -> bool {
+        self.audit.fetch.queued() > 0 || self.audit.sessions.open() > 0
+    }
+
+    /// The audit's turn on the listening role's housekeeping: the fetch queue asks again what is due, of
     /// the auditing members in view, and the tries of closed spaces are dropped.
     pub(super) fn audit_tick(&mut self) {
         if !self.audit.enabled {
             return;
         }
-        let now = self.now();
+        let local = self.local_ms();
         let spaces = &self.spaces;
         self.audit.tries.retain(|space, _| spaces.contains(space));
-        self.audit.sessions.expire(now);
-        self.audit.asker.expire(now);
+        self.audit.sessions.expire(local);
+        self.audit.asker.expire(local);
         let mut view: Vec<String> = self
             .admitted_members()
             .into_iter()
@@ -1005,7 +1026,7 @@ impl Actor {
             view.push(seed.clone());
         }
         view.retain(|member| self.partner_audits(member));
-        let batches = self.audit.fetch.retry(&view, now);
+        let batches = self.audit.fetch.retry(&view, local);
         self.send_fetches(batches);
     }
 }

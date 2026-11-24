@@ -121,10 +121,12 @@ mod actor;
 mod ads;
 mod blocks;
 mod handle;
+mod issue;
 mod join;
 mod listen;
 mod members;
 mod spaces;
+mod watchdog;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -147,6 +149,7 @@ pub use agentspaces_wire::fold::SpaceStore;
 pub use handle::Peer;
 pub use join::{default_dialers, settings_identity};
 pub use listen::{AdmissionRefusals, ListenConfig, ListenCounters, ListenerSpec};
+pub use watchdog::{LoopHealth, LoopStatus};
 
 /// The agent name a peer writes under when no agent identity is given (`<peerId>/rust`), as the
 /// Python peer writes under `python` and the Ruby peer under `ruby`.
@@ -171,24 +174,33 @@ pub struct PeerConfig {
     pub dialers: Vec<Arc<dyn Dialer>>,
     /// The wall clock for stamps, leases, and frame freshness.
     pub clock: SharedClock,
-    /// The pause between rounds of redialing after a lost link (default 5 s). Rounds start at
-    /// least this far apart, also when a redial succeeds and the new link is lost at once: a
-    /// link lost within this interval of coming up is redialed only once the interval has
-    /// passed, while a longer-lived link is redialed at once.
+    /// The unit of the redial table (default 5 s). After a round of dials in which no seed
+    /// answered, the next round waits 1, 2, 4, then 6 times this (5, 10, 20, 30 s by default),
+    /// then 1 times it again, each wait spread at random by ±10 %. A link that held for this
+    /// interval starts the table over when it is lost and is redialed at once, and so does a wake
+    /// from a suspend with no link; a link lost within this interval of coming up is a quick drop
+    /// and counts as a failed round, so a seed that sheds every link is redialed on the table.
+    /// Each round dials its seeds concurrently, staggered 250 ms apart in list order with the seed
+    /// just lost last, and the first to answer wins.
     pub reconnect_interval: Duration,
-    /// How long a lost link is redialed before the peer gives up (default 10 min). The window
-    /// runs from the loss of the last link that carried a verified frame, so links a seed
-    /// accepts and drops without a word do not extend it.
+    /// How long a lost link may go without a working one before the peer says so (default
+    /// 10 min): [`PeerEvent::Unreachable`], once per window, and a join waiting for its seed is
+    /// answered [`PeerError::NotConnected`]. The peer never gives up redialing: it goes on, on
+    /// the redial table, until it is closed, and a wake from a suspend redials at once however
+    /// long the outage (owner decision 3 of 2026-11-23). The window runs from the loss of the
+    /// last link that carried a verified frame, so links a seed accepts and drops without a word
+    /// do not extend it.
     pub reconnect_window: Duration,
     /// How often the self-advertisement is re-leased (default 30 s; the advertisement's own TTL
     /// is 10 min).
     ///
     /// The re-lease is also this peer's keepalive with a Java seed, which drops a member it has not
-    /// heard from for its member TTL (30 s by default). Once the group outgrows the seed's probe
-    /// cycle (`(members + 1) × 1 s × 4 ≥ 30 s`, about seven members) probes no longer keep every
-    /// member heard, so, as Java's `PeerNode.refreshIntervalMillis` does, the peer then re-leases
-    /// at most every 15 s, half the member TTL. Keep this interval at most half the seed's member
-    /// TTL when the seed runs a shorter one.
+    /// heard from for its member TTL: 30 s on a released 0.6.0 member, 45 s or more since SPEC
+    /// v0.1.36, whose members still keep their own keepalive inside 30 s (§5.2). Once the group
+    /// outgrows the seed's probe cycle (`(members + 1) × 1 s × 4 ≥ 30 s`, about seven members)
+    /// probes no longer keep every member heard, so, as Java's `PeerNode.refreshIntervalMillis`
+    /// does, the peer then re-leases at most every 15 s, half that 30 s keepalive bound. Keep this
+    /// interval at most half the seed's member TTL when the seed runs a shorter one.
     pub peer_ad_interval: Duration,
     /// The bound on one dial (default 10 s).
     pub dial_timeout: Duration,
@@ -341,7 +353,7 @@ pub enum PeerError {
     /// The peer was closed.
     #[error("the peer is closed")]
     Closed,
-    /// The peer has no link at the moment (it is redialing, or gave up).
+    /// The peer has no link at the moment (it is redialing).
     #[error("the peer has no link to send on")]
     NotConnected,
     /// The link's send queue had no room for the frame: it was not sent, and the link stays up
@@ -444,6 +456,45 @@ pub struct PeerCounters {
     pub session_frames: u64,
     /// Links re-established after a loss.
     pub reconnects: u64,
+    /// Reconnect windows that passed without a working link ([`PeerEvent::Unreachable`]); the
+    /// peer redialed on through each.
+    pub windows_lapsed: u64,
+    /// Wall-clock steps of more than a second against the monotonic clock (an NTP step either
+    /// way, or a suspend), seen between two turns of the peer's loop (SPEC v0.1.36 §9.5).
+    pub wall_steps: u64,
+    /// Wakes: forward wall-clock steps longer than the 30 s keepalive bound, such as a suspend,
+    /// and late wakes ([`PeerCounters::late_wakes`]). Each re-introduced this peer at once rather
+    /// than waiting out its re-lease, and asked its seed.
+    pub resumes: u64,
+    /// Late wakes: the peer's loop (or the process's watchdog) woke more than 30 s after its
+    /// deadline with no wall-clock step, as a frozen process does (SIGSTOP, a long collection or
+    /// VM pause), whose monotonic clock counted the freeze. Each is a wake as a suspend is (owner
+    /// decision 3 of 2026-11-23): the seed is PINGed again with a fresh answer window, held takes
+    /// are re-checked, and a listening peer probes the members it would otherwise drop for a
+    /// silence that only the freeze made. Also counted in [`PeerCounters::resumes`].
+    pub late_wakes: u64,
+    /// Wakes after which a dial-only peer re-probed its view: it re-pulled the view naming only
+    /// the cards still live, and kept each member whose card lapsed only while it was away in
+    /// view (as lacking the horizon hint) until the answer or 11.25 s (owner decision 3 of
+    /// 2026-11-23).
+    pub view_reprobes: u64,
+    /// PINGs this peer sent its seed because the dialed link was silent for 45 s, or on a wake
+    /// from a suspend (the dead-seed rule, owner decision of 2026-11-23). The wake's share is
+    /// also counted in [`PeerCounters::wake_pings`].
+    pub seed_pings: u64,
+    /// The [`PeerCounters::seed_pings`] sent on a wake with the link up (on a wall step's wake,
+    /// none when a PING already waited for its answer: it became the wake's; a late wake always
+    /// asks again, since the waiting PING's window ran out while the process was frozen).
+    pub wake_pings: u64,
+    /// Seed dials started: the join's first round and every redial round, one per seed dialed
+    /// (owner decision 4 of 2026-11-23: one set of counter names in every client).
+    pub seed_dials: u64,
+    /// Channels that answered after another seed of the same round had won, closed unused.
+    pub late_seed_channels: u64,
+    /// Dialed links closed because the seed stayed silent for the 2 s ping timeout after such a
+    /// PING (no frame, and no byte of one still arriving): the peer took
+    /// the seed as lost and redialed, another seed first.
+    pub links_silent: u64,
     /// Links closed because the far end stopped reading: a frame waited longer than
     /// [`PeerConfig::send_stall_timeout`] for the transport.
     pub send_overflows: u64,
@@ -502,6 +553,26 @@ pub struct PeerCounters {
     /// work, which a claim delivered later than the settle window allows. The shared state keeps
     /// one completion; this counts the duplicate once per entry, at the replica whose claim won.
     pub duplicate_completions: u64,
+    /// Offers this peer made again of a displaced claim of its own completion (Java
+    /// `displacedReoffers`, SPEC v0.1.36 §7.4): a better claim displaced the claim one of its
+    /// holders completed under, so the winner's replica needs that claim to recognize the
+    /// completion; offered at once, then no sooner than 1 s, 2 s, 4 s, ... after the previous
+    /// offer, at most six times, and only while a frame still shows the entry open.
+    pub displaced_reoffers: u64,
+    /// Targeted anti-entropy rounds this peer opened toward holders a claim of its own holders
+    /// displaced, while that take was open (Java `displacedPullRounds`, owner decision 4 of
+    /// 2026-11-23): at once, then after 1, 2, 4, 8 and 16 s, at most six per entry, so the
+    /// displaced holder's completion reaches this peer within one round.
+    pub displaced_pull_rounds: u64,
+    /// `DIGEST`s a relay carried to this dial-only peer from a member other than its seed,
+    /// answered with only the claims made here that a better claim displaced, with or without
+    /// their completions, in the spaces they name: a `want` for an opening, or a PULL_RESP for
+    /// text digests (owner decision 1 of 2026-11-23): the winner of a contested take learns the displaced
+    /// holder's completion from its targeted round (Java `displacedDigestAnswers`).
+    pub displaced_digest_answers: u64,
+    /// Such `DIGEST`s left unanswered because the asker's own answer bucket (16 at once, 4 a
+    /// second, per asker as in every client) was spent (`relayedAnswersPaced`).
+    pub relayed_answers_paced: u64,
     /// Space deltas and pulled sync deltas that did not decode under the wire encoding (SPEC
     /// §9.1), a stamp outside the canonical grammar included (`deltasUndecodable`). Each is
     /// dropped whole and strikes nobody.
@@ -641,9 +712,14 @@ pub enum PeerEvent {
         /// How many reconnects so far.
         reconnects: u64,
     },
-    /// The reconnect window ran out without a working link (one that carried a verified frame);
-    /// the peer stays disconnected.
+    /// Not sent since 0.7.0: a peer never gives up redialing (owner decision 3 of 2026-11-23),
+    /// and a whole reconnect window without a link is [`PeerEvent::Unreachable`]. Kept for one
+    /// release so matches on it still compile.
     GaveUp,
+    /// A whole reconnect window passed without a working link (one that carried a verified
+    /// frame): a join waiting for its seed is answered [`PeerError::NotConnected`], and the peer
+    /// goes on redialing on its table until it is closed. Said once per window.
+    Unreachable,
     /// A received or written state was folded (or refused) into a space.
     StateFolded {
         /// The space name.

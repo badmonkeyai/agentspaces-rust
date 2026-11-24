@@ -93,7 +93,8 @@ AdCache.StoredAd { adType: String, adBytes: bytes, publicKey: bytes, signature: 
 AdCache.Delta { ads: list<AdCache.StoredAd> }
 DiscoveryService.AdQuery { queryId: String, asker: PeerId, adType: String, fieldEquals: map<String,String> }
 DiscoveryService.QueryHits { queryId: String, hits: list<AdCache.StoredAd> }
-AgentCard { id: String, issuer: PeerId, group: GroupId, issued: Instant, ttl: Duration, agent: AgentId, description: String, goals: list<String>, consumes: list<String>, produces: list<String>, costHints: map<String,String>, spaceBindings: map<String,String>, agentPublicKey: bytes ?null, actions: list<CardAction> ?null, agentCertificate: AgentCertificate ?null, ui: UiDeclaration ?null, spill: CardSpill ?null }
+AgentCard { id: String, issuer: PeerId, group: GroupId, issued: Instant, ttl: Duration, agent: AgentId, description: String, goals: list<String>, consumes: list<String>, produces: list<String>, costHints: map<String,String>, spaceBindings: map<String,String>, agentPublicKey: bytes ?null, actions: list<CardAction> ?null, agentCertificate: AgentCertificate ?null, ui: UiDeclaration ?null, spill: CardSpill ?null, threads: list<ChatThread> ?null }
+ChatThread { space: String, key: String, scope: String }
 AgentCard.Parts { actions: list<CardAction> ?null, ui: UiDeclaration ?null }
 AppCard { id: String, issuer: PeerId, group: GroupId, issued: Instant, ttl: Duration, name: String, kind: String, shape: String, owner: String, reads: list<String>, actions: list<String>, idpClient: String, url: String, pkg: String, version: String, views: list<String>, ui: AppCard.Ui ?null, host: AppCard.Host ?null, origin: AppCard.Origin ?null, formats: list<String> ?null, spill: CardSpill ?null }
 AppCard.Ui { protocol: String, version: String, catalogIds: list<String>, agent: String, transport: String, surfaces: list<String>, components: list<UiDeclaration.Component> ?empty }
@@ -197,6 +198,17 @@ pub const UI_MAX_CONTROLS: usize = 16;
 pub const UI_MAX_ENTRIES: usize = 64;
 /// The most actions an `AgentCard` declares (`AgentCard.MAX_ACTIONS`).
 pub const CARD_MAX_ACTIONS: usize = 64;
+/// The most threads an `AgentCard` names (`AgentCard.MAX_THREADS`, SPEC §6.1, v0.1.38).
+pub const CARD_MAX_THREADS: usize = 16;
+/// The scopes of a `ChatThread` (SPEC §6.1, v0.1.38), a closed set: the one thread the key
+/// names, that thread and every `key:<sub>` thread under it, every thread of the space.
+pub const THREAD_SCOPES: [&str; 3] = ["exact", "tree", "all"];
+/// The scope of a `ChatThread` that takes every thread of its space, whose key is empty.
+pub const THREAD_SCOPE_ALL: &str = "all";
+/// The longest `ChatThread.space`, in UTF-16 code units (`ChatThread.MAX_SPACE`).
+pub const THREAD_MAX_SPACE: usize = 128;
+/// The longest `ChatThread.key`, in UTF-16 code units (`ChatThread.MAX_KEY`).
+pub const THREAD_MAX_KEY: usize = 128;
 /// The longest action description, in UTF-16 code units (`CardAction.MAX_DESCRIPTION_LENGTH`).
 pub const ACTION_MAX_DESCRIPTION_UNITS: usize = 512;
 /// The most terms per list of an action contract (`CardAction.MAX_CONTRACT_TERMS`).
@@ -514,8 +526,9 @@ fn in_canonical_order(map: &Map) -> bool {
 /// The records whose Java constructor refuses, or replaces with a default, a null in any field
 /// that is always present: either way Java refuses the carrier (a thrown constructor, or a
 /// re-encoding that differs from the bytes received).
-const NO_NULL_RECORDS: [&str; 26] = [
+const NO_NULL_RECORDS: [&str; 27] = [
     "AgentCard",
+    "ChatThread",
     "AppCard",
     "AppCard.Ui",
     "AppCard.Host",
@@ -582,6 +595,7 @@ fn invariant(record: &str, map: &Map) -> bool {
         }
         "AgentCard" => agent_card_holds(map),
         "AgentCard.Parts" => list(map, "actions").len() <= CARD_MAX_ACTIONS,
+        "ChatThread" => chat_thread_holds(map),
         "CardAction" => card_action_holds(map),
         "CardAction.Contract" => {
             ["pre", "post", "methods"]
@@ -656,24 +670,46 @@ pub(crate) fn units(text: &str) -> usize {
 
 /// Java's `String.isBlank`: empty, or only characters `Character.isWhitespace` names.
 pub(crate) fn java_blank(text: &str) -> bool {
-    text.chars().all(|c| {
-        matches!(
-            c,
-            '\t' | '\n'
-                | '\u{B}'
-                | '\u{C}'
-                | '\r'
-                | '\u{1C}'..='\u{1F}'
-                | ' '
-                | '\u{1680}'
-                | '\u{2000}'..='\u{2006}'
-                | '\u{2008}'..='\u{200A}'
-                | '\u{2028}'
-                | '\u{2029}'
-                | '\u{205F}'
-                | '\u{3000}'
-        )
-    })
+    text.chars().all(java_whitespace)
+}
+
+/// Java's `Character.isWhitespace`.
+pub(crate) fn java_whitespace(c: char) -> bool {
+    matches!(
+        c,
+        '\t' | '\n'
+            | '\u{B}'
+            | '\u{C}'
+            | '\r'
+            | '\u{1C}'..='\u{1F}'
+            | ' '
+            | '\u{1680}'
+            | '\u{2000}'..='\u{2006}'
+            | '\u{2008}'..='\u{200A}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{205F}'
+            | '\u{3000}'
+    )
+}
+
+/// Whether `text` is 1 to `max` UTF-16 code units with no white space, as `ChatThread` holds its
+/// `space` and a scoped `key`.
+pub(crate) fn thread_name_holds(text: &str, max: usize) -> bool {
+    !text.is_empty() && units(text) <= max && !text.chars().any(java_whitespace)
+}
+
+/// `ChatThread` (SPEC §6.1, v0.1.38): a space, a scope of [`THREAD_SCOPES`], and a key that is
+/// empty exactly when the scope is `all`.
+fn chat_thread_holds(map: &Map) -> bool {
+    let (space, key, scope) = (text(map, "space"), text(map, "key"), text(map, "scope"));
+    thread_name_holds(space, THREAD_MAX_SPACE)
+        && THREAD_SCOPES.contains(&scope)
+        && if scope == THREAD_SCOPE_ALL {
+            key.is_empty()
+        } else {
+            thread_name_holds(key, THREAD_MAX_KEY)
+        }
 }
 
 /// A control character: U+0000 to U+001F, or U+007F.
@@ -746,6 +782,15 @@ fn agent_card_holds(map: &Map) -> bool {
             || map.contains_key("ui"))
     {
         return false;
+    }
+    // Threads: one to CARD_MAX_THREADS, all distinct (Java reads an empty list as the absent
+    // field, so a present empty list re-encodes otherwise).
+    if let Some(threads) = map.get("threads").and_then(Value::as_array) {
+        let encoded: std::collections::HashSet<Vec<u8>> = threads.iter().map(cbor::encode).collect();
+        if threads.is_empty() || threads.len() > CARD_MAX_THREADS || encoded.len() != threads.len()
+        {
+            return false;
+        }
     }
     // Every control of the ui names an action of the card.
     if let Some(ui) = map.get("ui").and_then(Value::as_map) {

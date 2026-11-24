@@ -170,6 +170,25 @@ async fn swaps_read_across_members_and_concurrent_swaps_merge() {
         }
     })
     .await;
+    // Both members agreeing on the value does not mean both hold both heads: a member that holds only its own
+    // head reads its own value, and the other, holding both, may read the same one as the later head. The merge
+    // below would then name one head as its base and leave the other live, two heads for good (seen once as a
+    // timeout of this test). Wait until both hold the same heads.
+    eventually("both members hold the same heads", || {
+        let (a, b) = (a.clone(), b.clone());
+        async move {
+            let roots = |heads: Vec<agentspaces_pdt::Head>| {
+                let mut roots: Vec<String> = heads.into_iter().map(|h| h.root).collect();
+                roots.sort();
+                roots
+            };
+            match (a.heads().await, b.heads().await) {
+                (Ok(x), Ok(y)) => !x.is_empty() && roots(x) == roots(y),
+                _ => false,
+            }
+        }
+    })
+    .await;
     // the merged values converge on one root once a member writes the merge
     a.swap_map(|nodes, m| m.assoc(nodes, &text("settled"), &text("yes"))).await.expect("settle");
     eventually("one root everywhere", || {

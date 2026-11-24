@@ -838,8 +838,9 @@ async fn s6a_tls_to_a_tcp_seed_fails_cleanly() {
 
 /// 6b. A tcp dial to a tls seed never joins: the TCP connection opens, the seed drops it at
 ///     once (its first bytes are no TLS handshake), neither side lists the other, and the peer
-///     redials once per reconnect interval, not in a loop, until its reconnect window (which
-///     such links do not extend) runs out and it gives up.
+///     redials on the redial table, not in a loop; its reconnect window (which such links do
+///     not extend) runs out and it says it is unreachable, then redials on (owner decision 3 of
+///     2026-11-23: a peer never gives up).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s6b_tcp_to_a_tls_seed_fails_cleanly() {
     let classpath = classpath_or_skip!();
@@ -862,17 +863,17 @@ async fn s6b_tcp_to_a_tls_seed_fails_cleanly() {
         }
     };
     let mut events = peer.subscribe();
-    event(&mut events, "the peer to give up", |event| {
-        matches!(event, PeerEvent::GaveUp)
+    event(&mut events, "a reconnect window without a link", |event| {
+        matches!(event, PeerEvent::Unreachable)
     })
     .await;
     let took = started.elapsed();
     let counters = peer.counters().await;
-    println!("gave up after {took:?}: {counters:?}");
+    println!("unreachable after {took:?}: {counters:?}");
     assert!(!peer.is_connected());
     assert!(
         took < window + RECONNECT_INTERVAL + DIAL_TIMEOUT + REFUSAL_SLACK,
-        "gave up only after {took:?}"
+        "unreachable only after {took:?}"
     );
     // One link per interval over the window, not one per round trip (the storm found here).
     let most = window.as_millis() / RECONNECT_INTERVAL.as_millis() + 2;

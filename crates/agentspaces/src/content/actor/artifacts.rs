@@ -16,7 +16,9 @@
 //! `PIECE_WANT` and `MANIFEST_WANT` served, and artifact fetches.
 
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use tokio::sync::oneshot;
 
@@ -150,6 +152,14 @@ impl Actor {
             HeldArtifact { manifest_entry, holding_entry, lease, holding_renewed: now, manifest_renewed: now },
         );
         Ok(())
+    }
+
+    /// When each held artifact's holding (at `holding_half`) and manifest (at half its own lease)
+    /// fall due for renewal.
+    pub(super) fn artifact_renewals(&self, holding_half: Duration) -> impl Iterator<Item = Instant> + '_ {
+        self.held_artifacts.values().flat_map(move |held| {
+            [held.holding_renewed + holding_half, held.manifest_renewed + held.lease / 2]
+        })
     }
 
     /// Renews the holdings and manifests of held artifacts at half their leases.

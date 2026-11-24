@@ -272,6 +272,7 @@ pub struct AgentBuilder {
     card_ttl: Duration,
     publish_card: bool,
     grace: Duration,
+    threads: Vec<Map>,
     bindings: Vec<Binding>,
     errors: Vec<String>,
 }
@@ -300,6 +301,7 @@ impl Fleet {
             card_ttl: DEFAULT_CARD_TTL,
             publish_card: true,
             grace: DEFAULT_GRACE,
+            threads: Vec::new(),
             bindings: Vec::new(),
             errors: Vec::new(),
         }
@@ -360,6 +362,24 @@ impl AgentBuilder {
     /// caller finds it.
     pub fn without_card(mut self) -> Self {
         self.publish_card = false;
+        self
+    }
+
+    /// A conversation the agent answers, listed in its card's `threads` (SPEC §6.1, v0.1.38):
+    /// the `space` it watches for chat lines, the thread `key`, and the `scope` (`exact`,
+    /// `tree`, or `all` with an empty key). A thread breaking those rules, one given twice, or
+    /// more than 16 is reported by [`AgentBuilder::bind`]. A card with none omits the field.
+    pub fn thread(mut self, space: &str, key: &str, scope: &str) -> Self {
+        match ads::chat_thread(space, key, scope) {
+            Ok(thread) if self.threads.contains(&thread) => self
+                .errors
+                .push(format!("thread {space}/{key} ({scope}) is given twice")),
+            Ok(_) if self.threads.len() >= ads::CARD_MAX_THREADS => self.errors.push(
+                format!("a card names at most {} threads", ads::CARD_MAX_THREADS),
+            ),
+            Ok(thread) => self.threads.push(thread),
+            Err(error) => self.errors.push(error.to_string()),
+        }
         self
     }
 
@@ -671,6 +691,13 @@ impl AgentBuilder {
     /// the peer is closed or the agent revoked; [`AgentError::Card`] when the card cannot be
     /// built.
     pub async fn bind(self) -> Result<Bound, AgentError> {
+        // SPEC v0.1.36 §9.5: a card TTL under the 60 s floor warns, or refuses when strict.
+        crate::ttl::check(
+            "agent.card-ttl",
+            self.card_ttl,
+            &crate::ttl::TtlPolicy::from_env(),
+        )
+        .map_err(|error| AgentError::Invalid(format!("agent {}: {error}", self.name)))?;
         if let Some(first) = self.errors.first() {
             return Err(AgentError::Invalid(format!("agent {}: {first}", self.name)));
         }
@@ -788,6 +815,7 @@ impl AgentBuilder {
             space_bindings: space_bindings.into_iter().collect(),
             actions,
             ttl_iso: java_duration(self.card_ttl),
+            threads: self.threads,
         };
 
         // The reactions watch from now on, before the agent is announced.
@@ -825,7 +853,7 @@ impl AgentBuilder {
         // supervisor says when the last loop has ended.
         let (ended_tx, ended) = tokio::sync::watch::channel(false);
         let supervised = agent_id.clone();
-        tokio::spawn(supervise(tasks, supervised, ended_tx));
+        tokio::spawn(supervise(tasks, supervised, ended_tx, control.clone()));
         Ok(Bound {
             inner: Arc::new(BoundInner {
                 agent_id,
@@ -926,6 +954,7 @@ async fn supervise(
     mut tasks: JoinSet<()>,
     agent_id: String,
     ended: tokio::sync::watch::Sender<bool>,
+    control: Control,
 ) {
     while let Some(done) = tasks.join_next().await {
         if let Err(error) = done
@@ -934,6 +963,9 @@ async fn supervise(
             tracing::warn!("agentspaces: a loop of {agent_id} panicked");
         }
     }
+    // Every loop ended: the agent is unbound, and a take context a handler handed elsewhere
+    // renews no more.
+    control.unbind();
     ended.send_replace(true);
 }
 
@@ -1016,6 +1048,14 @@ impl Bound {
         self.inner.control.stats.failed.load(Ordering::Relaxed)
     }
 
+    /// How many takes lapsed before their handler answered (`late_takes`, the name every
+    /// implementation counts it by): the claim was no longer this agent's (a better claim
+    /// displaced it, or the entry was completed or withdrawn), or its wall-time lease passed (a
+    /// wake from a suspend that outlasted it, a hold not renewed). Nothing was completed.
+    pub fn late_takes(&self) -> u64 {
+        self.inner.control.stats.late.load(Ordering::Relaxed)
+    }
+
     /// Asks the agent to take nothing new and returns at once; running handlers go on. A
     /// waiting take stops waiting and claims nothing more; a claim it already made settles (its
     /// settle window), and when it wins, its handler runs as a running one.
@@ -1031,6 +1071,9 @@ impl Bound {
         if tokio::time::timeout(grace, self.wait()).await.is_ok() {
             return true;
         }
+        // Abandoned past the grace: unbound before the loops go, so no renewal of a running
+        // handler's take (from any clone of its context) keeps the entry.
+        self.inner.control.unbind();
         for task in self
             .inner
             .aborts

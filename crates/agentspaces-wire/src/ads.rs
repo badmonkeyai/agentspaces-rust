@@ -133,6 +133,10 @@ pub enum AdError {
     /// beyond its placeholder.
     #[error("a card's spill reference or its placeholders break SPEC 6.1a.5: {0}")]
     InvalidSpill(&'static str),
+    /// A chat thread or a card's threads break a rule of SPEC §6.1 (v0.1.38): the space, the
+    /// scope, the key against the scope, more than [`CARD_MAX_THREADS`] threads, or one twice.
+    #[error("a card's threads break SPEC 6.1 (v0.1.38): {0}")]
+    InvalidThread(&'static str),
     /// A host's `status` is not one of [`HOST_STATUSES`].
     #[error("a host's status is serving or stopped: {0:?}")]
     InvalidStatus(String),
@@ -389,7 +393,8 @@ fn names_own_agent(card: &Map, issuer: &str) -> bool {
 /// `goals`, `consumes`, `produces`, `costHints`, `spaceBindings` (both canonical), then the
 /// appended `agentPublicKey` (v0.1.11), `actions` (v0.1.13, [`card_action`]),
 /// `agentCertificate` (v0.1.13), and `ui` (v0.1.26, [`ui_declaration`]), each omitted when absent
-/// (`actions` when empty) so earlier cards keep their bytes.
+/// (`actions` when empty) so earlier cards keep their bytes. `threads` (v0.1.38) is added by
+/// [`agent_card_with_threads`].
 ///
 /// A certificate must certify `agent_public_raw` for this card's agent
 /// ([`AdError::CertificateMismatch`]), and the local name must be one Java's `AgentId` holds
@@ -455,6 +460,62 @@ pub fn agent_card(
         card.insert("ui", ui.clone());
     }
     Ok(card)
+}
+
+/// A `ChatThread` (SPEC §6.1, v0.1.38) in Java field order: `space`, `key`, `scope`. The space is
+/// 1 to [`THREAD_MAX_SPACE`] characters with no white space, the scope one of
+/// [`THREAD_SCOPES`], and the key empty exactly when the scope is `all`, otherwise 1 to
+/// [`THREAD_MAX_KEY`] characters with no white space.
+pub fn chat_thread(space: &str, key: &str, scope: &str) -> Result<Map, AdError> {
+    if !crate::schema::thread_name_holds(space, THREAD_MAX_SPACE) {
+        return Err(AdError::InvalidThread(
+            "space is 1 to 128 characters with no white space",
+        ));
+    }
+    if !THREAD_SCOPES.contains(&scope) {
+        return Err(AdError::InvalidThread("scope is exact, tree, or all"));
+    }
+    if scope == THREAD_SCOPE_ALL {
+        if !key.is_empty() {
+            return Err(AdError::InvalidThread("key is empty when the scope is all"));
+        }
+    } else if !crate::schema::thread_name_holds(key, THREAD_MAX_KEY) {
+        return Err(AdError::InvalidThread(
+            "key is 1 to 128 characters with no white space",
+        ));
+    }
+    let mut thread = Map::with_capacity(3);
+    thread.insert("space", space);
+    thread.insert("key", key);
+    thread.insert("scope", scope);
+    Ok(thread)
+}
+
+/// The card with its `threads` (SPEC §6.1, v0.1.38, Java `AgentCard.withThreads`): the
+/// conversations the agent answers ([`chat_thread`]), appended last after `spill`. An empty list
+/// removes the field, so a card without threads keeps its earlier bytes. Refuses more than
+/// [`CARD_MAX_THREADS`] threads, one thread twice, and a thread that is no `ChatThread`.
+pub fn agent_card_with_threads(card: &Map, threads: &[Map]) -> Result<Map, AdError> {
+    let mut out = card.clone();
+    out.remove("threads");
+    if threads.is_empty() {
+        return Ok(out);
+    }
+    if threads.len() > CARD_MAX_THREADS {
+        return Err(AdError::InvalidThread("a card names at most 16 threads"));
+    }
+    if threads
+        .iter()
+        .any(|thread| !crate::schema::conforms(&Value::Map(thread.clone()), "ChatThread"))
+    {
+        return Err(AdError::InvalidThread("a thread is no ChatThread"));
+    }
+    let encoded: std::collections::HashSet<Vec<u8>> = threads.iter().map(encode_map).collect();
+    if encoded.len() != threads.len() {
+        return Err(AdError::InvalidThread("a card's threads are distinct"));
+    }
+    out.insert("threads", maps(threads));
+    Ok(out)
 }
 
 /// A `@SpaceTake` worker action.
@@ -582,8 +643,10 @@ pub fn ui_declaration(
 
 pub use crate::schema::{
     AGENT_CARD_SPILL_SET, APP_CARD_SPILL_SET, APP_KINDS, APP_MAX_FORMAT_UNITS, APP_MAX_FORMATS,
-    APP_MAX_TERMS, APP_SHAPES, APP_TRANSPORTS, CARD_MAX_ACTIONS, CONTENT_ROOT_LENGTH,
-    HOST_SIGN_ONS, HOST_STATUSES, SPILL_MAX_SIZE, UI_MAX_COMPONENTS, formats_hold, is_content_root,
+    APP_MAX_TERMS, APP_SHAPES, APP_TRANSPORTS, CARD_MAX_ACTIONS, CARD_MAX_THREADS,
+    CONTENT_ROOT_LENGTH, HOST_SIGN_ONS, HOST_STATUSES, SPILL_MAX_SIZE, THREAD_MAX_KEY,
+    THREAD_MAX_SPACE, THREAD_SCOPE_ALL, THREAD_SCOPES, UI_MAX_COMPONENTS, formats_hold,
+    is_content_root,
 };
 
 /// The host group of a published `AppCard` (SPEC §6.1a.4, v0.1.28; v0.1.32 sign-on values) in
@@ -990,6 +1053,10 @@ pub fn spill_card(ad_type: &str, card: &Map) -> Result<(Map, Vec<u8>), AdError> 
         }
     }
     stub.insert("spill", spill);
+    // spill precedes an AgentCard's threads (v0.1.38), the last field.
+    if let Some(threads) = stub.remove("threads") {
+        stub.insert("threads", threads);
+    }
     Ok((stub, document))
 }
 
@@ -1158,6 +1225,7 @@ fn in_record_order(ad_type: &str, card: Map) -> Map {
             "agentCertificate",
             "ui",
             "spill",
+            "threads",
         ],
     };
     let mut ordered = Map::with_capacity(card.len());

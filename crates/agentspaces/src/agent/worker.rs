@@ -20,7 +20,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -81,12 +81,22 @@ pub(crate) struct Stats {
     pub handled: AtomicU64,
     /// Handlers that failed (an error, a panic, a reply that could not be written).
     pub failed: AtomicU64,
+    /// Takes that lapsed before the handler's result came (`late_takes`): the claim was no
+    /// longer this agent's (a better claim displaced it, or the entry was completed or
+    /// withdrawn), or its wall-time lease passed (a wake from a suspend that outlasted it, a hold
+    /// not renewed). The result is late: nothing is completed (owner decisions 5 and 2 of
+    /// 2026-11-23).
+    pub late: AtomicU64,
 }
 
 /// The stop signal and counters of one bound agent.
 #[derive(Debug, Clone)]
 pub(crate) struct Control {
     stop: Arc<watch::Sender<bool>>,
+    /// Set once the agent is unbound: revoked, abandoned past a stop's grace, or every loop
+    /// ended. From then on no [`TakeContext`] of the agent renews: as in the reference binder,
+    /// the binder's end bounds a handler's own renewals too.
+    unbound: Arc<AtomicBool>,
     pub stats: Arc<Stats>,
 }
 
@@ -94,8 +104,19 @@ impl Control {
     pub fn new() -> Control {
         Control {
             stop: Arc::new(watch::channel(false).0),
+            unbound: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(Stats::default()),
         }
+    }
+
+    /// Ends the binding: no take context of the agent renews from now on.
+    pub fn unbind(&self) {
+        self.unbound.store(true, Ordering::SeqCst);
+    }
+
+    /// The flag [`Control::unbind`] sets, for the take contexts.
+    pub fn unbound_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.unbound)
     }
 
     /// Asks every loop to take nothing new.
@@ -130,6 +151,10 @@ impl Control {
 
     fn handled(&self) {
         self.stats.handled.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn late(&self) {
+        self.stats.late.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -240,13 +265,15 @@ pub(crate) async fn take_loop(run: Arc<TakeRun>, control: Control) {
                         run.label,
                         agent.agent_id()
                     );
+                    control.unbind();
                     control.request_stop();
                     return;
                 }
             }
             Ok(Some((taken, job))) => {
                 let context =
-                    TakeContext::new(taken, run.lease, run.results.produced().map(str::to_owned));
+                    TakeContext::new(taken, run.lease, run.results.produced().map(str::to_owned))
+                        .bound_by(control.unbound_flag());
                 run_take(&run, &control, context, job).await;
             }
             Err(SpaceError::Peer(PeerError::Closed)) => return,
@@ -255,6 +282,7 @@ pub(crate) async fn take_loop(run: Arc<TakeRun>, control: Control) {
                     "agentspaces: {}: {who} is revoked; the agent stops",
                     run.label
                 );
+                control.unbind();
                 control.request_stop();
                 return;
             }
@@ -290,6 +318,19 @@ async fn run_take(run: &TakeRun, control: &Control, context: TakeContext, job: T
             tracing::warn!(
                 target: super::HANDLER_LOG_TARGET,
                 "agentspaces: {}: action failed on entry {entry_id}; lease will lapse: {error}",
+                run.label
+            );
+        }
+        Ok(_) if context.lapsed().await => {
+            // The take lapsed before the result came (its claim is no longer ours, or its lease
+            // passed on wall time): the result is late. Nothing is completed; the entry is
+            // another holder's, or reappeared for any worker (SPEC §7.2).
+            control.late();
+            tracing::warn!(
+                target: super::HANDLER_LOG_TARGET,
+                "agentspaces: {}: the take of entry {entry_id} lapsed before its result came \
+                 (its claim lost, or a wake from a suspend); the result is late and is not \
+                 completed",
                 run.label
             );
         }
@@ -673,6 +714,7 @@ pub(crate) async fn card_loop(keeper: Arc<CardKeeper>, control: Control) {
                 "agentspaces: {} is revoked; the agent stops and its card lapses",
                 keeper.agent.agent_id()
             );
+            control.unbind();
             control.request_stop();
             return;
         }
@@ -681,6 +723,7 @@ pub(crate) async fn card_loop(keeper: Arc<CardKeeper>, control: Control) {
             Err(super::AgentError::Peer(PeerError::Closed)) => return,
             Err(super::AgentError::Peer(PeerError::Revoked(who))) => {
                 tracing::warn!("agentspaces: {who} is revoked; the agent stops");
+                control.unbind();
                 control.request_stop();
                 return;
             }

@@ -27,6 +27,8 @@ pub mod tls;
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use agentspaces_wire::identity::Identity;
@@ -110,12 +112,33 @@ impl FrameSender {
 pub struct FrameReceiver {
     rx: mpsc::Receiver<Vec<u8>>,
     closed: watch::Receiver<bool>,
+    /// The bytes the link's reader has read off its stream so far, a frame still arriving
+    /// included; `None` for a transport that hands over whole frames only.
+    progress: Option<Arc<AtomicU64>>,
 }
 
 impl FrameReceiver {
     /// Wraps a queue the link's reader fills, watching the link's close signal.
     pub fn new(rx: mpsc::Receiver<Vec<u8>>, closed: watch::Receiver<bool>) -> Self {
-        Self { rx, closed }
+        Self {
+            rx,
+            closed,
+            progress: None,
+        }
+    }
+
+    /// The same receiver, whose reader counts the bytes it reads in `progress` as they arrive.
+    #[must_use]
+    pub fn with_progress(mut self, progress: Arc<AtomicU64>) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
+    /// The count of bytes read off the link's stream so far, a frame still arriving included
+    /// (so a large frame on a slow link shows its far end is writing before the frame is
+    /// whole); `None` when the transport hands over whole frames only.
+    pub fn progress(&self) -> Option<Arc<AtomicU64>> {
+        self.progress.clone()
     }
 
     /// The next frame, or `None` once the link has closed. Frames already queued when the link

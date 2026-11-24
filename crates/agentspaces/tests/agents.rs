@@ -123,13 +123,18 @@ impl Net {
 
     /// A member joined through the seed, and its identity.
     async fn member(&self) -> (Fleet, Identity) {
+        self.member_on(system()).await
+    }
+
+    /// A member on `clock` joined through the seed, and its identity.
+    async fn member_on(&self, clock: SharedClock) -> (Fleet, Identity) {
         let identity = Identity::generate().expect("identity");
         let peer = Peer::start(config(
             &self.network,
             identity.clone(),
             GroupSpec::FoundingText(FOUNDING.to_owned()),
             &[SEED],
-            system(),
+            clock,
         ))
         .await
         .expect("the peer starts");
@@ -1676,4 +1681,219 @@ mod interop {
         fleet.close().await.expect("close");
         let _ = seed.ask("quit").await;
     }
+}
+
+// ------------------------------------------------------------------------------- the binder's end
+
+/// The system clock moved by a step the test sets: a wake from a suspend, as the peer sees it
+/// (wall time jumps; the monotonic clock did not count the sleep).
+#[derive(Debug, Default)]
+struct SteppedClock(std::sync::atomic::AtomicI64);
+
+impl SteppedClock {
+    fn step(&self, millis: i64) {
+        self.0.fetch_add(millis, Ordering::SeqCst);
+    }
+}
+
+impl Clock for SteppedClock {
+    fn now_ms(&self) -> i64 {
+        SystemClock.now_ms() + self.0.load(Ordering::SeqCst)
+    }
+
+    fn local_ms(&self) -> i64 {
+        SystemClock.local_ms()
+    }
+}
+
+/// As the reference binder: a handler that renews its own take through its context, here from a
+/// task it spawned (a model
+/// stream's keepalive), stops renewing once its agent is unbound. Before, the spawned renewals
+/// went on after the agent was abandoned, and the entry never reappeared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_take_context_stops_renewing_once_its_agent_is_unbound() {
+    let net = Net::new();
+    let (worker, _) = net.member().await;
+    let (other, _) = net.member().await;
+    let (contexts_tx, mut contexts) = mpsc::unbounded_channel::<TakeContext>();
+    let hung = worker
+        .agent("hung")
+        .settle(SETTLE)
+        .take(SPACE, lease("1s"), move |_task: Task, ctx: TakeContext| {
+            let contexts = contexts_tx.clone();
+            async move {
+                let renewer = ctx.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        let _ = renewer.renew().await;
+                    }
+                });
+                let _ = contexts.send(ctx);
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok(Reply::none())
+            }
+        })
+        .bind()
+        .await
+        .expect("bind");
+    let writer = other.space(SPACE).with_settle(SETTLE);
+    let id = writer
+        .write(&task("hung"), Lease::DEFAULT_WRITE, Map::new())
+        .await
+        .expect("write");
+    let ctx = tokio::time::timeout(PATIENCE, contexts.recv())
+        .await
+        .expect("in time")
+        .expect("the handler runs");
+    // Held well past its 1 s lease by the spawned renewals while the agent is bound.
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    assert!(ctx.renewable());
+    assert_eq!(
+        writer
+            .get(&id)
+            .await
+            .expect("get")
+            .and_then(|v| v.holder().map(str::to_owned)),
+        Some(hung.agent_id().to_owned()),
+        "held by the renewals"
+    );
+
+    assert!(
+        !hung.stop(Duration::from_millis(200)).await,
+        "abandoned past the grace"
+    );
+    assert!(!ctx.renewable(), "unbound");
+    assert!(matches!(ctx.renew().await, Err(SpaceError::NotHeld(_))));
+    let retaken = writer
+        .take(
+            &Template::of::<Task>(),
+            lease("30s"),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("take")
+        .expect("the spawned renewals stopped: the hold lapses and the entry reappears");
+    assert_eq!(retaken.entry_id(), &id);
+    retaken
+        .complete(None, Lease::DEFAULT_RESULT, Map::new())
+        .await
+        .expect("complete");
+}
+
+/// A revoked agent's take context stops renewing too, once the binder sees the revocation (the
+/// card refresh here), whatever renews it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revoked_agents_take_context_stops_renewing() {
+    let net = Net::new();
+    let (worker, worker_identity) = net.member().await;
+    let (other, _) = net.member().await;
+    let (contexts_tx, mut contexts) = mpsc::unbounded_channel::<TakeContext>();
+    let bound = worker
+        .agent("doomed")
+        .settle(SETTLE)
+        .card_refresh(Duration::from_millis(100))
+        .take(SPACE, lease("2s"), move |_task: Task, ctx: TakeContext| {
+            let contexts = contexts_tx.clone();
+            async move {
+                let _ = contexts.send(ctx.clone());
+                ctx.keepalive(tokio::time::sleep(Duration::from_secs(60)))
+                    .await;
+                Ok(Reply::none())
+            }
+        })
+        .bind()
+        .await
+        .expect("bind");
+    let writer = other.space(SPACE).with_settle(SETTLE);
+    writer
+        .write(&task("doomed"), Lease::DEFAULT_WRITE, Map::new())
+        .await
+        .expect("write");
+    let ctx = tokio::time::timeout(PATIENCE, contexts.recv())
+        .await
+        .expect("in time")
+        .expect("the handler runs");
+    assert!(ctx.renewable());
+    net.revoke_agent(&worker_identity, bound.agent_id()).await;
+    eventually("the revoked agent's context stops renewing", || async {
+        !ctx.renewable()
+    })
+    .await;
+    assert!(matches!(ctx.renew().await, Err(SpaceError::NotHeld(_))));
+}
+
+/// Owner decision 5 of 2026-11-23: the hold limit and the keepalive's period run on the
+/// monotonic clock, which does not count a suspend, while the take's lease is wall time. On a
+/// wake (a wall step the peer sees), a held take is re-checked at once: one whose hold still runs
+/// is renewed now, and one that lapsed while the host slept renews no more, and its handler's
+/// result is late, so nothing is completed. Before, the keepalive found out only at its next
+/// half-lease tick, and the late result was a failed completion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wake_rechecks_a_held_take_at_once_and_a_lapsed_ones_result_is_late() {
+    let net = Net::new();
+    let clock = Arc::new(SteppedClock::default());
+    let (worker, _) = net.member_on(clock.clone()).await;
+    let (other, _) = net.member().await;
+    let (contexts_tx, mut contexts) = mpsc::unbounded_channel::<TakeContext>();
+    let bound = worker
+        .agent("sleeper")
+        .settle(SETTLE)
+        .take(SPACE, lease("4s"), move |task: Task, ctx: TakeContext| {
+            let contexts = contexts_tx.clone();
+            async move {
+                let _ = contexts.send(ctx.clone());
+                ctx.keepalive(tokio::time::sleep(Duration::from_secs(3)))
+                    .await;
+                Ok(Reply::from(report(&task.topic, ctx.agent_id())))
+            }
+        })
+        .produces::<Report>()
+        .bind()
+        .await
+        .expect("bind");
+    let writer = other.space(SPACE).with_settle(SETTLE);
+    let id = writer
+        .write(&task("asleep"), Lease::DEFAULT_WRITE, Map::new())
+        .await
+        .expect("write");
+    let ctx = tokio::time::timeout(PATIENCE, contexts.recv())
+        .await
+        .expect("in time")
+        .expect("the handler runs");
+    let peer = worker.peer().clone();
+
+    // A 1.5 s forward step: the hold still runs, so it is renewed at once (the keepalive's next
+    // tick is a second or more away).
+    let before = ctx.expires_at_millis().await;
+    clock.step(1_500);
+    let _ = peer.counters().await; // a turn of the loop, which sees the step
+    tokio::time::timeout(Duration::from_millis(400), async {
+        while ctx.expires_at_millis().await <= before + 1_000 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("renewed at once on the step");
+    assert!(ctx.renewable());
+
+    // A wake after 10 minutes: the hold lapsed while the host slept; renewals stop at once.
+    clock.step(600_000);
+    let _ = peer.counters().await;
+    tokio::time::timeout(Duration::from_millis(400), async {
+        while ctx.renewable() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the lapsed hold is seen at once");
+    assert!(matches!(ctx.renew().await, Err(SpaceError::NotHeld(_))));
+
+    // The handler answers after the wake: its result is late and completes nothing.
+    eventually("the late take", || async { bound.late_takes() == 1 }).await;
+    assert_eq!(bound.handled(), 0);
+    let view = writer.get(&id).await.expect("get").expect("held");
+    assert!(!view.completed(), "the late result completed nothing");
+    assert!(reports(&writer).await.is_empty(), "and wrote nothing");
+    bound.stop(Duration::from_millis(100)).await;
 }

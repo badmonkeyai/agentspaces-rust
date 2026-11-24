@@ -39,7 +39,7 @@ use common::{golden, hex, s};
 const ENTRY: &str = "11111111-2222-3333-4444-555555555555";
 
 /// Every `adv_*` key this suite and `fold_golden.rs` assert (`founding_test.rb`'s list).
-const COVERED: [&str; 68] = [
+const COVERED: [&str; 74] = [
     "adv_claim_bad_signature_delta",
     "adv_claim_transplanted_delta",
     "adv_claim_nan_bid_delta",
@@ -97,6 +97,12 @@ const COVERED: [&str; 68] = [
     "adv_app_card_spill_root_codec_cbor",
     "adv_app_card_spill_size_zero_cbor",
     "adv_agent_card_spill_actions_cbor",
+    "adv_agent_card_threads_scope_cbor",
+    "adv_agent_card_threads_all_key_cbor",
+    "adv_agent_card_threads_key_cbor",
+    "adv_agent_card_threads_count_cbor",
+    "adv_agent_card_threads_twice_cbor",
+    "adv_agent_card_threads_empty_cbor",
     "adv_digest_tree_path_nibble_body",
     "adv_digest_tree_path_long_body",
     "adv_digest_tree_nodes_length_body",
@@ -751,8 +757,38 @@ fn hostile_cards_are_undecodable_for_their_own_rule() {
             "AgentCard",
             (&["actions"], None),
         ),
+        (
+            "adv_agent_card_threads_scope_cbor",
+            "AgentCard",
+            (&["threads"], None),
+        ),
+        (
+            "adv_agent_card_threads_all_key_cbor",
+            "AgentCard",
+            (&["threads"], None),
+        ),
+        (
+            "adv_agent_card_threads_key_cbor",
+            "AgentCard",
+            (&["threads"], None),
+        ),
+        (
+            "adv_agent_card_threads_count_cbor",
+            "AgentCard",
+            (&["threads"], None),
+        ),
+        (
+            "adv_agent_card_threads_twice_cbor",
+            "AgentCard",
+            (&["threads"], None),
+        ),
+        (
+            "adv_agent_card_threads_empty_cbor",
+            "AgentCard",
+            (&["threads"], None),
+        ),
     ];
-    assert_eq!(cases.len(), 18);
+    assert_eq!(cases.len(), 24);
     for (name, record, fix) in &cases {
         let bytes = hex(name);
         // The item rules and the canonical bytes hold: the refusal is the card's own.
@@ -789,6 +825,7 @@ fn hostile_cards_are_undecodable_for_their_own_rule() {
         ("app_card_spill_cbor", "AppCard"),
         ("app_card_host_cbor", "AppCard"),
         ("agent_card_spill_cbor", "AgentCard"),
+        ("agent_card_threads_cbor", "AgentCard"),
     ] {
         assert!(schema::decode(&hex(name), record).is_some(), "{name}");
     }

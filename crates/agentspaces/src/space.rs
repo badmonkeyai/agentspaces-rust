@@ -810,7 +810,7 @@ impl Space {
 
     /// The leased push subscription of the Java space (`Space.notify`, `space.py`'s `notify`):
     /// `handler` runs, on a task of its own, for each transition of a matching entry until `lease`
-    /// lapses on the peer's clock unless [`Subscription::renew`]ed, the subscription is closed, or
+    /// lapses (on the peer clock's monotonic base, so a laptop sleep lapses nothing) unless [`Subscription::renew`]ed, the subscription is closed, or
     /// the peer closes. Must be called within a Tokio runtime.
     ///
     /// The handler runs on the runtime: it must not block (a blocking handler holds one of the
@@ -848,7 +848,8 @@ impl Space {
     ) -> Result<(SpaceEvents, Arc<WatchQueue>, SharedClock), SpaceError> {
         // Opened by the peer together with the registration, as in `watch`.
         let clock = Arc::clone(self.peer.clock());
-        let expires_at = clock.now_ms().saturating_add(lease.millis());
+        // A local period (SPEC v0.1.36 §9.5): judged on the clock's local base.
+        let expires_at = clock.local_ms().saturating_add(lease.millis());
         let queue = WatchQueue::new(self.watch_capacity, expires_at);
         let events = SpaceEvents::new(Arc::clone(&queue));
         self.peer

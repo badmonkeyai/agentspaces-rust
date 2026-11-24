@@ -270,6 +270,14 @@ impl AdmissionRefusals {
 pub struct ListenCounters {
     /// Links accepted.
     pub links_accepted: u64,
+    /// Runs of the listening role's housekeeping (silent links, lapsed members, due fetches, the
+    /// audit's retries, the periodic round). It runs when its earliest concern falls due, not on
+    /// a fixed tick (SPEC v0.1.36 §9.5), and at least once per backstop.
+    pub housekeeping_runs: u64,
+    /// Housekeeping runs that only the backstop started and that found a concern already due:
+    /// a deadline that moved earlier without re-arming the housekeeping (a missed wake). Zero in
+    /// a healthy peer.
+    pub housekeeping_missed_wakes: u64,
     /// Links closed at once: [`ListenConfig::max_links`] links carrying members were held, or
     /// the peer was closing.
     pub links_refused: u64,
@@ -279,6 +287,10 @@ pub struct ListenCounters {
     /// silent too long, sent too many frames before introducing one, or (introducing nobody
     /// yet) were the oldest such link when a new one arrived at [`ListenConfig::max_links`].
     pub links_silent: u64,
+    /// PINGs sent on a late wake (a frozen process) to members whose accepted link had been
+    /// silent past the idle timeout only because this peer was frozen: each is judged after a
+    /// probe's answer window rather than dropped at once (owner decision 3 of 2026-11-23).
+    pub wake_probes: u64,
     /// Members admitted from their own introduction.
     pub admitted: u64,
     /// Admissions refused, by reason.

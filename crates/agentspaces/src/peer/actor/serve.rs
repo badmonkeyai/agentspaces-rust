@@ -56,7 +56,8 @@
 //! advertisements of the live members (each directly, unforwarded), and its introduction goes on
 //! to the other links. A newcomer that runs anti-entropy itself (its first DIGEST names the `view`
 //! stream, as a Java member's does at once) also gets a targeted round from this peer; a
-//! dial-only newcomer, which answers no DIGEST, pulls what it needs instead. A copy of an advertisement that a third party carries refreshes a member already
+//! dial-only newcomer, which runs no rounds with this peer, pulls what it needs instead, and
+//! answers this peer's periodic rounds when this peer is its seed. A copy of an advertisement that a third party carries refreshes a member already
 //! admitted and admits nobody. Members are bounded; one whose advertisement lapsed while no link
 //! carries it is dropped. An evicted member (a revoked credential, delegation, or PeerID) loses
 //! every link it owns.
@@ -72,9 +73,10 @@
 //! split into frames of at most [`PULL_CHUNK_BYTES`] and cut short past half the link's queue,
 //! the bound of the backlog that may hold it, so a busy link never drops the head of an answer
 //! (the next pull of that asker resumes where the cut fell). Each member's DIGESTs are paced. This
-//! peer runs its own rounds with members that run anti-entropy themselves (they send DIGESTs
-//! naming the `view` stream) and with its seed: every period, doubled per idle round up to 32
-//! times, and a targeted one with each such newcomer; it applies a PULL_RESP from an accepted link
+//! peer runs its own rounds with a random member it holds a link to, dial-only members included
+//! (they answer the DIGESTs of their seed), or with its seed: one every period, doubled per idle
+//! round up to 32 times, and a targeted one with each newcomer that runs anti-entropy itself (it
+//! sends DIGESTs naming the `view` stream); it applies a PULL_RESP from an accepted link
 //! only as the answer of a member it asked within the last [`EXPECTED_FOR`] (the first frame of
 //! the answer, and the rest within [`ANSWER_WINDOW`]), at most [`MAX_EXPECTED`] at once.
 //!
@@ -91,6 +93,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use agentspaces_wire::ads as wire_ads;
+use agentspaces_wire::audit as wire_audit;
 use agentspaces_wire::bodies::{
     self, KIND_ACK, KIND_BLOCK_WANT, KIND_CHANNEL_HELLO, KIND_DIGEST, KIND_GROUP_AD,
     KIND_GROUP_AD_WANT, KIND_PING, KIND_PULL_RESP, KIND_RELAY_FRAME, KIND_RUMOR, RUMOR_HOPS,
@@ -119,8 +122,16 @@ use crate::peer::listen::{BoundListener, ListenCounters, TokenBucket};
 use crate::peer::{PeerError, PeerEvent};
 use crate::transport::Channel;
 
-/// How often the listening role's housekeeping runs (links, members, fetches, rounds).
-const TICK: Duration = Duration::from_millis(500);
+/// How often the audit's fetch queue is asked again while it holds anything (it names no next
+/// due of its own).
+const AUDIT_RETRY: Duration = Duration::from_millis(500);
+/// The longest the listening role's housekeeping sleeps whatever its concerns' next dues: a
+/// backstop for a deadline that moved earlier without re-arming it (counted in
+/// [`ListenCounters::housekeeping_missed_wakes`]). The housekeeping otherwise runs when its
+/// earliest concern falls due (SPEC v0.1.36 §9.5: due work, not a fixed tick).
+const HOUSEKEEPING_BACKSTOP: Duration = Duration::from_secs(15);
+/// A backstop run that finds a concern due more than this before it ran counts a missed wake.
+const MISSED_WAKE_SLACK: Duration = Duration::from_millis(50);
 /// The rumors remembered for duplicate suppression (by stream and payload hash).
 const SEEN_CAPACITY: usize = 16_384;
 /// The frames a stranger may send on an accepted link before any member introduced itself on
@@ -137,6 +148,15 @@ const MEMBER_RATE: u32 = 10_000;
 /// A member's DIGESTs answered: a burst (a joiner pulls several streams at once) and a rate.
 const ANSWER_BURST: u32 = 16;
 const ANSWER_RATE: u32 = 4;
+/// The answer bucket a dial-only peer gives each member whose relayed `DIGEST` it answers for
+/// its displaced entries (owner decision 1 of 2026-11-23): the same figures, one bucket per
+/// asker and none shared with the seed's own rounds (the cross-client check of 2026-11-23: a
+/// shared bucket let one member flooding relayed `DIGEST`s starve both the winners' rounds and
+/// the seed's repair). The same in every client.
+pub(super) const RELAYED_ANSWER_BURST: u32 = ANSWER_BURST;
+const RELAYED_ANSWER_RATE: u32 = ANSWER_RATE;
+/// At most this many askers' buckets are kept; the one asked least recently goes first.
+const RELAYED_ANSWER_ASKERS: usize = 1024;
 /// The most streams of one DIGEST answered.
 const MAX_DIGEST_STREAMS: usize = 64;
 /// The target size of one PULL_RESP body; an answer larger than it goes in several frames.
@@ -267,6 +287,14 @@ struct Expected {
 }
 
 impl Expected {
+    /// When the answer stops being applied (forgotten then).
+    fn closes_at(&self) -> Option<Instant> {
+        match self.answered {
+            None => self.asked.checked_add(EXPECTED_FOR),
+            Some(at) => at.checked_add(ANSWER_WINDOW),
+        }
+    }
+
     /// Whether a PULL_RESP arriving at `now` is still part of the answer.
     fn open(&self, now: Instant) -> bool {
         match self.answered {
@@ -312,7 +340,11 @@ pub(in crate::peer) struct Hub {
     /// The bootstrap bucket every stranger frame spends.
     admissions: TokenBucket,
     /// DIGESTs answered on the dialed link.
-    dialed_answers: TokenBucket,
+    pub(super) dialed_answers: TokenBucket,
+    /// Relayed DIGESTs a dial-only peer answers for its displaced entries: a bucket per asker,
+    /// with the order it was last asked in.
+    relayed_answers: HashMap<String, (TokenBucket, u64)>,
+    relayed_asked: u64,
     pub seen: Seen,
     /// The members asked in a round, when, and when their answer began.
     expected: VecDeque<Expected>,
@@ -331,7 +363,11 @@ pub(in crate::peer) struct Hub {
     pub base_period: Duration,
     round_period: Duration,
     next_round: Option<Instant>,
+    /// When the housekeeping runs next: its concerns' earliest due, capped by the backstop.
     pub next_tick: Option<Instant>,
+    /// The concerns' earliest due as last computed or lowered (uncapped): a run before it is a
+    /// backstop run.
+    due: Option<Instant>,
     /// The last self-advertisement payload, what the view's delta carries for this peer.
     pub own_ad: Option<Vec<u8>>,
     pub accept_tasks: Vec<JoinHandle<()>>,
@@ -362,6 +398,8 @@ impl Hub {
             admission_memory: HashMap::new(),
             admissions: TokenBucket::new(settings.admission_burst, settings.admissions_per_second),
             dialed_answers: TokenBucket::new(ANSWER_BURST, ANSWER_RATE),
+            relayed_answers: HashMap::new(),
+            relayed_asked: 0,
             seen: Seen::default(),
             expected: VecDeque::new(),
             digesters: BTreeSet::new(),
@@ -374,6 +412,7 @@ impl Hub {
             round_period: base,
             next_round: None,
             next_tick: None,
+            due: None,
             own_ad: None,
             accept_tasks: Vec::new(),
             inbound_budget: Arc::new(Semaphore::new(super::ACCEPTED_BUDGET_BYTES)),
@@ -565,7 +604,71 @@ impl Actor {
         self.hub.own_ad = Some(self.self_ad_payload(now));
         let at = Instant::now();
         self.hub.next_round = Some(at + jittered(self.hub.base_period));
-        self.hub.next_tick = Some(at + TICK);
+        self.lower_housekeeping(at);
+    }
+
+    /// Something moved (SPEC §5.3's idle backoff): the next round returns to the base period, and
+    /// while the rounds are stretched the first activity asks for a round at once rather than
+    /// waiting out the stretched period, as the reference implementation does.
+    pub(super) fn note_hub_activity(&mut self) {
+        let first = !self.hub.activity;
+        self.hub.activity = true;
+        if first && self.hub.round_period > self.hub.base_period {
+            self.bring_round_forward(Instant::now());
+        }
+    }
+
+    /// Brings the periodic round forward to `at` (a resume asks for one at once).
+    pub(super) fn bring_round_forward(&mut self, at: Instant) {
+        if let Some(next) = self.hub.next_round.as_mut() {
+            *next = (*next).min(at);
+        }
+        self.lower_housekeeping(at);
+    }
+
+    /// Runs the listening role's housekeeping no later than `at` (a concern's new deadline).
+    pub(super) fn lower_housekeeping(&mut self, at: Instant) {
+        if !self.hub.listening || self.closed {
+            return;
+        }
+        self.hub.due = Some(self.hub.due.map_or(at, |due| due.min(at)));
+        self.hub.next_tick = Some(self.hub.next_tick.map_or(at, |next| next.min(at)));
+    }
+
+    /// The earliest due of the housekeeping's concerns at `now` (`wall` on the wall clock): an
+    /// accepted link's introduction or idle timeout, a lapsed member no link carries (its
+    /// advertisement's expiry is wall time, re-anchored on every run), a block fetch's next ask,
+    /// the audit's retries while it waits on anything, and the periodic round.
+    fn housekeeping_due(&self, now: Instant, wall: i64) -> Option<Instant> {
+        let introduction = self.hub.settings.introduction_timeout;
+        let idle = self.hub.settings.link_idle_timeout;
+        let links = self.hub.accepted.values().filter_map(|link| {
+            let heard = link.heard_at.checked_add(idle);
+            let introduced = if link.owner.is_none() {
+                link.up_at.checked_add(introduction)
+            } else {
+                None
+            };
+            [heard, introduced].into_iter().flatten().min()
+        });
+        let members = self
+            .hub
+            .admitted
+            .iter()
+            .filter(|(peer, _)| !self.hub.routes.contains_key(*peer))
+            .map(|(_, member)| wall_due(now, wall, member.expires_ms));
+        let fetches = self.hub.fetches.values().map(|fetch| fetch.next_at);
+        let audit = (self.audit.enabled && self.audit_waiting())
+            .then(|| now.checked_add(AUDIT_RETRY))
+            .flatten();
+        let expected = self.hub.expected.iter().filter_map(Expected::closes_at);
+        links
+            .chain(members)
+            .chain(fetches)
+            .chain(audit)
+            .chain(self.hub.next_round)
+            .chain(expected)
+            .min()
     }
 
     /// The base period of this peer's own rounds: [`ListenConfig::anti_entropy_period`] when
@@ -607,6 +710,7 @@ impl Actor {
             self.drop_accepted(id);
         }
         self.hub.next_tick = None;
+        self.hub.due = None;
         self.hub.next_round = None;
         self.hub.fetches.clear();
     }
@@ -643,7 +747,16 @@ impl Actor {
         let link = self.open_link(channel, true);
         tracing::debug!(peer = %self.peer_id, remote = %link.info.remote, "agentspaces: link accepted");
         bump(&mut self.hub.counters.links_accepted);
+        let timeout = self
+            .hub
+            .settings
+            .introduction_timeout
+            .min(self.hub.settings.link_idle_timeout);
+        let due = link.up_at.checked_add(timeout);
         self.hub.accepted.insert(link.id, link);
+        if let Some(due) = due {
+            self.lower_housekeeping(due);
+        }
     }
 
     /// Closes and forgets accepted link `id`; its member stops being reachable here.
@@ -674,6 +787,10 @@ impl Actor {
                 .map(|other| other.id)
             {
                 self.hub.routes.insert(owner.clone(), other);
+            } else if let Some(member) = self.hub.admitted.get(owner) {
+                // No link carries the member now: its advertisement's lapse is a concern.
+                let due = wall_due(Instant::now(), self.now(), member.expires_ms);
+                self.lower_housekeeping(due);
             }
         }
         bump(&mut self.hub.counters.links_closed);
@@ -854,6 +971,67 @@ impl Actor {
                 .get(relay)
                 .map(|id| (*id, Some(relay.to_owned())))
         })
+    }
+
+    /// After a late wake (a frozen process, owner decision 3 of 2026-11-23), before any member
+    /// is judged by the time that passed: each accepted link whose idle verdict falls within a
+    /// probe's answer window from `now` is asked with one `PING` (addressed to its member) and
+    /// judged only once that window ends, so a member silent past the idle timeout only because
+    /// this peer was frozen is probed, not dropped; whatever it sent meanwhile, or its `ACK`,
+    /// keeps it. A link that introduced nobody gets the same window for its introduction.
+    pub(super) fn reprobe_after_freeze(&mut self, now: Instant) {
+        if !self.hub.listening || self.closed {
+            return;
+        }
+        let answer = super::seed_watch::SEED_ANSWER;
+        let Some(judged) = now.checked_add(answer) else {
+            return;
+        };
+        let idle = self.hub.settings.link_idle_timeout;
+        let introduction = self.hub.settings.introduction_timeout;
+        let mut probes: Vec<(u64, Option<String>)> = Vec::new();
+        for link in self.hub.accepted.values_mut() {
+            if link
+                .heard_at
+                .checked_add(idle)
+                .is_some_and(|due| due <= judged)
+            {
+                if let Some(heard) = judged.checked_sub(idle) {
+                    link.heard_at = link.heard_at.max(heard);
+                }
+                probes.push((link.id, link.owner.clone()));
+            }
+            if link.owner.is_none()
+                && link
+                    .up_at
+                    .checked_add(introduction)
+                    .is_some_and(|due| due <= judged)
+                && let Some(up) = judged.checked_sub(introduction)
+            {
+                link.up_at = link.up_at.max(up);
+            }
+        }
+        for (id, owner) in probes {
+            let Some(owner) = owner else {
+                continue; // a stranger's link: its introduction's window only
+            };
+            let Some(nonce) = super::random_nonce() else {
+                continue;
+            };
+            if self
+                .send_on_link(
+                    id,
+                    KIND_PING,
+                    &bodies::ping_body(nonce),
+                    Some(&owner),
+                    Budget::Whole,
+                )
+                .is_ok()
+            {
+                bump(&mut self.hub.counters.wake_probes);
+            }
+        }
+        self.lower_housekeeping(judged);
     }
 
     /// Closes accepted links that introduced nobody within the introduction timeout or stayed
@@ -1351,7 +1529,7 @@ impl Actor {
         if let Some(rumor) = bodies::parse_rumor(body) {
             self.hub.seen.insert(&rumor.stream_id, &rumor.payload);
             if rumor.stream_id != STREAM_PEERS {
-                self.hub.activity = true;
+                self.note_hub_activity();
             }
         }
         let targets: Vec<u64> = self.hub.routes.values().copied().collect();
@@ -1542,6 +1720,40 @@ impl Actor {
         !paced
     }
 
+    /// Spends one of `asker`'s relayed answers (owner decision 1 of 2026-11-23); `false`
+    /// (counted) when its bucket is spent. Each asker has its own, apart from the seed's.
+    pub(super) fn pace_relayed_answer(&mut self, asker: &str) -> bool {
+        self.hub.relayed_asked += 1;
+        let asked = self.hub.relayed_asked;
+        let (bucket, at) = self
+            .hub
+            .relayed_answers
+            .entry(asker.to_owned())
+            .or_insert_with(|| {
+                (
+                    TokenBucket::new(RELAYED_ANSWER_BURST, RELAYED_ANSWER_RATE),
+                    0,
+                )
+            });
+        *at = asked;
+        let spent = bucket.take();
+        if self.hub.relayed_answers.len() > RELAYED_ANSWER_ASKERS {
+            let oldest = self
+                .hub
+                .relayed_answers
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(asker, _)| asker.clone());
+            if let Some(oldest) = oldest {
+                self.hub.relayed_answers.remove(&oldest);
+            }
+        }
+        if !spent {
+            bump(&mut self.counters.relayed_answers_paced);
+        }
+        spent
+    }
+
     /// Notes that `sender` runs anti-entropy itself (its DIGEST named the view): it answers this
     /// peer's rounds. Whether it is owed the targeted round of a newcomer now.
     pub(super) fn note_digester(&mut self, sender: &str) -> bool {
@@ -1582,7 +1794,7 @@ impl Actor {
         }
         if !frames.is_empty() {
             bump(&mut self.hub.counters.pulls_answered);
-            self.hub.activity = true;
+            self.note_hub_activity();
         }
         for frame in frames {
             if self
@@ -1630,6 +1842,136 @@ impl Actor {
             .any(|expected| expected.peer == partner && expected.open(now))
     }
 
+    /// A `DIGEST` that a relay carried to this dial-only peer from a member other than its seed
+    /// (owner decision 1 of 2026-11-23, as the core's `GossipBus.onDigestDisplacedOnly`):
+    /// typically the targeted round of a winner whose claim displaced one of this peer's
+    /// holders, which needs that holder's completion and has no other source for it. Only the
+    /// spaces where this peer holds a displaced claim made here, with or without a completion
+    /// under it ([`Actor::holds_displaced`]), draw anything, and only those entries go:
+    /// - `want` for a round this peer opened (its own targeted rounds as a winner) is answered
+    ///   as ever;
+    /// - `hashes`, an opening, draws `want` for those spaces whose text form differs, so the
+    ///   winner sends its text digests;
+    /// - `digests` draws a PULL_RESP of each displaced claim and, where the asker's digest lacks
+    ///   it, the entry's state, which carries this peer's completion;
+    /// - `ids` and `tree`, and any space with nothing displaced, draw nothing.
+    ///
+    /// Under the asker's own answer pace ([`Actor::pace_relayed_answer`]). So no member but the
+    /// seed can make this peer upload anything else. Answers whether it took the `DIGEST`
+    /// (`false`: nothing of the kind is held, and the caller ignores it as before).
+    pub(super) fn answer_displaced_digest(
+        &mut self,
+        sender: &str,
+        body: &[u8],
+        via: Via,
+    ) -> Result<bool, Malformed> {
+        let digest = wire_audit::parse_digest(body).map_err(|_| Malformed)?;
+        let mut took = false;
+        if let Some(want) = &digest.want
+            && !want.is_empty()
+            && self.awaits(sender)
+        {
+            self.on_want(sender, want);
+            took = true;
+        }
+        let space_of = |stream: &str| stream.strip_prefix(STREAM_SPACE_PREFIX).map(str::to_owned);
+        // An opening: the spaces holding a displaced claim whose text form differs.
+        let mut want: Vec<String> = Vec::new();
+        let mut hashes: Vec<&(String, Vec<u8>)> = digest.hashes.iter().flatten().collect();
+        hashes.sort_by(|a, b| a.0.cmp(&b.0));
+        for (stream, theirs) in hashes {
+            if want.len() >= MAX_DIGEST_STREAMS || want.contains(stream) {
+                continue;
+            }
+            let Some(space) = space_of(stream) else {
+                continue;
+            };
+            if self.holds_displaced(&space)
+                && !wire_audit::same_stream(None, self.text_hash(stream).as_ref(), theirs)
+            {
+                want.push(stream.clone());
+            }
+        }
+        // Text digests: the spaces holding a displaced claim, with the asker's digest.
+        let mut held: Vec<(String, Vec<u8>)> = Vec::new();
+        for (stream, remote) in digest.digests.iter().flatten() {
+            if held.len() >= MAX_DIGEST_STREAMS || held.iter().any(|(named, _)| named == stream) {
+                continue;
+            }
+            let Some(space) = space_of(stream) else {
+                continue;
+            };
+            if self.holds_displaced(&space) {
+                held.push((stream.clone(), remote.clone()));
+            }
+        }
+        if want.is_empty() && held.is_empty() {
+            return Ok(took);
+        }
+        if !self.pace_relayed_answer(sender) {
+            return Ok(true);
+        }
+        if !want.is_empty() {
+            let body = wire_audit::DigestBody {
+                want: Some(want),
+                ..wire_audit::DigestBody::default()
+            };
+            self.send_digest_to(sender, &body, Some(via));
+            bump(&mut self.counters.displaced_digest_answers);
+        }
+        if held.is_empty() {
+            return Ok(true);
+        }
+        let now = self.now();
+        let mut streams: Vec<(String, Vec<Piece<'_>>)> = Vec::new();
+        for (stream, remote) in &held {
+            let Some(slot) = stream
+                .strip_prefix(STREAM_SPACE_PREFIX)
+                .and_then(|space| self.spaces.get(space))
+            else {
+                continue;
+            };
+            let lines = slot.settle.displaced_lines();
+            let entries: HashSet<&str> = lines.iter().map(|(entry, _)| *entry).collect();
+            // The entry's state where the asker lacks it (it carries this peer's completion),
+            // then the displaced claim itself, which is no longer the store's.
+            let mut pieces: Vec<Piece<'_>> = self
+                .missing_pieces(sender, stream, remote, now)
+                .into_iter()
+                .filter(|piece| {
+                    matches!(piece, Piece::State(state) if records::state_entry_id(state)
+                        .is_some_and(|entry| entries.contains(entry)))
+                })
+                .collect();
+            for (entry, proof) in lines {
+                if slot.store.state(entry).is_some() {
+                    pieces.push(Piece::Claim(entry, proof));
+                }
+            }
+            if !pieces.is_empty() {
+                streams.push((stream.clone(), pieces));
+            }
+        }
+        let (frames, _, truncated) = self.pack_answer(streams, &HashMap::new());
+        if truncated {
+            bump(&mut self.hub.counters.digests_truncated);
+        }
+        if frames.is_empty() {
+            return Ok(true);
+        }
+        bump(&mut self.counters.displaced_digest_answers);
+        bump(&mut self.hub.counters.pulls_answered);
+        for frame in frames {
+            if self
+                .reply_with(via, KIND_PULL_RESP, &frame, sender, Budget::Half)
+                .is_ok()
+            {
+                bump(&mut self.hub.counters.pull_frames);
+            }
+        }
+        Ok(true)
+    }
+
     /// The PULL_RESP bodies answering `asked` (stream, the asker's digest), the cursors to resume
     /// from next time, and whether the answer was cut short.
     fn answer_digest(
@@ -1657,6 +1999,16 @@ impl Actor {
                 streams.push(((*stream).to_owned(), pieces));
             }
         }
+        self.pack_answer(streams, cursors)
+    }
+
+    /// Packs an answer's `streams` into PULL_RESP bodies, resuming each stream at its cursor;
+    /// answers the bodies, the cursors to resume from next time, and whether it was cut short.
+    fn pack_answer<'a>(
+        &self,
+        streams: Vec<(String, Vec<Piece<'a>>)>,
+        cursors: &HashMap<String, usize>,
+    ) -> (Vec<Vec<u8>>, HashMap<String, usize>, bool) {
         // Pack in order, resuming each stream where the last cut answer stopped. The answer, each
         // frame's envelope and each stream's key counted, fits the backlog that may hold it (half
         // the link's queue): on a busy link the backlog then drops older frames, never the head
@@ -1883,22 +2235,25 @@ impl Actor {
         self.hub.listening && self.hub.round_period > self.hub.base_period
     }
 
-    /// Whether `member` is a partner of this peer's rounds: it runs anti-entropy itself and a
-    /// link to it is held.
+    /// Whether `member` runs anti-entropy itself and a link to it is held: a probe showing it
+    /// differs starts a targeted round with it ([`probes`](super::probes)).
     pub(super) fn runs_rounds_with(&self, member: &str) -> bool {
         self.hub.digesters.contains(member) && self.hub.routes.contains_key(member)
     }
 
-    /// The periodic round: with a random member that runs anti-entropy (or the seed), then the
+    /// The periodic round: with a random member this peer holds a link to, or the seed, then the
     /// period doubles while nothing moved, up to 32 times (SPEC §5.3).
+    ///
+    /// The partners are every member on a link here, as the core draws them from its whole view
+    /// (owner decision of 2026-11-23): members that run anti-entropy themselves, and dial-only
+    /// members, which answer their seed's own `DIGEST` (and another member's, relayed, only with
+    /// their displaced claims made here), so a round reaching one repairs its own rumors
+    /// lost on its link. One round per period goes to one partner either way, so the
+    /// dial-only links share the period's rate rather than adding rounds, and each such member
+    /// paces the answers it gives on its dialed link. A dial-only member of an older release that
+    /// answers no `DIGEST` costs this peer one unanswered round when it is drawn.
     fn periodic_round(&mut self, now: Instant) {
-        let mut partners: Vec<String> = self
-            .hub
-            .digesters
-            .iter()
-            .filter(|peer| self.hub.routes.contains_key(*peer))
-            .cloned()
-            .collect();
+        let mut partners: Vec<String> = self.hub.routes.keys().cloned().collect();
         if let Some(seed) = &self.seed_peer
             && self.link.is_some()
             && !self.joining
@@ -1906,7 +2261,15 @@ impl Actor {
         {
             partners.push(seed.clone());
         }
-        if !partners.is_empty() {
+        if partners.is_empty() {
+            // Nobody to round with: the period stretches as an idle one does (SPEC §5.3), so a
+            // lone listening peer does not wake every base period for nothing; a newcomer is
+            // owed its own round at admission, and the first activity asks for a round at once
+            // ([`Actor::note_hub_activity`]).
+            let active = std::mem::take(&mut self.hub.activity);
+            self.hub.round_period =
+                next_period(self.hub.round_period, self.hub.base_period, active);
+        } else {
             let pick = usize::try_from(random_u64() % partners.len() as u64).unwrap_or(0);
             let partner = partners.swap_remove(pick.min(partners.len() - 1));
             self.round_with(&partner);
@@ -2012,6 +2375,9 @@ impl Actor {
             },
         );
         self.fetch_round(&cid, now);
+        if let Some(next) = self.hub.fetches.get(&cid).map(|fetch| fetch.next_at) {
+            self.lower_housekeeping(next);
+        }
     }
 
     /// A fetched block arrived: its fetch is done.
@@ -2115,15 +2481,29 @@ impl Actor {
 
     /// The listening role's tick: silent links, lapsed members, stale expectations, due
     /// fetches, and the periodic round.
+    ///
+    /// It runs when its earliest concern falls due ([`Actor::housekeeping_due`]) or a concern's
+    /// new deadline lowers it ([`Actor::lower_housekeeping`]), and at least once per
+    /// [`HOUSEKEEPING_BACKSTOP`]; a backstop run that finds a concern already overdue counts a
+    /// missed wake. Calling it early is always safe: a concern that is not due does nothing.
     pub(super) fn on_listen_tick(&mut self) {
         let now = Instant::now();
         if self.closed || !self.hub.listening {
             self.hub.next_tick = None;
+            self.hub.due = None;
             return;
         }
-        self.hub.next_tick = Some(now + TICK);
-        self.close_silent_links(now);
         let wall = self.now();
+        bump(&mut self.hub.counters.housekeeping_runs);
+        let backstop_run = self.hub.due.is_none_or(|due| now < due);
+        if backstop_run
+            && self
+                .housekeeping_due(now, wall)
+                .is_some_and(|due| due + MISSED_WAKE_SLACK <= now)
+        {
+            bump(&mut self.hub.counters.housekeeping_missed_wakes);
+        }
+        self.close_silent_links(now);
         self.expire_members(wall);
         self.hub.expected.retain(|expected| expected.open(now));
         self.run_fetches(now);
@@ -2131,6 +2511,15 @@ impl Actor {
         if self.hub.next_round.is_some_and(|at| at <= now) {
             self.periodic_round(now);
         }
+        self.rearm_housekeeping(now, wall);
+    }
+
+    /// Arms the housekeeping at its concerns' earliest due, at most a backstop away.
+    fn rearm_housekeeping(&mut self, now: Instant, wall: i64) {
+        let due = self.housekeeping_due(now, wall);
+        let backstop = now.checked_add(HOUSEKEEPING_BACKSTOP);
+        self.hub.due = due;
+        self.hub.next_tick = [due, backstop].into_iter().flatten().min();
     }
 
     /// The members this peer admitted (linked or not), in PeerID order.
@@ -2178,6 +2567,19 @@ impl Actor {
                 .saturating_add(self.hub.dialed_backlog_bytes)
         });
         accepted.saturating_add(dialed)
+    }
+}
+
+/// The monotonic instant of `at_ms` on the wall clock reading `wall` at `now`: in the past for
+/// one already passed (so an overdue concern reads as overdue), re-anchored on every call, so a
+/// wall-clock step moves it.
+pub(in crate::peer) fn wall_due(now: Instant, wall: i64, at_ms: i64) -> Instant {
+    let ahead = at_ms.saturating_sub(wall);
+    let span = Duration::from_millis(ahead.unsigned_abs());
+    if ahead >= 0 {
+        now.checked_add(span).unwrap_or(now)
+    } else {
+        now.checked_sub(span).unwrap_or(now)
     }
 }
 
@@ -2434,6 +2836,215 @@ mod tests {
             "the answer lost its revocations ({} frames held, {} dropped)",
             held.len(),
             actor.hub.counters.backlog_dropped
+        );
+    }
+
+    /// A listening actor on paused time with a long round period, so only the concerns under
+    /// test fall due.
+    fn listening_actor() -> Actor {
+        let (mut actor, ..) = super::super::tests::test_actor();
+        actor.hub.listening = true;
+        actor.hub.settings.introduction_timeout = Duration::from_secs(10);
+        actor.hub.settings.link_idle_timeout = Duration::from_secs(120);
+        actor.hub.settings.anti_entropy_period = Some(Duration::from_secs(3600));
+        actor.hub.base_period = Duration::from_secs(3600);
+        actor.hub.round_period = Duration::from_secs(3600);
+        actor.start_listening(&[]);
+        actor
+    }
+
+    /// The housekeeping is due work (SPEC v0.1.36 §9.5): an idle listening peer sleeps to the
+    /// backstop, a link that introduces nobody is closed at its introduction timeout, and in
+    /// between nothing runs.
+    #[tokio::test(start_paused = true)]
+    async fn the_housekeeping_runs_when_a_concern_falls_due_not_on_a_tick() {
+        use crate::transport::memory;
+
+        let mut actor = listening_actor();
+        let start = Instant::now();
+        assert_eq!(
+            actor.hub.next_tick,
+            Some(start),
+            "armed at once at the start"
+        );
+        actor.on_listen_tick();
+        assert_eq!(
+            actor.hub.next_tick,
+            Some(start + HOUSEKEEPING_BACKSTOP),
+            "nothing is due: it sleeps to the backstop, not 500 ms"
+        );
+        let (mine, _theirs) = memory::pair("mem", "stranger", "hub", None, None);
+        actor.accept_link(mine);
+        assert_eq!(
+            actor.hub.next_tick,
+            Some(start + Duration::from_secs(10)),
+            "the new link's introduction timeout lowered it"
+        );
+        tokio::time::advance(Duration::from_secs(10)).await;
+        actor.on_listen_tick();
+        assert_eq!(actor.hub.counters.links_silent, 1, "closed at its timeout");
+        assert!(actor.hub.accepted.is_empty());
+        assert_eq!(
+            actor.hub.counters.housekeeping_runs, 2,
+            "two runs in 10 s, not 20"
+        );
+        assert_eq!(actor.hub.counters.housekeeping_missed_wakes, 0);
+    }
+
+    /// A concern whose deadline moved earlier without re-arming the housekeeping is found by the
+    /// backstop and counted as a missed wake.
+    #[tokio::test(start_paused = true)]
+    async fn a_backstop_run_that_finds_overdue_work_counts_a_missed_wake() {
+        let mut actor = listening_actor();
+        let clock = crate::clock::ManualClock::new(1_900_000_000_000);
+        actor.clock = std::sync::Arc::new(clock.clone());
+        actor.on_listen_tick();
+        let now = actor.now();
+        // A member no link carries, lapsed, slipped in without lowering the housekeeping.
+        actor.hub.admitted.insert(
+            "zMember".to_owned(),
+            Member {
+                payload: Vec::new(),
+                issued_ms: now - 60_000,
+                expires_ms: now - 1,
+                credentials: Vec::new(),
+                rate: TokenBucket::new(MEMBER_BURST, MEMBER_RATE),
+                answers: TokenBucket::new(ANSWER_BURST, ANSWER_RATE),
+                cursors: HashMap::new(),
+                round_owed: false,
+            },
+        );
+        tokio::time::advance(HOUSEKEEPING_BACKSTOP).await;
+        clock.advance(i64::try_from(HOUSEKEEPING_BACKSTOP.as_millis()).unwrap_or(0));
+        actor.on_listen_tick();
+        assert_eq!(actor.hub.counters.housekeeping_missed_wakes, 1);
+        assert!(
+            actor.hub.admitted.is_empty(),
+            "the backstop still expired it"
+        );
+    }
+
+    /// Owner decision 3 of 2026-11-23: after a late wake (a frozen process), a member whose
+    /// link has been silent past the idle timeout only because this peer was frozen is probed,
+    /// not dropped: one PING each, and the verdict a probe's answer window later. The member that
+    /// answers is kept; the silent one is closed when the window ends. Before, the first
+    /// housekeeping run after the freeze closed both.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_wake_probes_the_members_it_would_drop_for_the_freezes_silence() {
+        use crate::transport::memory;
+        use agentspaces_wire::envelope;
+        use agentspaces_wire::identity::Identity;
+
+        let (mut actor, _events, mut inbound, _link) = super::super::tests::test_actor();
+        actor.hub.listening = true;
+        actor.hub.settings.link_idle_timeout = Duration::from_secs(120);
+        actor.hub.settings.anti_entropy_period = Some(Duration::from_secs(3600));
+        actor.hub.base_period = Duration::from_secs(3600);
+        actor.hub.round_period = Duration::from_secs(3600);
+        let clock = crate::clock::ManualClock::new(1_900_000_000_000);
+        actor.clock = std::sync::Arc::new(clock.clone());
+        actor.start_listening(&[]);
+        let (answers, silent) = (
+            Identity::generate().expect("identity"),
+            Identity::generate().expect("identity"),
+        );
+        let mut far = Vec::new();
+        for member in [&answers, &silent] {
+            let (mine, theirs) = memory::pair("mem", "member", "hub", None, None);
+            actor.accept_link(mine);
+            let id = *actor.hub.accepted.keys().max().expect("accepted");
+            actor.bind_link(id, member.peer_id());
+            far.push(theirs);
+        }
+        actor.on_loop_wake(None);
+        let start = Instant::now();
+        assert_eq!(
+            actor.housekeeping_due(start, actor.now()),
+            Some(start + Duration::from_secs(120)),
+            "the idle verdicts are the loop's next deadline"
+        );
+
+        // Frozen for 200 s: both clocks move at once, then the loop wakes 80 s late.
+        clock.advance(200_000);
+        tokio::time::advance(Duration::from_secs(200)).await;
+        actor.on_loop_wake(Some(start + Duration::from_secs(120)));
+        actor.on_listen_tick();
+        assert_eq!(actor.counters.late_wakes, 1);
+        assert_eq!(
+            actor.hub.counters.links_silent, 0,
+            "nobody dropped at the wake"
+        );
+        assert_eq!(actor.hub.counters.wake_probes, 2, "each member probed");
+        assert_eq!(actor.hub.accepted.len(), 2);
+        for (theirs, member) in far.iter_mut().zip([&answers, &silent]) {
+            let mut pinged = false;
+            while let Ok(Some(frame)) =
+                tokio::time::timeout(Duration::from_millis(1), theirs.receiver.recv()).await
+            {
+                let env = envelope::decode_frame(&frame).expect("a frame");
+                pinged |= env.get("kind").and_then(Value::as_str) == Some(KIND_PING)
+                    && env.get("to").and_then(Value::as_str) == Some(member.peer_id());
+            }
+            assert!(pinged, "a PING addressed to the member");
+        }
+
+        // One member answers within the window; the other stays silent.
+        let stamp = format!("{}:1:{}", actor.now() + 1, answers.peer_id());
+        let env = envelope::envelope(
+            &actor.group,
+            KIND_ACK,
+            answers.peer_id(),
+            &stamp,
+            &bodies::ack_body(1),
+            Some(&actor.peer_id.clone()),
+        );
+        far[0]
+            .sender
+            .send(envelope::encode_frame(&env, &answers))
+            .await
+            .expect("the link is up");
+        let message = inbound.recv().await.expect("the reader forwards it");
+        actor.on_inbound(message);
+        clock.advance(2_000);
+        tokio::time::advance(super::super::seed_watch::SEED_ANSWER).await;
+        actor.on_loop_wake(actor.hub.next_tick);
+        actor.on_listen_tick();
+        assert_eq!(
+            actor.hub.counters.links_silent, 1,
+            "the silent member, after the window"
+        );
+        assert!(
+            actor.hub.routes.contains_key(answers.peer_id()),
+            "the member that answered"
+        );
+        assert!(!actor.hub.routes.contains_key(silent.peer_id()));
+        assert_eq!(actor.counters.late_wakes, 1, "one freeze, one wake");
+    }
+
+    /// A lone listening peer's rounds stretch to 32 times the period: nobody to round with is
+    /// nothing moving.
+    #[tokio::test(start_paused = true)]
+    async fn a_lone_listening_peer_stretches_its_rounds() {
+        let (mut actor, ..) = super::super::tests::test_actor();
+        actor.hub.listening = true;
+        actor.hub.settings.anti_entropy_period = Some(Duration::from_secs(1));
+        actor.start_listening(&[]);
+        for _ in 0..8 {
+            let at = actor.hub.next_round.expect("armed");
+            tokio::time::advance(at.saturating_duration_since(Instant::now())).await;
+            actor.on_listen_tick();
+        }
+        assert_eq!(actor.hub.round_period, Duration::from_secs(32));
+        // The first activity asks for a round at once; the next ones do not.
+        let now = Instant::now();
+        actor.note_hub_activity();
+        assert_eq!(actor.hub.next_round, Some(now));
+        assert_eq!(actor.hub.next_tick, Some(now));
+        actor.on_listen_tick();
+        assert_eq!(
+            actor.hub.round_period,
+            Duration::from_secs(1),
+            "back to the base"
         );
     }
 

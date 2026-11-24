@@ -250,12 +250,12 @@ The keystore directory is created 0700 and `peer.key` 0600. A private key its gr
 - **HTTP:** standard output carries only the one `{"mcp": ...}` line.
 - **Logging levels:** `-v` and `-vv` add detail on standard error. `-q` leaves errors only.
 
-The gateway stops with exit 0 on SIGINT, SIGTERM, SIGHUP, or SIGQUIT, or when the stdio client closes standard input. It first ends every call still waiting: each one answers a tool error saying the gateway stopped, and its input stays leased for a late worker. A peer that gives up redialing its seeds stops the gateway with exit 1, so a supervisor restarts it.
+The gateway stops with exit 0 on SIGINT, SIGTERM, SIGHUP, or SIGQUIT, or when the stdio client closes standard input. It first ends every call still waiting: each one answers a tool error saying the gateway stopped, and its input stays leased for a late worker. The peer never gives up redialing its seeds: a lost seed is redialed until the gateway stops, and a whole reconnect window without a link is noted on standard error.
 
 | Exit | When |
 |---|---|
 | 0 | Stopped by a signal, or the client left. |
-| 1 | An error. Examples: the join failed, the peer gave up redialing, a token or policy file couldn't be read. |
+| 1 | An error. Examples: the join failed, a token or policy file couldn't be read. |
 | 2 | Refused: HTTP without a verifier, malformed options, a malformed token or policy file, or a JWT verifier that can't be built. |
 | 4 | A token file its group or others can read, a policy or key set file they can write, or a readable private key. |
 

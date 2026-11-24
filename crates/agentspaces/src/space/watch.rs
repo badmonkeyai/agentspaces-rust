@@ -49,7 +49,8 @@ use crate::clock::SharedClock;
 pub enum CloseReason {
     /// Its owner closed it (or dropped the [`SpaceEvents`]).
     Closed,
-    /// Its lease lapsed on the peer's clock before a renewal ([`Subscription`]).
+    /// Its lease lapsed before a renewal ([`Subscription`]), judged on the peer clock's local
+    /// base ([`crate::clock::Clock::local_ms`]).
     Lapsed,
     /// The peer closed.
     PeerClosed,
@@ -68,7 +69,9 @@ pub(crate) struct WatchQueue {
     state: Mutex<QueueState>,
     capacity: usize,
     dropped: AtomicU64,
-    /// When the watch lapses, epoch milliseconds on the peer's clock; `i64::MAX` for none.
+    /// When the watch lapses, milliseconds on the peer clock's local base
+    /// ([`crate::clock::Clock::local_ms`], monotonic on the system clock: a subscription's lease
+    /// is a local period, SPEC v0.1.36 §9.5); `i64::MAX` for none.
     expires_at: AtomicI64,
 }
 
@@ -130,13 +133,19 @@ impl WatchQueue {
         self.lock().closed
     }
 
-    /// Whether the watch's lease has lapsed at `now_ms`.
+    /// When the watch's lease lapses (on the local base); a renewal only moves it later.
+    pub(crate) fn expires_at(&self) -> i64 {
+        self.expires_at.load(Ordering::SeqCst)
+    }
+
+    /// Whether the watch's lease has lapsed at `now_ms` (on the local base).
     pub(crate) fn lapsed(&self, now_ms: i64) -> bool {
         self.expires_at.load(Ordering::SeqCst) <= now_ms
     }
 
     /// Moves the lapse to `expires_at` unless that is earlier than it already is (a renewal
-    /// never shortens a lease, SPEC §7.2), unless the watch has ended or lapsed at `now_ms`. The
+    /// never shortens a lease, SPEC §7.2), unless the watch has ended or lapsed at `now_ms` (both
+    /// on the local base). The
     /// read and the write are one step under the queue's lock, so two renewals at once cannot
     /// leave the shorter one in force.
     fn renew(&self, expires_at: i64, now_ms: i64) -> bool {
@@ -233,8 +242,10 @@ impl Drop for SpaceEvents {
 
 /// A leased push subscription ([`Space::notify`](crate::space::Space::notify), Java
 /// `Space.notify` and `Subscription`): its handler runs on a task of its own for each matching
-/// event, until the lease lapses on the peer's clock, the subscription is closed, or the peer
-/// closes. [`Subscription::renew`] extends the lease from now.
+/// event, until the lease lapses, the subscription is closed, or the peer closes.
+/// [`Subscription::renew`] extends the lease from now. The lease is a local period, judged on the
+/// peer clock's monotonic base ([`crate::clock::Clock::local_ms`]), so a laptop sleep or a wall
+/// step lapses no subscription (SPEC v0.1.36 §9.5).
 ///
 /// Dropping the handle does not end the subscription: its lease does, so a subscription that
 /// outlives its owner never leaks (`space.py`'s `notify`). Delivery is the watch's ([module
@@ -256,7 +267,7 @@ impl Subscription {
     /// [`SpaceError::SubscriptionClosed`] when it has already lapsed or been closed (Java
     /// `Subscription.renew`).
     pub fn renew(&self, lease: Lease) -> Result<(), SpaceError> {
-        let now = self.clock.now_ms();
+        let now = self.clock.local_ms();
         let expires_at = now.saturating_add(lease.millis());
         if self.queue.renew(expires_at, now) {
             Ok(())
@@ -265,9 +276,16 @@ impl Subscription {
         }
     }
 
-    /// When the subscription's lease lapses, epoch milliseconds on the peer's clock.
+    /// When the subscription's lease lapses, epoch milliseconds on the peer's clock as it reads
+    /// now (the lease runs on the local base: after a wall step this moves with the step).
     pub fn expires_at_millis(&self) -> i64 {
-        self.queue.expires_at.load(Ordering::SeqCst)
+        let local = self.queue.expires_at.load(Ordering::SeqCst);
+        if local == i64::MAX {
+            return i64::MAX;
+        }
+        self.clock
+            .now_ms()
+            .saturating_add(local.saturating_sub(self.clock.local_ms()))
     }
 
     /// Ends the subscription at once; events still queued are not delivered. Idempotent.
@@ -275,8 +293,8 @@ impl Subscription {
         self.queue.close(CloseReason::Closed);
     }
 
-    /// Whether the subscription still delivers. A lapse is noticed by the peer's sweep (four
-    /// times a second while anything watches), so this reads `true` for a moment after it.
+    /// Whether the subscription still delivers. A lapse is noticed by the peer's sweep, which
+    /// runs at the earliest lapse it tells, so this reads `true` for a moment after it.
     pub fn is_open(&self) -> bool {
         self.queue.closed().is_none() && !self.task.is_finished()
     }

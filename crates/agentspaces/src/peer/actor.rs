@@ -28,7 +28,10 @@
 mod audit;
 mod horizon;
 mod probes;
+mod redial;
+pub(super) use redial::DialCounts;
 mod rounds;
+mod seed_watch;
 mod serve;
 mod space_ops;
 
@@ -72,6 +75,7 @@ use super::blocks::{
 use super::listen::{self, BoundListener, ListenConfig};
 use super::members::MemberView;
 use super::spaces::{Spaces, space_name};
+use super::watchdog::LoopBeat;
 use super::{
     DEFAULT_AGENT_NAME, FilterCounters, GROUP_AD_WANT_INTERVAL, LinkInfo, PeerCounters, PeerError,
     PeerEvent,
@@ -79,10 +83,25 @@ use super::{
 use crate::clock::SharedClock;
 use crate::transport::{Channel, Closer, Dialer, FrameReceiver, FrameSender, TransportError};
 use serve::{Hub, Via};
-use space_ops::{COLLECT_INTERVAL, Deferred, SWEEP_INTERVAL, Watcher};
+use space_ops::{COLLECT_INTERVAL, Deferred, Watcher};
 
 /// A call queued by a [`Peer`](super::Peer) handle: it runs on the actor and replies itself.
 pub(super) type Job = Box<dyn FnOnce(&mut Actor) + Send>;
+
+/// What woke the loop for one turn.
+enum Wake {
+    Job(Job),
+    Inbound(Inbound),
+    ReLease,
+    Want,
+    Sweep,
+    Collect,
+    Housekeeping,
+    DialRound,
+    SeedCheck,
+    DisplacedPull,
+    Nudged,
+}
 
 /// How many handle calls may wait for the actor.
 pub(super) const JOB_QUEUE: usize = 64;
@@ -119,9 +138,26 @@ const MAX_SERVED_BLOCKS: usize = 4096;
 const MAX_RELAYS: usize = 1024;
 /// The (card id, size) pairs a peer remembers warning about before it forgets them all.
 const MAX_WARNED_CARDS: usize = 1024;
-/// Java's default member TTL (`GroupMembership.Config.defaults().memberTtl`): a member not
-/// heard from for this long is dropped from a Java node's view.
-const MEMBER_TTL: Duration = Duration::from_secs(30);
+/// The keepalive bound every Java member keeps (`GroupMembership.KEEPALIVE_TTL`, SPEC v0.1.36
+/// §5.2, *The member TTL*): the TTL a released 0.6.0 Java member judges this peer by (a 0.7.0
+/// member judges by 45 s or more), so this peer keeps its own keepalive, the re-lease of its
+/// self-advertisement, inside it. It is no TTL this peer judges others by: it drops nobody for
+/// silence (its views follow advertisement expiry).
+const KEEPALIVE_TTL: Duration = Duration::from_secs(30);
+/// A change of more than this in (wall − monotonic) time between two turns of the loop is a
+/// wall-clock step (an NTP step either way, or a suspend, which the monotonic clock does not
+/// count): the wall-anchored deadlines are asked again (SPEC v0.1.36 §9.5).
+const WALL_STEP: Duration = Duration::from_secs(1);
+/// A wake of the loop this much past its armed deadline, with no wall-clock step, is a late
+/// wake (owner decision 3 of 2026-11-23, the same in every implementation): a frozen process
+/// (SIGSTOP, a long collection or VM pause) whose monotonic clock counted the freeze. The
+/// members judged this peer by the time that passed, so it is a wake as a suspend is.
+pub(super) const LATE_WAKE: Duration = Duration::from_secs(30);
+/// How long after a wake a dial-only peer keeps a member whose card lapsed during the absence in
+/// its view (counted as lacking the horizon hint, the cautious side) while it re-pulls the view
+/// ([`Actor::reprobe_view`]): 1.5 times the 2 s answer window plus the widest first redial step
+/// (5.5 s), as every client.
+const VIEW_REPROBE_WAIT: Duration = Duration::from_millis(11_250);
 /// Java's default probe period (`GroupMembership.Config.defaults().probeInterval`), and how far a
 /// quiet group stretches it (`GroupMembership.MAX_QUIET_STRETCH`, a factor of 4).
 const PROBE_INTERVAL: Duration = Duration::from_secs(1);
@@ -277,7 +313,7 @@ impl Settings {
 /// How often the self-advertisement is re-leased in a group of `members` other members, as Java's
 /// `PeerNode.refreshIntervalMillis` refreshes its own: the configured `interval`, unless the
 /// group's probe cycle (one member per [`PROBE_INTERVAL`], stretched [`QUIET_STRETCH`] times
-/// when quiet) has outgrown the [`MEMBER_TTL`]. Past that size the probes cannot reach every
+/// when quiet) has outgrown the [`KEEPALIVE_TTL`]. Past that size the probes cannot reach every
 /// member inside the TTL, so the re-lease is the keepalive and runs at half the TTL at most,
 /// leaving a whole interval of margin before a Java seed expires this peer.
 fn re_lease_period(interval: Duration, members: usize) -> Duration {
@@ -286,10 +322,10 @@ fn re_lease_period(interval: Duration, members: usize) -> Duration {
         .and_then(|count| PROBE_INTERVAL.checked_mul(count))
         .and_then(|cycle| cycle.checked_mul(QUIET_STRETCH))
         .unwrap_or(Duration::MAX);
-    if cycle < MEMBER_TTL {
+    if cycle < KEEPALIVE_TTL {
         interval
     } else {
-        interval.min(MEMBER_TTL / 2)
+        interval.min(KEEPALIVE_TTL / 2)
     }
 }
 
@@ -317,6 +353,11 @@ pub(super) struct Start {
     pub listeners: Vec<BoundListener>,
     /// The spaces a listening peer replicates from the start.
     pub replicate: Vec<String>,
+    /// What the seed dials counted, from the join's first dial on ([`redial::DialCounts`]).
+    pub dial_counts: Arc<redial::DialCounts>,
+    /// Counts the wakes the loop saw (wall-clock steps and late wakes), so a held take re-checks
+    /// its hold at once ([`crate::agent::TakeContext::keepalive`]).
+    pub wakes: watch::Sender<u64>,
 }
 
 /// What a link's reader and pump and the redial task tell the actor.
@@ -345,8 +386,8 @@ pub(super) enum Inbound {
         seed: Seed,
         attempt: u64,
     },
-    /// Redial `attempt` ran out of its window.
-    GaveUp { attempt: u64 },
+    /// Redial `attempt` went a whole reconnect window without a link; it goes on redialing.
+    WindowLapsed { attempt: u64 },
     /// A listener accepted a channel.
     Accepted { channel: Box<Channel> },
 }
@@ -432,6 +473,9 @@ struct Link {
     up_at: Instant,
     /// When a verified frame last arrived on it (an accepted link's idle timer).
     heard_at: Instant,
+    /// When its reader last read a frame off the transport (the dialed link's dead-seed rule,
+    /// [`seed_watch`]).
+    heard: Arc<seed_watch::Heard>,
     /// The member that introduced itself on it (an accepted link's owner, SPEC §5.2).
     owner: Option<String>,
     /// Frames a stranger sent on it before any member introduced itself (an accepted link).
@@ -468,6 +512,8 @@ struct Relay {
 
 /// The state of one peer. See the [module docs](self).
 pub(super) struct Actor {
+    /// This loop's heartbeat, read by the process's watchdog ([`super::watchdog`]).
+    beat: Arc<LoopBeat>,
     identity: Arc<Identity>,
     peer_id: String,
     group: String,
@@ -491,6 +537,8 @@ pub(super) struct Actor {
     current_seed: Option<Seed>,
     redial: Option<Redial>,
     redial_attempts: u64,
+    /// The position in the redial table ([`redial`]), lent to the redial in flight.
+    redial_table: redial::RedialTable,
     /// When the peer lost its last link that carried a verified frame; `None` while the current
     /// link has carried one. The reconnect window runs from here, so links a seed accepts and
     /// drops without a word do not restart it.
@@ -525,6 +573,8 @@ pub(super) struct Actor {
     inbound_tx: mpsc::Sender<Inbound>,
     /// The fold counter waiting reads and takes watch.
     folds: watch::Sender<u64>,
+    /// The wakes seen ([`Start::wakes`]).
+    wakes: watch::Sender<u64>,
     /// When each space was last pulled for the space verbs (its first use and the paced pulls
     /// of waiting reads and takes).
     last_pull: HashMap<String, Instant>,
@@ -534,6 +584,15 @@ pub(super) struct Actor {
     watchers: Vec<Watcher>,
     /// When the watch sweep last ran.
     last_sweep: Instant,
+    /// When the watch sweep next has a lapse to tell (epoch milliseconds, wall time): the
+    /// earliest write or claim lease of a watched open entry, or a watch's own lapse.
+    sweep_due: Option<i64>,
+    /// The issue instants of this peer's cards and self-advertisement (SPEC v0.1.36 §9.5).
+    issues: super::issue::IssueClock,
+    /// The monotonic instant the wall-step check measures from, and (wall − monotonic) as last
+    /// read, milliseconds.
+    clock_base: Instant,
+    wall_offset: Option<i64>,
     /// When the spaces' collection (SPEC §7.3) last ran.
     last_collect: Instant,
     /// Transitions waiting for their payload's block.
@@ -548,13 +607,29 @@ pub(super) struct Actor {
     horizon_view: horizon::HorizonView,
     /// A dial-only peer's periodic rounds toward its seed ([`rounds`]).
     dial_rounds: rounds::DialRounds,
+    /// The dead-seed rule's state ([`seed_watch`]).
+    seed_watch: seed_watch::SeedWatch,
+    /// What the seed dials counted ([`redial::DialCounts`]), shared with the redial tasks.
+    dial_counts: Arc<redial::DialCounts>,
+    /// When the next targeted round toward a displaced holder is due, if any line is held
+    /// ([`Actor::run_displaced_pulls`]).
+    displaced_pull_due: Option<Instant>,
+    /// When the last late wake was answered: one freeze is one wake, however many of the loop's
+    /// and the watchdog's signals report it ([`Actor::check_late_wake`]).
+    last_late_wake: Option<Instant>,
+    /// Until when a dial-only peer re-probes its view after a wake ([`Actor::reprobe_view`]):
+    /// the wall time when it went quiet, and the monotonic end of the wait.
+    view_reprobe: Option<(i64, Instant)>,
 }
 
 /// Starts an actor, on `dialed` (a channel dialed to a seed) when there is one, and returns its
 /// job queue. The actor sends its first frames at once: the GROUP_AD_WANT of a join by id, else
 /// the introduction and the revocation pull. A listening peer starts accepting links on its
 /// listeners; one whose seeds did not answer at start redials them in the background.
-pub(super) fn spawn(mut start: Start, dialed: Option<(Channel, Seed)>) -> mpsc::Sender<Job> {
+pub(super) fn spawn(
+    mut start: Start,
+    dialed: Option<(Channel, Seed)>,
+) -> (mpsc::Sender<Job>, Arc<LoopBeat>) {
     let (jobs_tx, jobs_rx) = mpsc::channel(JOB_QUEUE);
     let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE);
     let listeners = std::mem::take(&mut start.listeners);
@@ -579,16 +654,17 @@ pub(super) fn spawn(mut start: Start, dialed: Option<(Channel, Seed)>) -> mpsc::
             // A listening peer whose seeds did not answer: it serves its own links meanwhile.
             let now = Instant::now();
             actor.outage_since = Some(now);
-            actor.start_redial(
-                now.checked_add(actor.settings.reconnect_window),
-                actor.settings.reconnect_interval,
-            );
+            let pause = actor
+                .redial_table
+                .next_wait(actor.settings.reconnect_interval);
+            actor.start_redial(now.checked_add(actor.settings.reconnect_window), pause);
         }
         None => {}
     }
     actor.start_listening(&replicate);
+    let beat = Arc::clone(&actor.beat);
     tokio::spawn(actor.run(jobs_rx, inbound_rx));
-    jobs_tx
+    (jobs_tx, beat)
 }
 
 impl Actor {
@@ -615,6 +691,7 @@ impl Actor {
             registry.set_founder(start.founding.as_ref().and_then(founder_of));
         }
         Self {
+            beat: LoopBeat::register(peer_id.clone()),
             hlc: start.hlc,
             identity: Arc::new(start.identity),
             spaces: Spaces::new(&start.group, settings.space_max_entries),
@@ -638,6 +715,7 @@ impl Actor {
             current_seed: None,
             redial: None,
             redial_attempts: 0,
+            redial_table: redial::RedialTable::default(),
             outage_since: None,
             pulled_spaces: BTreeSet::new(),
             pulled_ads: false,
@@ -660,16 +738,26 @@ impl Actor {
             link_watch: start.link_watch,
             inbound_tx,
             folds: start.folds,
+            wakes: start.wakes,
             last_pull: HashMap::new(),
             agents: HashMap::new(),
             watchers: Vec::new(),
             last_sweep: Instant::now(),
+            sweep_due: None,
+            issues: super::issue::IssueClock::default(),
+            clock_base: Instant::now(),
+            wall_offset: None,
             last_collect: Instant::now(),
             deferred: VecDeque::new(),
             warned_cards: HashSet::new(),
             audit: audit_state,
             horizon_view: horizon::HorizonView::default(),
             dial_rounds: rounds::DialRounds::default(),
+            seed_watch: seed_watch::SeedWatch::default(),
+            dial_counts: start.dial_counts,
+            displaced_pull_due: None,
+            last_late_wake: None,
+            view_reprobe: None,
             hub,
             peer_id,
         }
@@ -683,13 +771,9 @@ impl Actor {
             // pending re-lease at once.
             let period = re_lease_period(self.settings.peer_ad_interval, self.members.len());
             let lease_at = self.last_lease.checked_add(period);
-            // The watch sweep runs only while something watches; the collection while a space
-            // is open, watched or not.
-            let sweep_at = if self.watching() {
-                self.last_sweep.checked_add(SWEEP_INTERVAL)
-            } else {
-                None
-            };
+            // The watch sweep runs only while something watches, when its earliest lapse falls
+            // due; the collection while a space is open, watched or not.
+            let sweep_at = self.sweep_at();
             let collect_at = if self.spaces.is_empty() {
                 None
             } else {
@@ -697,21 +781,227 @@ impl Actor {
             };
             let tick_at = self.hub.next_tick;
             let round_at = self.dial_rounds.due();
-            tokio::select! {
+            let seed_at = self.seed_check_at();
+            let pull_at = self.displaced_pull_due;
+            let armed = [
+                lease_at, want_at, sweep_at, collect_at, tick_at, round_at, seed_at, pull_at,
+            ]
+            .into_iter()
+            .flatten()
+            .min();
+            let slept_from = Instant::now();
+            self.beat
+                .arm(armed.map(|at| at.saturating_duration_since(slept_from)));
+            let beat = Arc::clone(&self.beat);
+            let wake = tokio::select! {
                 job = jobs.recv() => match job {
-                    Some(job) => job(&mut self),
+                    Some(job) => Wake::Job(job),
                     None => break,
                 },
-                Some(message) = inbound.recv() => self.on_inbound(message),
-                () = wake_at(lease_at) => self.on_re_lease(),
-                () = wake_at(want_at) => self.on_want_tick(),
-                () = wake_at(sweep_at) => self.on_sweep(),
-                () = wake_at(collect_at) => self.on_collect(),
-                () = wake_at(tick_at) => self.on_listen_tick(),
-                () = wake_at(round_at) => self.on_dial_round(),
+                Some(message) = inbound.recv() => Wake::Inbound(message),
+                () = wake_at(lease_at) => Wake::ReLease,
+                () = wake_at(want_at) => Wake::Want,
+                () = wake_at(sweep_at) => Wake::Sweep,
+                () = wake_at(collect_at) => Wake::Collect,
+                () = wake_at(tick_at) => Wake::Housekeeping,
+                () = wake_at(round_at) => Wake::DialRound,
+                () = wake_at(seed_at) => Wake::SeedCheck,
+                () = wake_at(pull_at) => Wake::DisplacedPull,
+                // The watchdog found this loop idle past its deadline: the next turn recomputes
+                // every deadline, and an overdue one fires at once.
+                () = beat.nudged() => Wake::Nudged,
+            };
+            // Before the turn runs what woke it: a wake (a wall step, or a late wake of a frozen
+            // process) re-asks the seed and re-probes the members first, so no deadline that
+            // fell due during a freeze judges anyone by the time the freeze took.
+            // A deadline already past when the wait began (a wall-anchored one, say) fires at
+            // once: its lateness counts from the wait's start.
+            self.on_loop_wake(armed.map(|at| at.max(slept_from)));
+            self.turn(wake);
+        }
+        self.beat.end(false);
+        self.close();
+    }
+
+    /// One turn of the loop: what woke it, run with its heartbeat published, and a panic in it
+    /// contained (logged by the panic hook, counted, and the loop goes on: the reference
+    /// implementation's contained participant throw; three in ten minutes read DOWN).
+    fn turn(&mut self, wake: Wake) {
+        self.beat.start_turn();
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| match wake {
+            Wake::Job(job) => job(self),
+            Wake::Inbound(message) => self.on_inbound(message),
+            Wake::ReLease => self.on_re_lease(),
+            Wake::Want => self.on_want_tick(),
+            Wake::Sweep => self.on_sweep(),
+            Wake::Collect => self.on_collect(),
+            Wake::Housekeeping => self.on_listen_tick(),
+            Wake::DialRound => self.on_dial_round(),
+            Wake::SeedCheck => self.on_seed_check(),
+            Wake::DisplacedPull => self.run_displaced_pulls(),
+            Wake::Nudged => {}
+        }));
+        self.beat.end_turn();
+        if outcome.is_err() {
+            let down = self.beat.note_panic();
+            tracing::error!(
+                peer = %self.peer_id,
+                down,
+                "agentspaces: a turn of the peer's loop panicked; contained, the loop goes on"
+            );
+        }
+    }
+
+    /// Milliseconds on this peer's monotonic clock (from its start, offset so it is never 0):
+    /// the time base of local periods that no wire value is compared with, such as the audit's
+    /// session, descent, and fetch timeouts (SPEC v0.1.36 §9.5: local periods on a monotonic
+    /// clock, so a wall step neither cuts them short nor stretches them).
+    fn local_ms(&self) -> i64 {
+        let since = Instant::now().saturating_duration_since(self.clock_base);
+        i64::try_from(since.as_millis())
+            .unwrap_or(i64::MAX)
+            .saturating_add(1_000)
+    }
+
+    /// What the loop checks each time it wakes, before the turn: a wall-clock step
+    /// ([`Actor::check_wall_step`]) and, with none, a late wake against `armed`, the deadline
+    /// it slept toward ([`Actor::check_late_wake`]).
+    pub(super) fn on_loop_wake(&mut self, armed: Option<Instant>) {
+        if !self.check_wall_step() {
+            self.check_late_wake(armed);
+        }
+    }
+
+    /// A late wake (owner decision 3 of 2026-11-23): the loop woke more than [`LATE_WAKE`] past
+    /// `armed`, the deadline it slept toward, or the process's watchdog found its own tick that
+    /// late ([`LoopBeat::take_late_wake`]), with no wall-clock step: a frozen process (SIGSTOP,
+    /// a long collection or VM pause), whose monotonic clock counted the freeze. It is a wake:
+    /// the seed is PINGed again with a fresh answer window (the one a PING had before the freeze
+    /// ran out while nobody could read the answer), held takes re-check at once, and a listening
+    /// peer probes the members it would otherwise drop for the silence the freeze made
+    /// ([`Actor::reprobe_after_freeze`]). One freeze is one wake.
+    fn check_late_wake(&mut self, armed: Option<Instant>) {
+        let now = Instant::now();
+        let by_deadline =
+            armed.map_or(Duration::ZERO, |armed| now.saturating_duration_since(armed));
+        let late = by_deadline.max(self.beat.take_late_wake());
+        if late <= LATE_WAKE
+            || self
+                .last_late_wake
+                .is_some_and(|at| now.saturating_duration_since(at) < LATE_WAKE)
+        {
+            return;
+        }
+        self.last_late_wake = Some(now);
+        bump(&mut self.counters.late_wakes);
+        self.wakes
+            .send_modify(|wakes| *wakes = wakes.wrapping_add(1));
+        self.lower_housekeeping(now);
+        if self.closed || self.joining {
+            return;
+        }
+        tracing::info!(
+            peer = %self.peer_id,
+            late_ms = u64::try_from(late.as_millis()).unwrap_or(u64::MAX),
+            "agentspaces: the loop woke late with no wall-clock step (a frozen process?); \
+             re-asking the seed and re-probing the members"
+        );
+        self.reprobe_after_freeze(now);
+        self.resume(
+            now,
+            true,
+            i64::try_from(late.as_millis()).unwrap_or(i64::MAX),
+        );
+    }
+
+    /// Reads (wall − monotonic) time and, when it moved by more than [`WALL_STEP`] since the
+    /// last turn, takes it as a wall-clock step ([`Actor::on_wall_step`]); answers whether it
+    /// did. Local periods run on the monotonic clock and never step; stamps, leases, and
+    /// expiries stay on wall time.
+    fn check_wall_step(&mut self) -> bool {
+        let mono = i64::try_from(
+            Instant::now()
+                .saturating_duration_since(self.clock_base)
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX);
+        let offset = self.now().saturating_sub(mono);
+        let last = self.wall_offset.replace(offset);
+        if let Some(last) = last {
+            let step = offset.saturating_sub(last);
+            if step.unsigned_abs() > u64::try_from(WALL_STEP.as_millis()).unwrap_or(u64::MAX) {
+                self.on_wall_step(step);
+                return true;
             }
         }
-        self.close();
+        false
+    }
+
+    /// A wall-clock step of `step` milliseconds (SPEC v0.1.36 §9.5). The deadlines anchored to
+    /// wall time (the watch sweep's lapses, a lapsed member on a listening peer) are asked again
+    /// at once;
+    /// a forward step longer than the [`KEEPALIVE_TTL`], such as a suspend, is a resume: the
+    /// members judged this peer by the wall time that passed, so it re-introduces itself at once
+    /// (its self-advertisement to the seed and to every member it holds a link to) and asks for a
+    /// round, instead of waiting out its re-lease (the reference implementation sends its self
+    /// advertisement to every member and probes each once; this peer runs no prober).
+    fn on_wall_step(&mut self, step: i64) {
+        bump(&mut self.counters.wall_steps);
+        // Every held take re-checks its wall-time lease now (owner decision 5 of 2026-11-23).
+        self.wakes
+            .send_modify(|wakes| *wakes = wakes.wrapping_add(1));
+        let now = Instant::now();
+        self.lower_housekeeping(now);
+        self.sweep_after_wall_step();
+        let keepalive = i64::try_from(KEEPALIVE_TTL.as_millis()).unwrap_or(i64::MAX);
+        if step <= keepalive || self.closed || self.joining {
+            return;
+        }
+        tracing::info!(
+            peer = %self.peer_id,
+            step_ms = step,
+            "agentspaces: the wall clock stepped forward past the keepalive (a suspend?); re-introducing"
+        );
+        self.resume(now, false, step);
+    }
+
+    /// A wake, from a suspend (a wall step) or a freeze (a late wake): this peer re-introduces
+    /// itself, starts the redial table over, asks its seed under the wake rule (or redials at
+    /// once with no link), and asks for its rounds now. `fresh_ping`: the PING already waiting,
+    /// if any, is not adopted but sent again with a fresh answer window (a freeze ran its window
+    /// out on the monotonic clock while nobody could read the answer; a suspend did not).
+    fn resume(&mut self, now: Instant, fresh_ping: bool, away_ms: i64) {
+        bump(&mut self.counters.resumes);
+        self.reprobe_view(now, away_ms);
+        if self.link.is_some() || self.hub.listening {
+            self.introduce();
+            self.flush_outbox();
+        }
+        // A wake starts the redial table over, whether or not the peer is linked now.
+        self.redial_table.reset();
+        if self.link.is_some() {
+            // The link may have died while the host slept, with no FIN to tell: ask the seed now,
+            // so a dead one is left within the answer window ([`seed_watch`]).
+            if fresh_ping {
+                self.seed_watch.reset();
+            }
+            let asked = self.counters.seed_pings;
+            self.ask_seed();
+            if self.counters.seed_pings > asked {
+                bump(&mut self.counters.wake_pings);
+            }
+            // The PING in force (sent now, or already waiting) is the wake's: no answer within
+            // the ping timeout fails over at once, however young the link.
+            self.seed_watch.woke = self.seed_asked();
+        } else if self.redial.is_some() {
+            // A redial pausing between rounds (on the monotonic clock, which did not count the
+            // sleep) dials again now rather than sitting out what is left of its pause.
+            self.redial_now();
+        }
+        self.dial_rounds.note_activity();
+        self.dial_rounds.bring_forward(now);
+        self.note_hub_activity();
+        self.bring_round_forward(now);
     }
 
     /// Merges a remote stamp into this peer's clock ([`Hlc::observe`]): only an acceptable stamp
@@ -770,6 +1060,7 @@ impl Actor {
         let info = link.info.clone();
         tracing::debug!(peer = %self.peer_id, remote = %info.remote, "agentspaces: link up");
         self.link = Some(link);
+        self.seed_watch.reset();
         self.current_seed = Some(seed);
         self.link_watch.send_replace(Some(info.clone()));
         self.emit(PeerEvent::Connected(info));
@@ -805,6 +1096,7 @@ impl Actor {
                 dropped: Arc::clone(&self.send_dropped),
             },
         ));
+        let heard = seed_watch::Heard::new(receiver.progress());
         let (own, shared_budget) = if accepted {
             (
                 ACCEPTED_LINK_BUDGET_BYTES,
@@ -823,6 +1115,7 @@ impl Actor {
                 own_bytes: own,
                 shared: shared_budget,
             },
+            Arc::clone(&heard),
         ));
         let now = Instant::now();
         Link {
@@ -837,6 +1130,7 @@ impl Actor {
             hello_sent: false,
             up_at: now,
             heard_at: now,
+            heard,
             owner: None,
             strangers: 0,
             backlog: VecDeque::new(),
@@ -868,15 +1162,25 @@ impl Actor {
 
     /// Drops the current link and, unless the peer is closed, starts redialing.
     ///
-    /// Dial rounds start at least [`Settings::reconnect_interval`] apart, also when a dial
-    /// succeeds and the link is lost at once (a `tls` seed dialed over `tcp` accepts the
-    /// connection and drops it): the first round after a loss waits until an interval has passed
-    /// since the lost link came up, so only a link that lived longer is redialed at once. The
-    /// reconnect window runs from the loss of the last link that carried a verified frame.
+    /// A link that held for a [`Settings::reconnect_interval`] (5 s by default) starts the redial
+    /// table over and is redialed at once. Any other link is a quick drop and counts as a failed
+    /// round: the redial first waits the next step of the redial table ([`redial`]). That covers a
+    /// seed that accepts each connection and drops it (a `tls` seed dialed over `tcp`) and one
+    /// that drops each link soon after speaking (an overloaded seed shedding links), so such a
+    /// seed is redialed on the table, never in a loop. Only the link's life counts, not what it
+    /// carried (owner decision 1 of 2026-11-23, the same rule in every client). The reconnect
+    /// window runs from the loss of the last link that carried a verified frame.
     fn lose_link(&mut self) {
+        self.lose_link_failing_over(false);
+    }
+
+    /// [`Actor::lose_link`]; `at_once` (the verdict on a wake's unanswered `PING`) redials at
+    /// once from the table's start however young the link was.
+    fn lose_link_failing_over(&mut self, at_once: bool) {
         let Some(link) = self.link.take() else {
             return;
         };
+        self.seed_watch.reset();
         self.disarm_dial_rounds();
         link.closer.close();
         if link.queue.shared.stalled.load(Ordering::SeqCst) {
@@ -893,32 +1197,38 @@ impl Actor {
         if !self.closed {
             let now = Instant::now();
             let since = *self.outage_since.get_or_insert(now);
-            let pause = link
-                .up_at
-                .checked_add(self.settings.reconnect_interval)
-                .map_or(Duration::ZERO, |due| due.saturating_duration_since(now));
+            let held = at_once
+                || now.saturating_duration_since(link.up_at) >= self.settings.reconnect_interval;
+            let pause = if held {
+                self.redial_table.reset();
+                Duration::ZERO
+            } else {
+                self.redial_table
+                    .next_wait(self.settings.reconnect_interval)
+            };
             self.start_redial(since.checked_add(self.settings.reconnect_window), pause);
         }
     }
 
-    /// The seeds to redial after a lost link: the one after the current first, the current one
-    /// last, so the failover goes to the next seed (`Peer._candidate_seeds`).
+    /// The seeds to redial after a lost link, in the order [`redial::dial_any`] starts them: the
+    /// seeds in list order with the one just lost moved last, so the failover goes to another
+    /// seed first (owner decision 2 of 2026-11-23, the same order in every client).
     fn candidate_seeds(&self) -> Vec<Seed> {
-        let position = self
-            .current_seed
-            .as_ref()
-            .and_then(|current| self.seeds.iter().position(|seed| seed == current));
-        match position {
-            Some(index) => {
-                let (head, tail) = self.seeds.split_at(index.saturating_add(1));
-                tail.iter().chain(head).cloned().collect()
-            }
-            None if self.seeds.is_empty() => self.current_seed.iter().cloned().collect(),
-            None => self.seeds.clone(),
+        match &self.current_seed {
+            Some(current) if self.seeds.contains(current) => self
+                .seeds
+                .iter()
+                .filter(|seed| *seed != current)
+                .chain(std::iter::once(current))
+                .cloned()
+                .collect(),
+            current if self.seeds.is_empty() => current.iter().cloned().collect(),
+            _ => self.seeds.clone(),
         }
     }
 
-    /// Starts a redial that waits `pause` before its first round and gives up at `deadline`.
+    /// Starts a redial that waits `pause` before its first round and says the peer is
+    /// unreachable at `deadline` (then once per window after), redialing on.
     fn start_redial(&mut self, deadline: Option<Instant>, pause: Duration) {
         if let Some(redial) = self.redial.take() {
             redial.task.abort();
@@ -935,9 +1245,25 @@ impl Actor {
                 attempt,
                 deadline,
                 pause,
+                table: self.redial_table.clone(),
+                counts: Arc::clone(&self.dial_counts),
             },
         ));
         self.redial = Some(Redial { attempt, task });
+    }
+
+    /// Restarts the redial in progress with no pause before its first round, keeping its
+    /// reconnect window (a wake from a suspend: [`Actor::on_wall_step`], which also starts the
+    /// redial table over).
+    fn redial_now(&mut self) {
+        if self.closed || self.link.is_some() || self.redial.is_none() {
+            return;
+        }
+        let since = *self.outage_since.get_or_insert_with(Instant::now);
+        self.start_redial(
+            since.checked_add(self.settings.reconnect_window),
+            Duration::ZERO,
+        );
     }
 
     fn on_inbound(&mut self, message: Inbound) {
@@ -950,8 +1276,9 @@ impl Actor {
                 shared,
             } => {
                 if self.is_current(link) {
-                    // A verified frame: the far end speaks the protocol, so the link is a
-                    // working one and a later loss starts a new reconnect window.
+                    // A verified frame: the far end speaks the protocol, so a later loss starts
+                    // a new reconnect window. The redial table starts over only if the link then
+                    // holds for an interval ([`Actor::lose_link`]).
                     self.outage_since = None;
                     bump(&mut self.counters.frames_received);
                     if self.handle(env, Some(auth), Via::Dialed).is_err() {
@@ -992,18 +1319,21 @@ impl Actor {
                 seed,
                 attempt,
             } => self.on_dialed(*channel, seed, attempt),
-            Inbound::GaveUp { attempt } => {
+            Inbound::WindowLapsed { attempt } => {
+                // The peer never gives up redialing (owner decision 3 of 2026-11-23, the lenient
+                // retries of SPEC §9.4): a whole window without a link is said, and a join
+                // waiting for its seed is answered, while the redial goes on.
                 if self
                     .redial
                     .as_ref()
                     .is_some_and(|redial| redial.attempt == attempt)
                 {
-                    self.redial = None;
-                    tracing::warn!(peer = %self.peer_id, "agentspaces: no working link within the reconnect window; giving up");
+                    bump(&mut self.counters.windows_lapsed);
+                    tracing::warn!(peer = %self.peer_id, "agentspaces: no working link within the reconnect window; still redialing");
                     for waiter in self.ready.drain(..) {
                         let _ = waiter.send(Err(PeerError::NotConnected));
                     }
-                    self.emit(PeerEvent::GaveUp);
+                    self.emit(PeerEvent::Unreachable);
                 }
             }
         }
@@ -1300,8 +1630,9 @@ impl Actor {
     /// This peer's signed self-advertisement as of `now` (SPEC §5.2): its resource hints and, on
     /// a listening peer, the endpoints of its listeners and the RELAY role (SPEC §5.4). A peer
     /// that advertises endpoints is dialed directly, so it names no `relay.via`.
-    fn self_ad_payload(&self, now: i64) -> Vec<u8> {
-        let issued = time::instant_iso(now.div_euclid(1000).saturating_mul(1000));
+    fn self_ad_payload(&mut self, now: i64) -> Vec<u8> {
+        let issued = self.self_ad_issue(now);
+        let issued = time::instant_iso(issued);
         let mut hints = self.resource_hints.clone();
         if !self.hub.endpoints.is_empty() {
             hints.remove("relay.via");
@@ -1317,6 +1648,24 @@ impl Actor {
             ad.insert("roles", Value::Array(vec![Value::from(serve::ROLE_RELAY)]));
         }
         wire_ads::signed_peer_ad(&ad, &self.identity)
+    }
+
+    /// The issue instant of this peer's self-advertisement at `now`: the whole second, unless the
+    /// last one was issued at or after it with other content (its hints, endpoints, or roles), then
+    /// a millisecond after that one, so a member keeping the newest copy takes the change (SPEC
+    /// v0.1.36 §9.5).
+    fn self_ad_issue(&mut self, now: i64) -> i64 {
+        let mut content = Map::new();
+        content.insert("resourceHints", Value::Map(self.resource_hints.clone()));
+        content.insert(
+            "endpoints",
+            Value::Array(self.hub.endpoints.iter().cloned().map(Value::Map).collect()),
+        );
+        content.insert("listening", self.hub.listening);
+        let fingerprint = crypto::port().sha256(&cbor::encode(&Value::Map(content)));
+        let whole = now.div_euclid(1000).saturating_mul(1000);
+        let id = format!("peer:{}", self.peer_id);
+        self.issues.next(&id, whole, fingerprint)
     }
 
     /// On a link the transport attested, announces once that this peer accepts channel-attested
@@ -1511,8 +1860,25 @@ impl Actor {
             KIND_GROUP_AD => self.on_group_ad(&body)?,
             KIND_RUMOR => self.on_rumor(bodies::parse_rumor(&body).ok_or(Malformed)?, via)?,
             KIND_PULL_RESP => self.on_pull_resp_frame(&sender, &body, via)?,
-            // A dial-only peer serves no digests and no foundings; a listening one answers both.
-            KIND_DIGEST if self.hub.listening => self.on_digest(&sender, &body, via)?,
+            // A listening peer answers a DIGEST on any link. A dial-only one answers its seed's
+            // own round whole (owner decision of 2026-11-23): a DIGEST read directly off its
+            // dialed link from the seed, so its own rumors lost on that link are repaired when the
+            // seed's round reaches it. A DIGEST a relay carried from another member is answered
+            // only with this peer's displaced claims made here (owner decision 1 of
+            // 2026-11-23, [`Actor::answer_displaced_digest`]); any other, and another member's
+            // forwarded copy, draws no answer: no member but the seed can make this peer upload
+            // anything else. Only a listening peer serves foundings.
+            KIND_DIGEST
+                if self.hub.listening
+                    || (via == Via::Dialed && self.seed_peer.as_deref() == Some(&*sender)) =>
+            {
+                self.on_digest(&sender, &body, via)?;
+            }
+            KIND_DIGEST if via.is_relayed() => {
+                if !self.answer_displaced_digest(&sender, &body, via)? {
+                    self.ignore_kind(kind);
+                }
+            }
             KIND_GROUP_AD_WANT if self.hub.listening => {
                 if let Some(link) = via.direct_link(self.link.as_ref().map(|link| link.id)) {
                     self.serve_founding(link, &sender);
@@ -1754,7 +2120,7 @@ impl Actor {
         let verdict = self.rumor_item(&rumor);
         if listening {
             if rumor.stream_id != STREAM_PEERS {
-                self.hub.activity = true;
+                self.note_hub_activity();
             }
             if matches!(verdict, Ok(true)) {
                 self.forward_rumor(&rumor, via);
@@ -1876,6 +2242,19 @@ impl Actor {
                 None => malformed = true,
             }
         }
+        if !self.hub.listening {
+            // A dial-only peer's pull of the membership view (SPEC §5.2; v0.1.21): each signed
+            // advertisement its digest did not name is held as a forwarded copy on `peers` is.
+            if let Some(payloads) =
+                delta_of(serving::STREAM_VIEW).and_then(serving::parse_view_delta)
+            {
+                for payload in &payloads {
+                    self.accept_peer_ad(payload);
+                }
+                // The view answered: a wake's re-probe ends, and what lapsed stays lapsed.
+                self.end_view_reprobe();
+            }
+        }
         if self.hub.listening {
             // The membership view (SPEC §5.2): a copy of a member's advertisement refreshes a
             // member already admitted and admits nobody.
@@ -1892,7 +2271,7 @@ impl Actor {
                 .iter()
                 .any(|(stream, _)| stream.as_str() != Some(serving::STREAM_VIEW))
             {
-                self.hub.activity = true;
+                self.note_hub_activity();
             }
         }
         for (stream, delta) in &deltas {
@@ -1939,7 +2318,7 @@ impl Actor {
     /// revoked PeerID leaves the member and reachable sets and the probes carried for it, a
     /// revoked seed stops being this peer's relay (`relay.via`), and a link to a revoked seed
     /// (the one it attested, or the one that addressed this peer) is closed so the peer fails
-    /// over to the next seed. Its frames are dropped from then on ([`Actor::handle`]).
+    /// over to another seed. Its frames are dropped from then on ([`Actor::handle`]).
     fn enforce_peer_revocations(&mut self) {
         let registry = &self.registry;
         self.members.retain(|peer| !registry.peer_revoked(peer));
@@ -2141,6 +2520,7 @@ impl Actor {
             return Some(FoldOutcome::Refused(Refusal::ControlId));
         }
         let slot = self.spaces.get_mut(space)?;
+        let before = slot.store.claim_proof(entry_id).cloned();
         let ctx = FoldContext::new(now, &self.registry).with_space(&slot.space_id);
         let outcome = slot.store.fold_claim(entry_id, signed, &ctx);
         if outcome == FoldOutcome::Refused(Refusal::Revoked) {
@@ -2172,6 +2552,10 @@ impl Actor {
         if outcome.is_applied() {
             self.dial_rounds.note_activity();
             self.after_claim(space, entry_id);
+        }
+        if matches!(outcome, FoldOutcome::Applied | FoldOutcome::Unchanged) {
+            // SPEC v0.1.36 §7.4, *Pairing the evidence*.
+            self.after_claim_merge(space, entry_id, before.as_ref(), signed);
         }
         Some(outcome)
     }
@@ -2292,6 +2676,8 @@ impl Actor {
                 .saturating_add(slot.store.stamps_far_future_deferred());
         }
         counters.send_dropped = self.send_dropped.load(Ordering::Relaxed);
+        counters.seed_dials = self.dial_counts.dials.load(Ordering::Relaxed);
+        counters.late_seed_channels = self.dial_counts.late.load(Ordering::Relaxed);
         counters.listen = self.hub.counters.clone();
         counters.audit = self.audit.counters();
         counters.dial_rounds = self.dial_rounds.rounds();
@@ -2633,7 +3019,23 @@ impl Actor {
             .ok_or_else(|| {
                 PeerError::InvalidArgument("an advertisement has an issued instant".to_owned())
             })?;
-        let item = format!("{id}:{issued}");
+        // A changed card issued in the millisecond of the last one under its id is issued a
+        // millisecond later, so its item id differs (SPEC v0.1.36 §9.5).
+        let mut unissued = ad.clone();
+        unissued.remove("issued");
+        let fingerprint = crypto::port().sha256(&cbor::encode(&Value::Map(unissued)));
+        let issued_at = self
+            .issues
+            .next(&format!("{ad_type}:{id}"), issued, fingerprint);
+        let mut reissued;
+        let ad = if issued_at == issued {
+            ad
+        } else {
+            reissued = ad.clone();
+            reissued.insert("issued", time::instant_iso(issued_at));
+            &reissued
+        };
+        let item = format!("{id}:{issued_at}");
         // SPEC §6.1a.2: a dial-only member cannot see every member's AppCard level, so it writes
         // none of the gated fields (origin, formats, a host whose signOn is idp, spill).
         let (ad, downgraded) = wire_ads::app_card_at_level(ad_type, ad);
@@ -2816,6 +3218,9 @@ impl Actor {
 /// `Disconnected`. After a normal end this does nothing more.
 impl Drop for Actor {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.beat.end(true);
+        }
         self.close();
     }
 }
@@ -2976,15 +3381,18 @@ struct Budgets {
 
 /// Drains a link, verifies each frame with the link's attestation, and forwards it to the actor
 /// with its share of the link's budgets (one permit per byte); tells the actor when the link
-/// ends. Once a budget is spent this task waits, so the transport stops reading.
+/// ends. Once a budget is spent this task waits, so the transport stops reading. Each frame read
+/// marks the link `heard` (the dead-seed rule, [`seed_watch`]).
 async fn read_link(
     mut receiver: FrameReceiver,
     attested: Option<String>,
     link: u64,
     inbound: mpsc::Sender<Inbound>,
     budgets: Budgets,
+    heard: Arc<seed_watch::Heard>,
 ) {
     while let Some(frame) = receiver.recv().await {
+        heard.touch();
         let share = u32::try_from(frame.len().min(budgets.own_bytes)).unwrap_or(u32::MAX);
         let Ok(permit) = Arc::clone(&budgets.own).acquire_many_owned(share).await else {
             return;
@@ -3164,22 +3572,20 @@ async fn dial_one(
     }
 }
 
-/// Dials the seeds in order until one accepts (`Peer.connect_any`); when none does, the error
-/// says how they failed ([`no_seed_accepted`]).
+/// Dials the seeds concurrently, the first to answer winning ([`redial::dial_any`], staggered
+/// in list order); when none does, the error says how they failed ([`no_seed_accepted`]).
 pub(super) async fn dial_first(
     seeds: &[Seed],
     dialers: &[Arc<dyn Dialer>],
     identity: &Identity,
     timeout: Duration,
+    counts: &redial::DialCounts,
 ) -> Result<(Channel, Seed), PeerError> {
+    let identity = Arc::new(identity.clone());
     let mut failures = Vec::new();
-    for seed in seeds {
-        match dial_one(seed, dialers, identity, timeout).await {
-            Ok(channel) => return Ok((channel, seed.clone())),
-            Err(error) => failures.push((seed.clone(), error)),
-        }
-    }
-    Err(no_seed_accepted(&failures))
+    redial::dial_any(seeds, dialers, &identity, timeout, &mut failures, counts)
+        .await
+        .ok_or_else(|| no_seed_accepted(&failures))
 }
 
 /// What every seed failing as `failures` says: [`PeerError::SeedNotAttested`] when a seed
@@ -3208,17 +3614,21 @@ pub(super) fn no_seed_accepted(failures: &[(Seed, TransportError)]) -> PeerError
     }
 }
 
-/// When a redial runs: its attempt number, when it gives up, and how long it waits before its
-/// first round.
+/// When a redial runs: its attempt number, when its window lapses (it redials on), how long it
+/// waits before its first round, the peer's redial table, which paces the rounds after it, and
+/// the dial counts it adds to.
 struct Schedule {
     attempt: u64,
     deadline: Option<Instant>,
     pause: Duration,
+    table: redial::RedialTable,
+    counts: Arc<redial::DialCounts>,
 }
 
-/// After a lost link: waits the schedule's pause, then dials the candidates (the next seed
-/// first) every `reconnect_interval` until one accepts or the deadline passes
-/// (`Peer._reconnect`, with the rounds paced as `Actor::lose_link` describes).
+/// After a lost link: waits the schedule's pause, then dials the candidates concurrently (in
+/// list order with the seed just lost last, [`redial::dial_any`]) in rounds paced by the redial table until one accepts
+/// or the deadline passes (`Peer._reconnect`, with the first round paced as `Actor::lose_link`
+/// describes).
 async fn redial(
     candidates: Vec<Seed>,
     dialers: Vec<Arc<dyn Dialer>>,
@@ -3229,8 +3639,10 @@ async fn redial(
 ) {
     let Schedule {
         attempt,
-        deadline,
+        mut deadline,
         pause,
+        table,
+        counts,
     } = schedule;
     if !pause.is_zero() {
         tokio::time::sleep(pause).await;
@@ -3241,20 +3653,31 @@ async fn redial(
             return;
         }
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            let _ = inbound.send(Inbound::GaveUp { attempt }).await;
-            return;
-        }
-        for seed in &candidates {
-            if inbound.is_closed() {
+            // A whole window without a link: said once per window, and the redial goes on
+            // (owner decision 3 of 2026-11-23: a peer never gives up redialing).
+            if inbound
+                .send(Inbound::WindowLapsed { attempt })
+                .await
+                .is_err()
+            {
                 return;
             }
-            let Ok(channel) = dial_one(seed, &dialers, &identity, settings.dial_timeout).await
-            else {
-                continue;
-            };
+            deadline = Instant::now().checked_add(settings.reconnect_window);
+        }
+        let mut failures = Vec::new();
+        if let Some((channel, seed)) = redial::dial_any(
+            &candidates,
+            &dialers,
+            &identity,
+            settings.dial_timeout,
+            &mut failures,
+            &counts,
+        )
+        .await
+        {
             let message = Inbound::Dialed {
                 channel: Box::new(channel),
-                seed: seed.clone(),
+                seed,
                 attempt,
             };
             if let Err(mpsc::error::SendError(Inbound::Dialed { channel, .. })) =
@@ -3264,7 +3687,7 @@ async fn redial(
             }
             return;
         }
-        tokio::time::sleep(settings.reconnect_interval).await;
+        tokio::time::sleep(table.next_wait(settings.reconnect_interval)).await;
     }
 }
 
@@ -3413,6 +3836,7 @@ mod tests {
                 own_bytes: BUDGET,
                 shared: None,
             },
+            seed_watch::Heard::new(None),
         ));
         let identity = Identity::generate().expect("identity");
         let body = vec![7u8; 100 * 1024];
@@ -3485,6 +3909,8 @@ mod tests {
             folds: watch::channel(0).0,
             listeners: Vec::new(),
             replicate: Vec::new(),
+            dial_counts: Arc::default(),
+            wakes: watch::channel(0).0,
         };
         (
             Actor::new(start, inbound_tx, &[]),
@@ -3492,6 +3918,148 @@ mod tests {
             inbound_rx,
             link,
         )
+    }
+
+    /// A forward wall step longer than the keepalive (a suspend) re-introduces the peer at once
+    /// on its link; a small step or a step back is counted and re-anchors the wall deadlines
+    /// only (SPEC v0.1.36 §9.5).
+    #[tokio::test(start_paused = true)]
+    async fn a_suspend_re_introduces_at_once_and_a_small_step_does_not() {
+        use crate::transport::memory;
+
+        let (mut actor, ..) = test_actor();
+        let clock = crate::clock::ManualClock::new(1_900_000_000_000);
+        actor.clock = Arc::new(clock.clone());
+        let (mine, mut theirs) = memory::pair("mem", "seed", "peer", None, None);
+        actor.install_link(mine, Seed::new("127.0.0.1", 7000, "tcp"));
+        actor.on_link_ready();
+        async fn sent(rx: &mut crate::transport::FrameReceiver) -> Vec<Vec<u8>> {
+            let mut frames = Vec::new();
+            while let Ok(Some(frame)) =
+                tokio::time::timeout(Duration::from_millis(1), rx.recv()).await
+            {
+                frames.push(frame);
+            }
+            frames
+        }
+        sent(&mut theirs.receiver).await;
+        actor.check_wall_step();
+        // A slew and a small step: nothing.
+        clock.advance(900);
+        actor.check_wall_step();
+        assert_eq!(actor.counters.wall_steps, 0);
+        // A step back of 5 s: counted, nothing sent.
+        clock.advance(-5_000);
+        actor.check_wall_step();
+        assert_eq!((actor.counters.wall_steps, actor.counters.resumes), (1, 0));
+        assert!(
+            sent(&mut theirs.receiver).await.is_empty(),
+            "nothing sent for a step back"
+        );
+        actor.check_wall_step();
+        // A suspend of ten minutes (the monotonic clock did not move): a resume.
+        let before = actor.last_intro_ms;
+        clock.advance(600_000);
+        actor.check_wall_step();
+        assert_eq!((actor.counters.wall_steps, actor.counters.resumes), (2, 1));
+        assert!(actor.last_intro_ms > before, "re-introduced at once");
+        let frames = sent(&mut theirs.receiver).await;
+        let kinds: Vec<String> = frames
+            .iter()
+            .filter_map(|frame| envelope::decode_frame(frame))
+            .filter_map(|env| env.get("kind").and_then(Value::as_str).map(str::to_owned))
+            .collect();
+        assert!(kinds.iter().any(|kind| kind == KIND_RUMOR), "{kinds:?}");
+    }
+
+    /// A changed card published in the millisecond of the last one under its id is issued a
+    /// millisecond later, under another item id (SPEC v0.1.36 §9.5); the same card again keeps
+    /// its instant.
+    #[tokio::test]
+    async fn a_changed_card_in_the_same_millisecond_is_issued_a_millisecond_later() {
+        let (mut actor, ..) = test_actor();
+        let issued = 1_900_000_000_000i64;
+        let card = |version: &str| {
+            let mut ad = Map::new();
+            ad.insert(
+                "id",
+                format!("aspace://{}/cap/test/{}", actor.group, actor.peer_id),
+            );
+            ad.insert("issuer", actor.peer_id.as_str());
+            ad.insert("group", actor.group.as_str());
+            ad.insert("issued", time::instant_iso(issued));
+            ad.insert("ttl", "PT15M");
+            ad.insert("capabilityType", "test");
+            ad.insert("version", version);
+            ad.insert("binding", "pipe");
+            ad.insert("parameters", Value::Map(Map::new()));
+            ad.insert("costHints", Value::Map(Map::new()));
+            ad
+        };
+        let items = |actor: &mut Actor| -> Vec<String> {
+            actor
+                .outbox
+                .drain(..)
+                .filter_map(|body| bodies::parse_rumor(&body))
+                .map(|rumor| rumor.item_id)
+                .collect()
+        };
+        let (first, changed) = (card("0.1"), card("0.2"));
+        actor
+            .publish_ad(wire_ads::AD_TYPE_CAPABILITY, &first)
+            .expect("publish");
+        actor
+            .publish_ad(wire_ads::AD_TYPE_CAPABILITY, &changed)
+            .expect("publish");
+        actor
+            .publish_ad(wire_ads::AD_TYPE_CAPABILITY, &changed)
+            .expect("publish");
+        let items = items(&mut actor);
+        let id = first.get("id").and_then(Value::as_str).unwrap_or_default();
+        assert_eq!(
+            items,
+            vec![
+                format!("{id}:{issued}"),
+                format!("{id}:{}", issued + 1),
+                format!("{id}:{}", issued + 1),
+            ]
+        );
+    }
+
+    /// A turn that panics is contained: the caller's reply is lost, the loop counts the panic,
+    /// reads DEGRADED, and goes on serving (SPEC v0.1.36 §9.5, the watchdog's repeated-throw
+    /// rule); its heartbeat shows a turn in hand while one runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicking_turn_is_contained_and_the_loop_goes_on() {
+        use crate::group::GroupSpec;
+        use crate::peer::{ListenerSpec, LoopStatus, Peer, PeerConfig};
+        use crate::transport::memory::MemoryNetwork;
+
+        let network = MemoryNetwork::new();
+        let config = PeerConfig::new(
+            Identity::generate().expect("identity"),
+            GroupSpec::FoundingText("agentspaces-rust-watchdog".to_owned()),
+        )
+        .listen_on(ListenerSpec::bound(Arc::new(
+            network.listen("127.0.0.1:7991"),
+        )));
+        let peer = Peer::start(config).await.expect("start");
+        assert_eq!(peer.loop_health().status, LoopStatus::Up);
+        let in_turn = peer
+            .call(|actor| actor.beat.health().in_turn)
+            .await
+            .expect("call");
+        assert!(in_turn, "a job runs inside a turn");
+        let lost = peer
+            .call(|_| -> u8 { panic!("a test panic inside one turn") })
+            .await;
+        assert!(matches!(lost, Err(PeerError::Closed)), "{lost:?}");
+        // The loop goes on: the next call is answered, after the panic was counted.
+        peer.call(|_| ()).await.expect("the loop still answers");
+        let health = peer.loop_health();
+        assert_eq!((health.panics, health.status), (1, LoopStatus::Degraded));
+        assert!(health.turns >= 3);
+        peer.close().await.expect("close");
     }
 
     /// An actor dropped without its close (a panic unwinding it, say) still closes: the link is
@@ -3679,6 +4247,8 @@ mod tests {
                     attempt: 1,
                     deadline: Instant::now().checked_add(Duration::from_secs(60)),
                     pause: Duration::ZERO,
+                    table: redial::RedialTable::default(),
+                    counts: Arc::default(),
                 },
             ),
         )

@@ -192,7 +192,7 @@ pub async fn connect(options: JoinOptions) -> Result<Connection, String> {
     };
     let content = Content::start_with(peer.clone(), nodes, pieces, ContentConfig::default()).await.map_err(|e| e.to_string())?;
     let pdt = Pdt::new(content.clone(), PdtConfig::default());
-    pdt.spawn_ticker(Duration::from_secs(1));
+    pdt.spawn_ticker(Duration::from_secs(30));
     let max_bytes = if options.max_bytes == 0 { agentspaces_pdt::files::MAX_FILE_BYTES } else { options.max_bytes };
     let files = FileShare::new(pdt.clone(), FileShareConfig { max_bytes, ledger, ..FileShareConfig::default() }).map_err(|e| e.to_string())?;
     let resumed = files.resume().await;

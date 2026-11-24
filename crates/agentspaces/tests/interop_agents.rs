@@ -1250,9 +1250,12 @@ async fn s6b_a_killed_worker_lets_the_task_reappear_for_the_java_agent() {
 
     let java_agent = format!("{}/java-rescuer", seed.peer);
     seed.ask("bind-agent java-rescuer").await;
+    // The events come from the Java seed's `notify` listener, which hears a transition after the
+    // store holds it: wait for the COMPLETED event as well as the completed state.
+    let completed = format!("COMPLETED by {java_agent}");
     let state = eventually!("the Java agent to complete the reappeared task", {
         let state = seed.task_state("doomed").await;
-        if state["state"] == "completed" {
+        if state["state"] == "completed" && has_event(&state, &completed) {
             Ok(state)
         } else {
             Err(state)
@@ -1270,10 +1273,7 @@ async fn s6b_a_killed_worker_lets_the_task_reappear_for_the_java_agent() {
     assert_eq!(state["holder"], java_agent.as_str(), "{state}");
     assert_eq!(state["epoch"], 2, "{state}");
     assert!(has_event(&state, &taken), "{state}");
-    assert!(
-        has_event(&state, &format!("COMPLETED by {java_agent}")),
-        "{state}"
-    );
+    assert!(has_event(&state, &completed), "{state}");
     let results = seed.results().await;
     assert_eq!(
         results,

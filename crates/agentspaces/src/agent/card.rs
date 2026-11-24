@@ -343,6 +343,9 @@ pub(crate) struct CardSpec {
     pub space_bindings: Map,
     pub actions: Vec<CardAction>,
     pub ttl_iso: String,
+    /// The conversations the agent answers (`ChatThread` maps, SPEC §6.1 v0.1.38), appended
+    /// last and omitted when empty.
+    pub threads: Vec<Map>,
 }
 
 impl CardSpec {
@@ -358,7 +361,7 @@ impl CardSpec {
         let consumes: Vec<&str> = self.consumes.iter().map(String::as_str).collect();
         let produces: Vec<&str> = self.produces.iter().map(String::as_str).collect();
         let actions: Vec<Map> = self.actions.iter().map(CardAction::to_map).collect();
-        ads::agent_card(
+        let card = ads::agent_card(
             &self.group,
             peer,
             agent.local_name(),
@@ -374,7 +377,11 @@ impl CardSpec {
             &actions,
             agent.certificate_covering(issued_ms),
             None,
-        )
+        )?;
+        if self.threads.is_empty() {
+            return Ok(card);
+        }
+        ads::agent_card_with_threads(&card, &self.threads)
     }
 }
 
@@ -476,6 +483,7 @@ mod tests {
                 space_bindings: Map::new(),
                 actions,
                 ttl_iso: "PT15M".to_owned(),
+                threads: Vec::new(),
             };
             let agent = peer
                 .renewing_subordinate("w", "PT24H", None, 1_767_225_600_000)
@@ -511,6 +519,42 @@ mod tests {
     }
 
     #[test]
+    fn a_built_card_names_its_threads_last() {
+        let peer = Identity::from_seed(&[5; 32]);
+        let now = 1_767_225_600_000;
+        let agent = peer
+            .renewing_subordinate("chat", "PT24H", None, now)
+            .expect("agent");
+        let mut spec = CardSpec {
+            group: "zGroup".to_owned(),
+            description: "chats".to_owned(),
+            goals: Vec::new(),
+            consumes: Vec::new(),
+            produces: Vec::new(),
+            space_bindings: Map::new(),
+            actions: Vec::new(),
+            ttl_iso: "PT15M".to_owned(),
+            threads: Vec::new(),
+        };
+        let without = spec.build(&peer, &agent, now).expect("card");
+        assert!(!without.contains_key("threads"));
+        spec.threads = vec![
+            ads::chat_thread("conversations", "main", "tree").expect("thread"),
+            ads::chat_thread("findings", "", "all").expect("thread"),
+        ];
+        let card = spec.build(&peer, &agent, now).expect("card");
+        assert_eq!(
+            card.keys().last().and_then(Value::as_str),
+            Some("threads")
+        );
+        let stored = Value::Map(ads::stored_ad(ads::AD_TYPE_AGENT_CARD, &card, &peer));
+        assert!(ads::verify_stored_ad(&stored, now + 10).is_some());
+        let mut removed = card.clone();
+        removed.remove("threads");
+        assert_eq!(removed, without);
+    }
+
+    #[test]
     fn a_built_card_parses_and_verifies() {
         let peer = Identity::from_seed(&[3; 32]);
         let now = 1_767_225_600_000;
@@ -528,6 +572,7 @@ mod tests {
             space_bindings: bindings,
             actions: vec![action("work", "a#v1")],
             ttl_iso: "PT15M".to_owned(),
+            threads: Vec::new(),
         };
         let card = spec.build(&peer, &agent, now + 5).expect("card");
         let stored = Value::Map(ads::stored_ad(ads::AD_TYPE_AGENT_CARD, &card, &peer));

@@ -31,7 +31,7 @@
 mod support;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use agentspaces::clock::{Clock, SharedClock, SystemClock};
@@ -532,12 +532,13 @@ async fn a_stranger_s_ping_flood_does_not_starve_admissions() {
     .await;
 
     let flooding = Arc::new(AtomicBool::new(true));
+    let sent = Arc::new(AtomicU64::new(0));
     let flood = {
         let network = network.clone();
         let group = group.clone();
         let flooding = Arc::clone(&flooding);
+        let sent = Arc::clone(&sent);
         tokio::spawn(async move {
-            let mut sent = 0u64;
             while flooding.load(Ordering::SeqCst) {
                 let pest = RawPeer::dial(
                     &network,
@@ -553,16 +554,26 @@ async fn a_stranger_s_ping_flood_does_not_starve_admissions() {
                     if !pest.send(KIND_PING, &bodies::ping_body(nonce), None).await {
                         break;
                     }
-                    sent += 1;
+                    sent.fetch_add(1, Ordering::SeqCst);
                     if nonce % 64 == 0 {
                         tokio::task::yield_now().await;
                     }
                 }
             }
-            sent
         })
     };
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The flood is under way: counted in PINGs, not in wall time, which a loaded machine
+    // stretches (a 300 ms head start once sent 982 PINGs where 1000 were the premise).
+    let started = std::time::Instant::now();
+    eventually("the flood's first 1000 PINGs", || {
+        let sent = Arc::clone(&sent);
+        async move { sent.load(Ordering::SeqCst) > 1000 }
+    })
+    .await;
+    eprintln!(
+        "the flood sent its first 1000 PINGs in {} ms",
+        started.elapsed().as_millis()
+    );
 
     // An honest newcomer introduces itself, as a member re-leasing would, a few times.
     let honest = RawPeer::dial(
@@ -587,9 +598,9 @@ async fn a_stranger_s_ping_flood_does_not_starve_admissions() {
         }
     }
     flooding.store(false, Ordering::SeqCst);
-    let sent = flood.await.expect("the flood task");
+    flood.await.expect("the flood task");
+    let sent = sent.load(Ordering::SeqCst);
     let counters = hub.counters().await.listen;
-    assert!(sent > 1000, "the flood sent only {sent} PINGs");
     assert!(
         admitted_now,
         "the honest newcomer was starved by {sent} PINGs: {counters:?}"

@@ -588,6 +588,39 @@ async fn a_failover_forgets_the_old_seed_as_relay() {
     // The new seed names itself by addressing this peer.
     fence(&b, 0, &peer, 2).await;
     assert_eq!(peer.seed_peer().await.as_deref(), Some(b.peer_id()));
+    // Naming the new seed changes the self-advertisement, which goes out issued after the one
+    // that named no relay, even in the same second: a member keeping the newest copy of an
+    // advertisement takes the relay a Java prober reaches this peer through (SPEC v0.1.36 §9.5;
+    // the whole-second issue gave both one instant, and the hint was lost until the re-lease).
+    let b_id = b.peer_id().to_owned();
+    b.wait_for("the introduction naming the new seed", |received| {
+        received
+            .iter()
+            .filter_map(Received::rumor)
+            .filter(|rumor| rumor.stream_id == STREAM_PEERS)
+            .filter_map(|rumor| ads::verify_signed_peer_ad(&rumor.payload))
+            .any(|(ad, _)| hint(&ad, "relay.via").as_deref() == Some(b_id.as_str()))
+    })
+    .await;
+    let intros = introductions(&b, 0);
+    let issued = |ad: &Map| {
+        time::parse_instant_millis(ad.get("issued").and_then(Value::as_str).expect("issued"))
+            .expect("an instant")
+    };
+    let unnamed = intros
+        .iter()
+        .find(|ad| hint(ad, "relay.via").is_none())
+        .expect("the first introduction");
+    let named = intros
+        .iter()
+        .find(|ad| hint(ad, "relay.via").as_deref() == Some(b_id.as_str()))
+        .expect("the introduction naming the new seed");
+    assert!(
+        issued(named) > issued(unnamed),
+        "the changed advertisement is issued later: {} vs {}",
+        issued(named),
+        issued(unnamed)
+    );
 }
 
 /// A failover to an attested seed takes the seed the transport proved as the relay at once, before

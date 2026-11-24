@@ -18,7 +18,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentspaces::content::{Content, ContentError, FetchOptions};
 use agentspaces::space::{EntryId, Lease, Space, Template};
@@ -33,6 +33,7 @@ use agentspaces::wire::pdt::value::Slot;
 use agentspaces::wire::pdt::vg::VgNode;
 use agentspaces::wire::ref_heads::{self, RefVersion};
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 
 /// The most steps a base walk takes.
 const MAX_BASE_STEPS: usize = 64;
@@ -194,6 +195,8 @@ struct Inner {
     nodes: Arc<dyn Nodes>,
     config: PdtConfig,
     refs: Mutex<RefTable>,
+    /// Wakes the ticker when an own head was written, displaced, or superseded.
+    wake: tokio::sync::Notify,
 }
 
 /// Persistent data trees over one group's content swarm. Cheap to clone.
@@ -211,6 +214,13 @@ impl std::fmt::Debug for Pdt {
 impl Pdt {
     /// The engine over `content`, its heads in `config.space`.
     pub fn new(content: Content, config: PdtConfig) -> Pdt {
+        // SPEC v0.1.36 §9.5: a head lease under the 60 s floor warns. This constructor cannot
+        // refuse, so under a strict policy it warns as the lax one does.
+        let policy = agentspaces::ttl::TtlPolicy::from_env();
+        if agentspaces::ttl::check("pdt.head-lease", config.head_lease, &policy).is_err() {
+            let lax = agentspaces::ttl::TtlPolicy { strict: false, ..policy };
+            let _ = agentspaces::ttl::check("pdt.head-lease", config.head_lease, &lax);
+        }
         let space = content.peer().space(&config.space);
         let nodes = content.nodes().clone();
         Pdt {
@@ -220,6 +230,7 @@ impl Pdt {
                 nodes,
                 config,
                 refs: Mutex::new(HashMap::new()),
+                wake: tokio::sync::Notify::new(),
             }),
         }
     }
@@ -264,36 +275,63 @@ impl Pdt {
     }
 
     /// Renews the heads this member wrote at half their lease and withdraws its superseded heads
-    /// after the grace. Call it on a timer ([`Pdt::spawn_ticker`] does).
+    /// after the grace. Call it when [`Pdt::tick_due`] says ([`Pdt::spawn_ticker`] does).
     pub async fn tick(&self) {
+        self.tick_due().await;
+    }
+
+    /// [`Pdt::tick`], answering when it next has something to do: the earliest renewal (half a
+    /// head's lease after its last) or withdrawal (a superseded head's grace); `None` when this
+    /// member holds no head.
+    pub async fn tick_due(&self) -> Option<Instant> {
         let refs: Vec<Arc<tokio::sync::Mutex<RefState>>> = {
             let refs = self.inner.refs.lock().unwrap_or_else(|e| e.into_inner());
             refs.values().map(|(_, s)| s.clone()).collect()
         };
+        let mut due: Option<Instant> = None;
         for state in refs {
             let mut state = state.lock().await;
-            self.tend_own(&mut state).await;
+            if let Some(next) = self.tend_own(&mut state).await {
+                due = Some(due.map_or(next, |due| due.min(next)));
+            }
         }
+        due
     }
 
-    /// A task that calls [`Pdt::tick`] every `period` until the engine is dropped everywhere.
+    /// A task that runs [`Pdt::tick`] when it next falls due ([`Pdt::tick_due`]), when a head of
+    /// this member is written, displaced, or superseded, and at least every `period` (a
+    /// backstop), until the engine is dropped everywhere. Due work, not a fixed tick (SPEC v0.1.36
+    /// §9.5): an idle member with no heads sleeps the whole `period`.
     pub fn spawn_ticker(&self, period: Duration) -> tokio::task::JoinHandle<()> {
         let weak = Arc::downgrade(&self.inner);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(period);
+            let mut wait = Duration::ZERO;
             loop {
-                interval.tick().await;
+                {
+                    let Some(inner) = weak.upgrade() else { return };
+                    let woken = inner.wake.notified();
+                    tokio::pin!(woken);
+                    woken.as_mut().enable();
+                    tokio::select! {
+                        () = tokio::time::sleep(wait) => {}
+                        () = &mut woken => {}
+                    }
+                }
                 let Some(inner) = weak.upgrade() else { return };
-                Pdt { inner }.tick().await;
+                let due = Pdt { inner }.tick_due().await;
+                wait = due.map_or(period, |due| due.saturating_duration_since(Instant::now()).min(period));
             }
         })
     }
 
-    async fn tend_own(&self, state: &mut RefState) {
+    /// Withdraws this member's displaced and superseded heads and renews the rest at half their
+    /// lease; answers when it next has something to do.
+    async fn tend_own(&self, state: &mut RefState) -> Option<Instant> {
         let lease = self.inner.config.head_lease;
         let grace = self.inner.config.cancel_grace;
         let mut kept = Vec::new();
         let mut released = Vec::new();
+        let mut due: Option<Instant> = None;
         for mut own in std::mem::take(&mut state.own) {
             let withdraw = own.displaced || own.superseded_at.is_some_and(|t| t.elapsed() >= grace);
             if withdraw {
@@ -307,6 +345,13 @@ impl Pdt {
                 }
                 own.renewed_at = Instant::now();
             }
+            let next = [Some(own.renewed_at + lease / 2), own.superseded_at.map(|t| t + grace)]
+                .into_iter()
+                .flatten()
+                .min();
+            if let Some(next) = next {
+                due = Some(due.map_or(next, |due| due.min(next)));
+            }
             kept.push(own);
         }
         for root in released {
@@ -315,6 +360,7 @@ impl Pdt {
             }
         }
         state.own = kept;
+        due
     }
 }
 
@@ -754,6 +800,8 @@ impl Ref {
             }
         }
         state.own.push(Own { entry: entry.clone(), root: root.clone(), renewed_at: Instant::now(), superseded_at: None, displaced: false });
+        // The ticker withdraws the superseded heads after their grace and renews this one.
+        self.pdt.inner.wake.notify_one();
         state.stats.swaps += 1;
         self.pdt.inner.content.hold_tree(&root).await?;
         Ok(Swapped { root, entry: Some(entry), seq, inline_bytes: inline.map_or(0, |n| n.iter().map(Vec::len).sum()) })

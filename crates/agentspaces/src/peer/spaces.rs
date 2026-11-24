@@ -25,6 +25,7 @@
 use std::collections::HashMap;
 
 use agentspaces_wire::bodies::STREAM_SPACE_PREFIX;
+use agentspaces_wire::cbor::Map;
 use agentspaces_wire::fold::SpaceStore;
 use agentspaces_wire::horizon::HorizonGate;
 use agentspaces_wire::ids;
@@ -76,6 +77,71 @@ pub(super) struct SettleBook {
     /// The claim epoch at which one of this peer's holders completed the entry with its own work:
     /// a displaced holder's authentic completion arriving after it is a duplicate.
     completed_here: Bounded,
+    /// The verified claims a claim of this peer's own holders displaced in the lattice, at most
+    /// [`DISPLACED_PER_ENTRY`] per entry (Java `displacedClaims`, SPEC v0.1.36 §7.4 *Pairing the
+    /// evidence*): the first half of a pair whose second half, the displaced holder's completion,
+    /// may come in another frame.
+    displaced_claims: Lines<Vec<Map>>,
+    /// The completed states dropped here while a claim of this peer's own holders held the entry,
+    /// at most [`DISPLACED_PER_ENTRY`] per entry (Java `unprovenCompletions`): each failed to
+    /// authenticate against that claim and may be a displaced holder's.
+    unproven: Lines<Vec<Map>>,
+    /// The entries one of this peer's holders completed under a claim that a better claim,
+    /// merged here afterwards, displaced (Java `displacedOwn`): the claim is offered again
+    /// ([`Reoffer`]).
+    displaced_own: Lines<Reoffer>,
+    /// The claims made here that a better claim of another peer displaced, the first one lost
+    /// per entry, whether or not one of this peer's holders completed under it (Java
+    /// `displacedHere`): what a dial-only peer answers a relayed `DIGEST` for (owner decision 1
+    /// of 2026-11-23, SPEC v0.1.37 §9.4), so a winner's targeted round reaches it.
+    displaced_here: Lines<Map>,
+    /// The holders a claim of this peer's own holders displaced, per entry, and the targeted
+    /// anti-entropy rounds opened toward them while that take is open (Java `displacedPulls`,
+    /// owner decision 4 of 2026-11-23): [`DisplacedPull`].
+    displaced_pulls: Lines<DisplacedPull>,
+}
+
+/// The most displaced claims, and the most unproven completions, kept per entry (Java
+/// `DISPLACED_PER_ENTRY`); past it the oldest goes.
+pub(super) const DISPLACED_PER_ENTRY: usize = 4;
+/// The most offers of one displaced claim (Java `REOFFER_MAX`).
+pub(super) const REOFFER_MAX: u32 = 6;
+/// The wait after the first offer of a displaced claim; it doubles after each (Java
+/// `REOFFER_BACKOFF_MILLIS`).
+pub(super) const REOFFER_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The most targeted rounds toward the holders one entry's claim displaced (Java
+/// `DISPLACED_PULL_MAX`): at once, then after 1, 2, 4, 8 and 16 s.
+pub(super) const DISPLACED_PULL_MAX: u32 = 6;
+
+/// The holders (PeerIDs) a claim of this peer's own holders displaced for one entry, and the
+/// targeted anti-entropy rounds opened toward them so far (Java `DisplacedPull`). A displaced
+/// holder's completion may have only one source, the holder itself, and anti-entropy repairs
+/// only a round's opener, so the winner opens the rounds rather than wait for a random partner
+/// pick to land on the holder.
+#[derive(Debug, Clone)]
+pub(super) struct DisplacedPull {
+    /// The displaced holders' PeerIDs, in the order they were displaced.
+    pub holders: Vec<String>,
+    /// The rounds opened so far (each toward every holder).
+    pub rounds: u32,
+    /// No round before this instant (monotonic: a local period).
+    pub next_at: Instant,
+}
+
+/// One of this peer's completions whose claim a better claim displaced, and its offers so far.
+#[derive(Debug, Clone)]
+pub(super) struct Reoffer {
+    /// The displaced claim, signed, as it first travelled.
+    pub proof: Map,
+    /// The offers made so far.
+    pub offers: u32,
+    /// No offer before this instant (monotonic: a local period).
+    pub next_at: Instant,
+    /// Whether the offers are over (spent, the claim lapsed or aged): the line stays until the
+    /// entry is collected, so a later frame carrying the displaced claim again cannot start a
+    /// second round of offers ("at most six offers in all").
+    pub ended: bool,
 }
 
 impl SettleBook {
@@ -113,10 +179,236 @@ impl SettleBook {
         false
     }
 
+    /// Keeps `lost`, a claim made here that a better claim of another peer displaced for
+    /// `entry_id` (Java `displacedHere.putIfAbsent`): the first one lost stays.
+    pub fn note_displaced_here(&mut self, entry_id: &str, lost: &Map) {
+        self.displaced_here.entry_with(entry_id, || lost.clone());
+    }
+
+    /// Forgets each displaced claim made here that `keep` refuses (Java `pruneDisplacedHere`).
+    pub fn prune_displaced_here(&mut self, keep: impl Fn(&str, &Map) -> bool) {
+        self.displaced_here
+            .values
+            .retain(|entry_id, (lost, _)| keep(entry_id, lost));
+    }
+
+    /// The displaced claims made here a relayed `DIGEST` draws (owner decision 1 of 2026-11-23,
+    /// Java `displacedFor`): each kept [`SettleBook::note_displaced_here`] line, then each
+    /// displaced claim still offered again (Java `displacedOwn`) whose entry has none, by entry.
+    /// Nothing else this peer completed is among them. Prune first.
+    pub fn displaced_lines(&self) -> Vec<(&str, &Map)> {
+        let mut lines: Vec<(&str, &Map)> = self
+            .displaced_here
+            .values
+            .iter()
+            .map(|(entry_id, (lost, _))| (entry_id.as_str(), lost))
+            .collect();
+        for (entry_id, (line, _)) in &self.displaced_own.values {
+            if !line.ended && self.displaced_here.get(entry_id).is_none() {
+                lines.push((entry_id.as_str(), &line.proof));
+            }
+        }
+        lines
+    }
+
     /// Forgets an entry that left the store.
     pub fn forget(&mut self, entry_id: &str) {
         self.outbid.remove(entry_id);
         self.completed_here.remove(entry_id);
+        self.displaced_claims.remove(entry_id);
+        self.unproven.remove(entry_id);
+        self.displaced_own.remove(entry_id);
+        self.displaced_here.remove(entry_id);
+        self.displaced_pulls.remove(entry_id);
+    }
+
+    /// Notes `holder` (a PeerID) as displaced for `entry_id` by a claim of this peer's own
+    /// holders, for the targeted rounds (Java `noteDisplaced`): a new line is due at `now`; a
+    /// holder newly displaced after the first round is asked at once. Answers when the line's
+    /// next round is due.
+    pub fn note_displaced_holder(&mut self, entry_id: &str, holder: &str, now: Instant) -> Instant {
+        let pull = self.displaced_pulls.entry_with(entry_id, || DisplacedPull {
+            holders: Vec::new(),
+            rounds: 0,
+            next_at: now,
+        });
+        if !pull.holders.iter().any(|held| held == holder) {
+            if pull.holders.len() >= DISPLACED_PER_ENTRY {
+                pull.holders.remove(0);
+            }
+            pull.holders.push(holder.to_owned());
+            if pull.rounds > 0 {
+                pull.next_at = pull.next_at.min(now);
+            }
+        }
+        pull.next_at
+    }
+
+    /// The entries with a targeted-round line, for the due work to judge each.
+    pub fn displaced_pull_entries(&self) -> Vec<String> {
+        self.displaced_pulls.values.keys().cloned().collect()
+    }
+
+    /// The targeted-round line of `entry_id`.
+    pub fn displaced_pull_mut(&mut self, entry_id: &str) -> Option<&mut DisplacedPull> {
+        self.displaced_pulls.get_mut(entry_id)
+    }
+
+    /// Drops the targeted-round line of `entry_id` (the take is no longer open, or its rounds
+    /// are spent).
+    pub fn end_displaced_pull(&mut self, entry_id: &str) {
+        self.displaced_pulls.remove(entry_id);
+    }
+
+    /// The targeted-round line of `entry_id`, for tests.
+    #[cfg(test)]
+    pub fn displaced_pull(&self, entry_id: &str) -> Option<&DisplacedPull> {
+        self.displaced_pulls.get(entry_id)
+    }
+
+    /// Keeps `lost`, a verified claim that a claim of this peer's own holders displaced for
+    /// `entry_id` (the same claim once; at most [`DISPLACED_PER_ENTRY`], the oldest going).
+    pub fn note_displaced_claim(&mut self, entry_id: &str, lost: &Map) {
+        let claim = lost.get("claim");
+        let lines = self.displaced_claims.entry(entry_id);
+        if lines.iter().any(|held| held.get("claim") == claim) {
+            return;
+        }
+        if lines.len() >= DISPLACED_PER_ENTRY {
+            lines.remove(0);
+        }
+        lines.push(lost.clone());
+    }
+
+    /// Keeps `state`, a completion dropped while this peer's claim held `entry_id` (the same
+    /// signature once; at most [`DISPLACED_PER_ENTRY`], the oldest going). Answers whether a
+    /// displaced claim is kept for the entry, so the pair is worth judging now.
+    pub fn note_unproven(&mut self, entry_id: &str, state: &Map) -> bool {
+        let sig = state.get("stateSig");
+        let lines = self.unproven.entry(entry_id);
+        if !lines.iter().any(|held| held.get("stateSig") == sig) {
+            if lines.len() >= DISPLACED_PER_ENTRY {
+                lines.remove(0);
+            }
+            lines.push(state.clone());
+        }
+        self.displaced_claims.get(entry_id).is_some()
+    }
+
+    /// The displaced claims and unproven completions kept for `entry_id`, when both are.
+    pub fn pairs(&self, entry_id: &str) -> Option<(Vec<Map>, Vec<Map>)> {
+        Some((
+            self.displaced_claims.get(entry_id)?.clone(),
+            self.unproven.get(entry_id)?.clone(),
+        ))
+    }
+
+    /// How many displaced claims are kept for `entry_id`.
+    #[cfg(test)]
+    pub fn displaced_claims(&self, entry_id: &str) -> usize {
+        self.displaced_claims.get(entry_id).map_or(0, Vec::len)
+    }
+
+    /// How many unproven completions are kept for `entry_id`.
+    pub fn unproven(&self, entry_id: &str) -> usize {
+        self.unproven.get(entry_id).map_or(0, Vec::len)
+    }
+
+    /// Starts offering `proof` again for `entry_id`, due at `now`, unless it is offered already.
+    /// Answers whether it started.
+    pub fn start_reoffer(&mut self, entry_id: &str, proof: &Map, now: Instant) -> bool {
+        if self.displaced_own.get(entry_id).is_some() {
+            return false;
+        }
+        self.displaced_own.entry_with(entry_id, || Reoffer {
+            proof: proof.clone(),
+            offers: 0,
+            next_at: now,
+            ended: false,
+        });
+        true
+    }
+
+    /// The re-offer line of `entry_id`, while its offers are not over.
+    pub fn reoffer_mut(&mut self, entry_id: &str) -> Option<&mut Reoffer> {
+        self.displaced_own
+            .get_mut(entry_id)
+            .filter(|line| !line.ended)
+    }
+
+    /// Whether a re-offer line is kept for `entry_id`.
+    #[cfg(test)]
+    pub fn reoffering(&self, entry_id: &str) -> bool {
+        self.displaced_own
+            .get(entry_id)
+            .is_some_and(|line| !line.ended)
+    }
+
+    /// Stops offering `entry_id` again, for good (until the entry is collected).
+    pub fn end_reoffer(&mut self, entry_id: &str) {
+        if let Some(line) = self.displaced_own.get_mut(entry_id) {
+            line.ended = true;
+        }
+    }
+}
+
+/// Values by entry id in insertion order, at most [`SETTLE_BOOK_CAP`] entries; past it the oldest
+/// goes.
+#[derive(Debug)]
+struct Lines<V> {
+    values: HashMap<String, (V, u64)>,
+    next: u64,
+}
+
+impl<V> Default for Lines<V> {
+    fn default() -> Self {
+        Self {
+            values: HashMap::new(),
+            next: 0,
+        }
+    }
+}
+
+impl<V> Lines<V> {
+    fn get(&self, entry_id: &str) -> Option<&V> {
+        self.values.get(entry_id).map(|(value, _)| value)
+    }
+
+    fn get_mut(&mut self, entry_id: &str) -> Option<&mut V> {
+        self.values.get_mut(entry_id).map(|(value, _)| value)
+    }
+
+    fn remove(&mut self, entry_id: &str) -> Option<V> {
+        self.values.remove(entry_id).map(|(value, _)| value)
+    }
+
+    /// The value of `entry_id`, made by `make` (the oldest evicted first at the cap) when absent.
+    fn entry_with(&mut self, entry_id: &str, make: impl FnOnce() -> V) -> &mut V {
+        if !self.values.contains_key(entry_id)
+            && self.values.len() >= SETTLE_BOOK_CAP
+            && let Some(oldest) = self
+                .values
+                .iter()
+                .min_by_key(|(_, (_, order))| *order)
+                .map(|(id, _)| id.clone())
+        {
+            self.values.remove(&oldest);
+        }
+        let next = &mut self.next;
+        &mut self
+            .values
+            .entry(entry_id.to_owned())
+            .or_insert_with(|| {
+                *next = next.wrapping_add(1);
+                (make(), *next)
+            })
+            .0
+    }
+}
+
+impl<V: Default> Lines<V> {
+    fn entry(&mut self, entry_id: &str) -> &mut V {
+        self.entry_with(entry_id, V::default)
     }
 }
 

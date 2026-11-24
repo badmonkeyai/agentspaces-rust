@@ -24,7 +24,8 @@ mod common;
 use agentspaces_wire::ads::{
     ACTION_TAKE, AD_TYPE_AGENT_CARD, AD_TYPE_APP_CARD, AD_TYPE_ASSET_CARD, AD_TYPE_SPACE, AdError,
     AppCard, HINT_APP_CARD, MAX_AD_ISSUED_SKEW_MILLIS, MAX_AD_TTL_MILLIS, PEER_AD_TTL,
-    SPILL_MAX_FETCH_BYTES, SpillError, UI_PROTOCOL, UI_VERSION, ad_expires_at_millis, agent_card,
+    CARD_MAX_THREADS, SPILL_MAX_FETCH_BYTES, SpillError, UI_PROTOCOL, UI_VERSION,
+    ad_expires_at_millis, agent_card, agent_card_with_threads, chat_thread,
     app_card_at_level, app_card_host, app_card_level, app_card_origin, app_card_ui, card_action,
     card_parts, card_spill, content_root, content_store_of, endpoint, peer_advertisement,
     peer_advertisement_with_ttl, resolve_spill, signed_peer_ad, space_advertisement, space_id_of,
@@ -369,6 +370,108 @@ fn the_card_with_a_ui_declaration_matches_java() {
     // The Java declaration rebuilds byte for byte from its own parts.
     let java = map_of(&hex("agent_card_ui_cbor"));
     assert_eq!(java.get("ui"), Some(&Value::Map(ui)));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Agent card threads (SPEC §6.1, v0.1.38)
+
+fn golden_threads() -> Vec<Map> {
+    vec![
+        chat_thread("conversations", "main", "tree").unwrap(),
+        chat_thread("conversations", "agent-research", "exact").unwrap(),
+        chat_thread("findings", "", "all").unwrap(),
+    ]
+}
+
+#[test]
+fn the_card_with_threads_matches_java() {
+    let ui_card = map_of(&hex("agent_card_ui_cbor"));
+    let card = agent_card_with_threads(&ui_card, &golden_threads()).unwrap();
+    assert_eq!(bytes_of(&card), hex("agent_card_threads_cbor"));
+    let keys: Vec<&str> = card.keys().filter_map(Value::as_str).collect();
+    assert_eq!(keys.last(), Some(&"threads"));
+    let threads = golden_threads();
+    let thread_keys: Vec<&str> = threads[0]
+        .keys()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(thread_keys, ["space", "key", "scope"]);
+    // The reader decodes the vector and re-encodes it byte for byte.
+    let bytes = hex("agent_card_threads_cbor");
+    let decoded = schema::decode_map(&bytes, "AgentCard").expect("decodes");
+    assert_eq!(bytes_of(&decoded), bytes);
+    // An empty list omits the field, so the card keeps its v0.1.37 bytes.
+    let empty = agent_card_with_threads(&card, &[]).unwrap();
+    assert_eq!(bytes_of(&empty), hex("agent_card_ui_cbor"));
+    // A present empty list re-encodes otherwise, so a reader refuses it.
+    let mut present_empty = ui_card.clone();
+    present_empty.insert("threads", Vec::<Value>::new());
+    assert!(schema::decode(&bytes_of(&present_empty), "AgentCard").is_none());
+    // Signed and stored, the card is admitted.
+    let stored = stored_ad(AD_TYPE_AGENT_CARD, &card, &identity());
+    let now = millis(s("certificate_verify_at")) + 1;
+    assert!(verify_stored_ad(&Value::Map(stored), now).is_some());
+}
+
+#[test]
+fn a_card_with_threads_spills_before_its_threads() {
+    let card = map_of(&hex("agent_card_threads_cbor"));
+    let (stub, document) = spill_card(AD_TYPE_AGENT_CARD, &card).unwrap();
+    let keys: Vec<&str> = stub.keys().filter_map(Value::as_str).collect();
+    assert_eq!(keys[keys.len() - 2..], ["spill", "threads"]);
+    assert!(schema::decode(&bytes_of(&stub), "AgentCard").is_some());
+    let full = resolve_spill(AD_TYPE_AGENT_CARD, &stub, &document, SPILL_MAX_FETCH_BYTES).unwrap();
+    assert_eq!(bytes_of(&full), hex("agent_card_threads_cbor"));
+}
+
+#[test]
+fn the_hostile_thread_cards_are_refused() {
+    for name in [
+        "adv_agent_card_threads_scope_cbor",
+        "adv_agent_card_threads_all_key_cbor",
+        "adv_agent_card_threads_key_cbor",
+        "adv_agent_card_threads_count_cbor",
+        "adv_agent_card_threads_twice_cbor",
+        "adv_agent_card_threads_empty_cbor",
+    ] {
+        let bytes = hex(name);
+        // The bytes are canonical; the refusal is the threads' own.
+        assert!(schema::load_canonical(&bytes).is_some(), "{name}");
+        assert!(schema::decode(&bytes, "AgentCard").is_none(), "{name}");
+        let mut repaired = map_of(&bytes);
+        repaired.remove("threads");
+        assert!(schema::decode(&bytes_of(&repaired), "AgentCard").is_some(), "{name}");
+    }
+}
+
+#[test]
+fn a_thread_against_the_rules_is_refused() {
+    for (space, key, scope) in [
+        ("", "main", "exact"),
+        ("two words", "main", "exact"),
+        ("conversations", "main", "some"),
+        ("conversations", "main", "all"),
+        ("conversations", "", "exact"),
+        ("conversations", "", "tree"),
+        ("conversations", "a\tb", "tree"),
+    ] {
+        assert!(
+            matches!(chat_thread(space, key, scope), Err(AdError::InvalidThread(_))),
+            "{space:?} {key:?} {scope:?}"
+        );
+    }
+    let long = "k".repeat(129);
+    assert!(chat_thread("conversations", &long, "exact").is_err());
+    assert!(chat_thread(&long, "main", "exact").is_err());
+    assert!(chat_thread("conversations", &long[..128], "exact").is_ok());
+    let card = map_of(&hex("agent_card_ui_cbor"));
+    let many: Vec<Map> = (0..=CARD_MAX_THREADS)
+        .map(|n| chat_thread("conversations", &format!("t-{n}"), "exact").unwrap())
+        .collect();
+    assert!(agent_card_with_threads(&card, &many).is_err());
+    assert!(agent_card_with_threads(&card, &many[..CARD_MAX_THREADS]).is_ok());
+    let twice = vec![golden_threads()[0].clone(), golden_threads()[0].clone()];
+    assert!(agent_card_with_threads(&card, &twice).is_err());
 }
 
 #[test]

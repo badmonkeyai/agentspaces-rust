@@ -54,9 +54,13 @@ pub struct Peer {
     events: broadcast::Sender<PeerEvent>,
     link: watch::Receiver<Option<LinkInfo>>,
     folds: watch::Receiver<u64>,
+    /// The wakes the loop saw ([`Peer::wakes`]).
+    wakes: watch::Receiver<u64>,
     clock: SharedClock,
     /// The addresses the listeners bound (none on a dial-only peer).
     listen_addrs: Arc<[Seed]>,
+    /// The loop's heartbeat ([`Peer::loop_health`]).
+    beat: Arc<super::watchdog::LoopBeat>,
 }
 
 impl fmt::Debug for Peer {
@@ -156,10 +160,19 @@ impl Peer {
         if seeds.is_empty() && (!listening || joining) {
             return Err(PeerError::NoSeeds);
         }
+        let dial_counts = Arc::new(actor::DialCounts::default());
         let dialed = if seeds.is_empty() {
             None
         } else {
-            match actor::dial_first(&seeds, &dialers, &identity, settings.dial_timeout).await {
+            match actor::dial_first(
+                &seeds,
+                &dialers,
+                &identity,
+                settings.dial_timeout,
+                &dial_counts,
+            )
+            .await
+            {
                 Ok(dialed) => Some(dialed),
                 Err(error) if listening && !joining => {
                     tracing::warn!(%error, "agentspaces: no seed answered; listening and redialing");
@@ -171,12 +184,13 @@ impl Peer {
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let (link_watch, link) = watch::channel(None);
         let (folds_tx, folds) = watch::channel(0);
+        let (wakes_tx, wakes) = watch::channel(0);
         let peer_id: Arc<str> = Arc::from(identity.peer_id());
         // SPEC §9: a node validates its own node where it builds its clock.
         let hlc = agentspaces_wire::hlc::Hlc::new(identity.peer_id()).map_err(|error| {
             PeerError::InvalidArgument(format!("the PeerID cannot stamp: {error}"))
         })?;
-        let jobs = actor::spawn(
+        let (jobs, beat) = actor::spawn(
             Start {
                 identity,
                 hlc,
@@ -194,6 +208,8 @@ impl Peer {
                 folds: folds_tx,
                 listeners: bound,
                 replicate: listen_config.replicate,
+                dial_counts,
+                wakes: wakes_tx,
             },
             dialed,
         );
@@ -204,8 +220,10 @@ impl Peer {
             events,
             link,
             folds,
+            wakes,
             clock,
             listen_addrs,
+            beat,
         };
         if joining {
             let (waiter, ready) = oneshot::channel();
@@ -240,6 +258,13 @@ impl Peer {
         });
         self.jobs.send(job).await.map_err(|_| PeerError::Closed)?;
         answer.await.map_err(|_| PeerError::Closed)
+    }
+
+    /// How this peer's loop is doing, as its heartbeat and the process's watchdog judge it
+    /// (SPEC v0.1.36 §9.5): turning or not, slow or wedged turns, missed deadlines, contained
+    /// panics. Read without the loop, so it answers while the loop is busy or gone.
+    pub fn loop_health(&self) -> super::watchdog::LoopHealth {
+        self.beat.health()
     }
 
     /// This peer's PeerID.
@@ -678,6 +703,13 @@ impl Peer {
         &self.clock
     }
 
+    /// A receiver of the wake counter: it changes on every wall-clock step the peer's loop sees
+    /// (an NTP step either way, or a wake from a suspend) and on every late wake (a frozen
+    /// process: SIGSTOP, a long pause), so a held take re-checks its hold at once.
+    pub(crate) fn wakes(&self) -> watch::Receiver<u64> {
+        self.wakes.clone()
+    }
+
     /// A receiver of the fold counter: it changes whenever a state or claim folds unrefused.
     pub(crate) fn folds(&self) -> watch::Receiver<u64> {
         self.folds.clone()
@@ -771,6 +803,22 @@ impl Peer {
         Ok(self
             .call(move |actor| actor.space_held(&space, &entry_id, agent))
             .await?)
+    }
+
+    /// Whether a take has lapsed: its claim is no longer `holder`'s at `epoch`, or its
+    /// wall-time lease has passed (owner decision 2 of 2026-11-23).
+    pub(crate) async fn space_take_lapsed(
+        &self,
+        space: &str,
+        entry_id: &str,
+        holder: &str,
+        epoch: i64,
+    ) -> Result<bool, PeerError> {
+        let space = space.to_owned();
+        let entry_id = entry_id.to_owned();
+        let holder = holder.to_owned();
+        self.call(move |actor| actor.space_take_lapsed(&space, &entry_id, &holder, epoch))
+            .await
     }
 
     pub(crate) async fn space_renew_claim(

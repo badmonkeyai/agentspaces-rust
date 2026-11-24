@@ -113,6 +113,7 @@ pub mod peer;
 pub mod remote;
 pub mod space;
 pub mod transport;
+pub mod ttl;
 
 pub use agentspaces_wire as wire;
 /// The resolved configuration: flags, `ASPACE_*` variables, and the fleet YAML ([`config`]).

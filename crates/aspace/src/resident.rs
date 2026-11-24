@@ -28,7 +28,7 @@
 //! the daemon's PeerID instead of answering "nothing matched" from a join that sees nothing.
 //!
 //! Every resident also follows its link ([`watch_link`]): a lost link and its return are said on
-//! standard error, and a peer that gives up redialing stops the resident.
+//! standard error; the peer never gives up redialing, so the resident runs on through an outage.
 
 use std::path::{Path, PathBuf};
 
@@ -215,14 +215,19 @@ pub fn warn_if_shared(keystore: &Path) {
     ));
 }
 
-/// Follows a resident's link: a lost link and its return are said on standard error, and
-/// `gave_up` turns true when the peer gives up redialing its seeds (its reconnect window ran
-/// out), which stops the resident.
+/// Follows a resident's link: a lost link, a whole reconnect window without one, and its return
+/// are said on standard error. The peer never gives up redialing (owner decision 3 of
+/// 2026-11-23), so a resident outlives any outage. `gave_up` turns true only on
+/// [`PeerEvent::GaveUp`], which a peer of this release no longer sends (the variant and this
+/// stop go together at the next release).
 pub async fn watch_link(mut events: broadcast::Receiver<PeerEvent>, gave_up: watch::Sender<bool>) {
     loop {
         match events.recv().await {
             Ok(PeerEvent::Disconnected) => note("the link to the seed is lost; redialing"),
             Ok(PeerEvent::Reconnected { .. }) => note("the link to the seed is back"),
+            Ok(PeerEvent::Unreachable) => {
+                note("no link to any seed for the reconnect window; still redialing");
+            }
             Ok(PeerEvent::GaveUp) => {
                 note("the peer gave up redialing the seeds; stopping");
                 gave_up.send_replace(true);

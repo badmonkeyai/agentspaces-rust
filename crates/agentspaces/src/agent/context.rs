@@ -18,6 +18,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::Mutex;
@@ -31,9 +32,23 @@ const MIN_RENEWAL: Duration = Duration::from_millis(10);
 /// entry, its claim, the binding's lease, and the space, so long work can keep the take alive
 /// ([`TakeContext::keepalive`], [`TakeContext::renew`]), key state by the task's entry id, or
 /// write more entries as the agent. Cheap to clone; every clone renews the same take.
+///
+/// A context renews only while the binder still would, as the reference binder's does: once its agent
+/// is unbound (revoked, abandoned past a stop's grace, or every loop ended) or the hold has
+/// lapsed on wall time, [`TakeContext::renew`] refuses, from every clone, so a handler that
+/// renews its own take (a model stream's keepalive, a task it spawned) cannot keep the entry
+/// after its agent is gone. A take has lapsed once its claim is no longer this holder's (a
+/// better claim displaced it, or the entry was completed or withdrawn) or its wall-time lease
+/// has passed ([`TakeContext::lapsed`]). After a wake (a wall step, or a late wake of a frozen
+/// process) the hold is re-checked at once ([`TakeContext::keepalive`]); a hold that lapsed is
+/// not renewed, and the handler's result is late: it completes nothing.
 #[derive(Debug, Clone)]
 pub struct TakeContext {
     taken: Arc<Mutex<Taken>>,
+    /// Set once the binder that ran this take ended ([`TakeContext::bound_by`]).
+    unbound: Option<Arc<AtomicBool>>,
+    /// Set once the take was seen lapsed ([`TakeContext::lapsed`]); never cleared.
+    lapsed: Arc<AtomicBool>,
     entry: EntryView,
     epoch: i64,
     holder: String,
@@ -50,9 +65,60 @@ impl TakeContext {
             holder: taken.holder().to_owned(),
             space: taken.space().clone(),
             taken: Arc::new(Mutex::new(taken)),
+            unbound: None,
+            lapsed: Arc::new(AtomicBool::new(false)),
             lease,
             produces,
         }
+    }
+
+    /// This context renews only while `unbound` is not set (the binder's end).
+    pub(crate) fn bound_by(mut self, unbound: Arc<AtomicBool>) -> TakeContext {
+        self.unbound = Some(unbound);
+        self
+    }
+
+    /// Whether the agent that runs this take is unbound.
+    fn is_unbound(&self) -> bool {
+        self.unbound
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+    }
+
+    /// Whether a renewal may still be made: the agent is bound and the hold has not been seen
+    /// lapsed. (A renewal still checks the hold on the peer's clock when it is made.)
+    pub fn renewable(&self) -> bool {
+        !self.is_unbound() && !self.lapsed.load(Ordering::SeqCst)
+    }
+
+    /// Whether the take has lapsed (owner decision 2 of 2026-11-23, the same in every
+    /// implementation): its claim is no longer this holder's at this epoch on the peer's replica
+    /// (a better claim displaced it, or the entry was completed or withdrawn), or its wall-time
+    /// lease has passed unrenewed (as after a suspend that outlasted it). Once seen, it stays
+    /// lapsed. A peer that has closed answers only the lease's end.
+    pub async fn lapsed(&self) -> bool {
+        if self.lapsed.load(Ordering::SeqCst) {
+            return true;
+        }
+        let now = self.space.peer().clock().now_ms();
+        let expired = self.taken.lock().await.expires_at_millis() <= now;
+        let lost = !expired
+            && self
+                .space
+                .peer()
+                .space_take_lapsed(
+                    self.space.name(),
+                    self.entry_id().as_str(),
+                    &self.holder,
+                    self.epoch,
+                )
+                .await
+                .unwrap_or(false);
+        if expired || lost {
+            self.lapsed.store(true, Ordering::SeqCst);
+            return true;
+        }
+        false
     }
 
     pub(crate) fn taken(&self) -> &Arc<Mutex<Taken>> {
@@ -126,21 +192,31 @@ impl TakeContext {
     }
 
     /// Renews the hold by the binding's lease from now (Java `TakeContext.renew`); answers the
-    /// new expiry.
+    /// new expiry. Refused, with nothing sent, once the agent is unbound or the hold has lapsed
+    /// on wall time ([`TakeContext::renewable`]).
     ///
     /// # Errors
     ///
-    /// [`SpaceError::NotHeld`] once the hold lapsed or was lost, and the errors of
-    /// [`Taken::renew`].
+    /// [`SpaceError::NotHeld`] once the hold lapsed or was lost, or the agent is unbound, and
+    /// the errors of [`Taken::renew`].
     pub async fn renew(&self) -> Result<i64, SpaceError> {
+        if self.is_unbound() || self.lapsed().await {
+            return Err(SpaceError::NotHeld(self.entry_id().clone()));
+        }
         self.taken.lock().await.renew(self.lease).await
     }
 
     /// Runs `work` while renewing the take's hold every half lease, the first renewal at half of
     /// what the hold has left when that is sooner ([`TakeContext::hold_left`]), and stops renewing
     /// when `work` ends, whatever it answers: long work keeps its task without the handler
-    /// threading renewals through its code. A renewal that fails (the hold was lost) is logged and
-    /// ends the renewals; `work` runs on.
+    /// threading renewals through its code. A renewal that fails (the hold was lost, or the agent
+    /// is unbound) is logged and ends the renewals; `work` runs on.
+    ///
+    /// On every wake the peer sees (a wall-clock step, such as a wake from a suspend or an NTP
+    /// step, or a late wake of a frozen process), the take is re-checked at once
+    /// ([`TakeContext::lapsed`]) rather than at the next half lease, which the monotonic clock
+    /// (not counting a sleep) would put late: a take that lapsed meanwhile is renewed no more and
+    /// the handler's result will be late; one still running is renewed now.
     ///
     /// ```no_run
     /// # use agentspaces::agent::{HandlerError, Reply, TakeContext};
@@ -157,11 +233,37 @@ impl TakeContext {
         let mut renewing = true;
         let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + first, half);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut steps = self.space.peer().wakes();
+        steps.mark_unchanged();
+        let mut stepping = true;
         tokio::pin!(work);
         loop {
             tokio::select! {
                 biased;
                 output = &mut work => return output,
+                changed = steps.changed(), if renewing && stepping => {
+                    if changed.is_err() {
+                        // The peer's loop is gone: the next renewal fails and ends them.
+                        stepping = false;
+                        continue;
+                    }
+                    if self.lapsed().await {
+                        tracing::warn!(
+                            entry_id = %self.entry_id(),
+                            "agentspaces: the take lapsed (its claim lost, or its hold ran out \
+                             while the host slept); renewals stop and the result will be late"
+                        );
+                        renewing = false;
+                    } else if let Err(error) = self.renew().await {
+                        tracing::warn!(
+                            entry_id = %self.entry_id(),
+                            %error,
+                            "agentspaces: a keepalive renewal after a wall-clock step failed; \
+                             renewals stop"
+                        );
+                        renewing = false;
+                    }
+                }
                 _ = ticks.tick(), if renewing => {
                     if let Err(error) = self.renew().await {
                         tracing::warn!(

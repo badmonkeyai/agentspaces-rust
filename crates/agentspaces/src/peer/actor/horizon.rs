@@ -50,6 +50,7 @@ use agentspaces_wire::fold::FoldContext;
 use agentspaces_wire::horizon::{self, Rule, Standing, Writer};
 use agentspaces_wire::serving;
 use agentspaces_wire::trie;
+use tokio::time::Instant;
 
 use super::{Actor, bump};
 
@@ -78,9 +79,19 @@ pub(in crate::peer) struct HorizonView {
 impl Actor {
     /// Whether every member in view advertises `wire.horizon=1` at `now`, deriving the view (and
     /// the stays) again when the member view changed or an advertisement in it lapsed since.
-    fn view_hinted(&mut self, now: i64) -> bool {
+    pub(super) fn view_hinted(&mut self, now: i64) -> bool {
         let generation = self.members.generation();
+        // A wake's view re-probe ([`Actor::reprobe_view`]): until it ends, a member whose card
+        // was live when this peer went quiet stays in view, counted as lacking the hint.
+        let reprobe = self
+            .view_reprobe
+            .filter(|(_, until)| Instant::now() < *until)
+            .map(|(quiet_since, _)| quiet_since);
+        if reprobe.is_none() && self.view_reprobe.is_some() {
+            self.end_view_reprobe();
+        }
         if let Some((at, until, hinted)) = self.horizon_view.derived
+            && reprobe.is_none()
             && at == generation
             && now < until
         {
@@ -106,6 +117,11 @@ impl Actor {
                     hinted &= horizon::hints_horizon(ad.get("resourceHints"));
                     in_view.push((peer.to_owned(), entered));
                 }
+                Some(expires) if reprobe.is_some_and(|quiet_since| expires > quiet_since) => {
+                    // Lapsed only while this peer was away: probed, not dropped.
+                    hinted = false;
+                    in_view.push((peer.to_owned(), entered));
+                }
                 _ => {}
             }
         }
@@ -124,8 +140,15 @@ impl Actor {
                 );
             }
         }
-        self.horizon_view.derived = Some((generation, until, hinted));
+        // Derived during a re-probe, it holds only until the re-probe ends.
+        self.horizon_view.derived = reprobe.is_none().then_some((generation, until, hinted));
         hinted
+    }
+
+    /// The view the per-entry horizon judges by changed outside the member view (a wake's
+    /// re-probe began or ended): derived again on the next judgement.
+    pub(super) fn horizon_view_changed(&mut self) {
+        self.horizon_view.derived = None;
     }
 
     /// The rule `space` applies at `now`: its gate judged against this peer's setting and view

@@ -44,8 +44,9 @@
 //! `sweepLocked`): `Written` at the first fold of a live entry, `Completed` when the joined state
 //! turns completed (for an entry first learned already completed, only when its value is held
 //! here, and never with a `Written` or `Taken` before it: SPEC §7.2, *Completed on arrival*), `Taken` when a member's claim wins the lattice while live (once per epoch and
-//! holder; this peer's own claim only once its take has won), and, from the sweep that runs every
-//! [`SWEEP_INTERVAL`] while a space has watchers, `Expired` once per open entry whose write lease
+//! holder; this peer's own claim only once its take has won), and, from the sweep that runs when
+//! the earliest such lapse falls due while a space has watchers ([`Actor::sweep_at`]), `Expired`
+//! once per open entry whose write lease
 //! lapsed and `Reappeared` once per lapsed claim epoch of an open entry. Each transition is offered
 //! to the matching watches without waiting ([`crate::space::watch`]); one whose payload block is
 //! still on its way waits (at most [`MAX_DEFERRED`] of them) until the block arrives.
@@ -91,16 +92,23 @@ use agentspaces_wire::records::{self, PayloadSource, WRITE_LEASE_KIND};
 use tokio::time::Instant;
 
 use super::{Actor, DEFAULT_AGENT_NAME, PeerError, PeerEvent, bump, fits_a_frame};
-use crate::peer::spaces::{Fired, MAX_TRACKED_LEASE_MILLIS, Slot};
+use crate::peer::spaces::{
+    DISPLACED_PULL_MAX, Fired, MAX_TRACKED_LEASE_MILLIS, REOFFER_BACKOFF, REOFFER_MAX, Slot,
+};
 use crate::space::watch::{CloseReason, WatchQueue};
 use crate::space::{
     Attestation, ClaimTicket, EntryId, EntryView, EventKind, ResultWrite, SpaceError, SpaceEvent,
     Template,
 };
 
-/// How often the transitions the clock decides (`Expired`, `Reappeared`, a subscription's lapse)
-/// are looked for while anything watches (`space.py`'s sweep, four times a second).
-pub(in crate::peer) const SWEEP_INTERVAL: Duration = Duration::from_millis(250);
+/// The longest the watch sweep waits while anything watches, whatever its next due: a backstop
+/// for a lapse that moved earlier without lowering the sweep. The sweep otherwise runs when the
+/// earliest lapse it tells falls due (SPEC v0.1.36 §9.5: "when the earliest lapse falls due",
+/// where it ran four times a second before).
+pub(in crate::peer) const SWEEP_BACKSTOP: Duration = Duration::from_secs(30);
+/// How often transitions waiting for their payload's block are offered again, while any wait
+/// (the block is asked for again at most this often too).
+const DEFERRED_RETRY: Duration = Duration::from_secs(1);
 /// The most transitions waiting for their payload's block.
 pub(in crate::peer) const MAX_DEFERRED: usize = 4096;
 /// The most watches a peer holds at once.
@@ -240,6 +248,38 @@ fn tags_match(template: &Template, state: &Map) -> bool {
 }
 
 /// The tracker of `entry_id`, made on first use.
+/// When the sweep next has something to tell of one entry at `now` (epoch milliseconds): its
+/// write lease's lapse (`Expired`) or its live claim's (`Reappeared`), `now` when one is past and
+/// untold, `None` when nothing the clock decides is left (completed, withdrawn, told, or a lease
+/// that never lapses).
+fn entry_sweep_due(
+    state: &Map,
+    claim: Option<&Map>,
+    fired: Option<&Fired>,
+    now: i64,
+) -> Option<i64> {
+    if !fold::is_present(state) {
+        return None;
+    }
+    let told = fired.cloned().unwrap_or_default();
+    if write_lapsed(state, now) {
+        return (!told.expired).then_some(now);
+    }
+    let kind = lease_of(state)
+        .and_then(|lease| lease.get("kind"))
+        .and_then(Value::as_str);
+    let mut due = write_expiry(state).filter(|_| kind.is_none_or(|kind| kind == WRITE_LEASE_KIND));
+    if let Some(claim) = claim {
+        let expires = claim.get("expiresAtMillis").and_then(Value::as_i64);
+        let at = match expires {
+            Some(expires) if expires > now => Some(expires),
+            _ => (told.reappeared != Some(claim_epoch(claim))).then_some(now),
+        };
+        due = [due, at].into_iter().flatten().min();
+    }
+    due
+}
+
 fn fired_mut<'a>(fired: &'a mut HashMap<String, Fired>, entry_id: &str) -> &'a mut Fired {
     fired.entry(entry_id.to_owned()).or_default()
 }
@@ -511,11 +551,18 @@ impl Actor {
             .spaces
             .get_mut(space)
             .ok_or_else(|| SpaceError::UnknownEntry(EntryId::new(entry_id)))?;
+        let before = slot.store.claim_proof(entry_id).cloned();
         let outcome = slot.store.merge_own_claim(entry_id, signed);
         if outcome.is_applied()
             && let Some(span) = claim_lease_span(signed)
         {
             slot.observe_lease(span);
+        }
+        if matches!(outcome, FoldOutcome::Applied | FoldOutcome::Unchanged) {
+            self.after_claim_merge(space, entry_id, before.as_ref(), signed);
+        }
+        if outcome.is_applied() {
+            self.note_sweep_entry(space, entry_id);
         }
         match outcome {
             FoldOutcome::Refused(refusal) => return Err(refused(entry_id, refusal)),
@@ -695,6 +742,21 @@ impl Actor {
 
     /// Checks that `holder` still holds `entry_id` at `epoch` (live, the entry present) and
     /// answers the signed claim; [`SpaceError::NotHeld`] otherwise.
+    /// Whether a take has lapsed (owner decision 2 of 2026-11-23): the claim this peer
+    /// holds for `entry_id` is no longer `holder`'s at `epoch` (a better claim displaced it, or
+    /// the entry was completed or withdrawn), or its wall-time lease has passed. A result that
+    /// arrives after the lapse completes nothing ([`crate::agent::TakeContext::lapsed`]).
+    pub(crate) fn space_take_lapsed(
+        &self,
+        space: &str,
+        entry_id: &str,
+        holder: &str,
+        epoch: i64,
+    ) -> bool {
+        self.held_claim(space, entry_id, holder, epoch, self.now())
+            .is_err()
+    }
+
     fn held_claim(
         &self,
         space: &str,
@@ -1090,7 +1152,11 @@ impl Actor {
             }
             self.collect_spaces(&[space.to_owned()], now);
         }
-        self.fold_state(space, dto)
+        let outcome = self.fold_state(space, dto);
+        if let Some(outcome) = outcome {
+            self.after_remote_state(space, dto, outcome);
+        }
+        outcome
     }
 
     /// Judges a completion of `space` this peer refused, received with the claim `proof` it
@@ -1198,6 +1264,316 @@ impl Actor {
                  the race but heard of the winner later than the settle window (SPEC 7.4); the \
                  shared state keeps one completion"
             );
+        }
+    }
+
+    /// After a received or own claim of `entry_id` merged into `space` (applied or unchanged),
+    /// with `before` the claim held until then: when the lattice kept one claim of two held by
+    /// different holders, notes what rule two of the settle guarantee needs (SPEC v0.1.36 §7.4,
+    /// *Pairing the evidence*; Java `mergeHeldClaim`).
+    pub(super) fn after_claim_merge(
+        &mut self,
+        space: &str,
+        entry_id: &str,
+        before: Option<&Map>,
+        incoming: &Map,
+    ) {
+        let Some(before) = before else {
+            return;
+        };
+        let Some(kept) = self
+            .spaces
+            .get(space)
+            .and_then(|slot| slot.store.claim_proof(entry_id))
+            .cloned()
+        else {
+            return;
+        };
+        let lost = if kept == *before { incoming } else { before };
+        self.note_displaced(space, entry_id, &kept, lost);
+    }
+
+    /// Keeps what rule two of the settle guarantee needs once the lattice kept `kept` over `lost`
+    /// for `entry_id` (Java `noteDisplaced`): the displaced claim, when one of this peer's holders
+    /// holds the kept one (it is judged at once against the completions dropped here for want of
+    /// it); and this peer's own completion's claim, when `lost` is the claim one of this peer's
+    /// holders completed under (it is offered again, [`Actor::offer_displaced`]). Every claim
+    /// reaching here was verified or signed here. A renewal or an attestation upgrade of one
+    /// holder's claim displaces nobody.
+    fn note_displaced(&mut self, space: &str, entry_id: &str, kept: &Map, lost: &Map) {
+        let (Some(kept_claim), Some(lost_claim)) = (
+            kept.get("claim").and_then(Value::as_map),
+            lost.get("claim").and_then(Value::as_map),
+        ) else {
+            return;
+        };
+        if kept_claim == lost_claim {
+            return;
+        }
+        let (Some(kept_holder), Some(lost_holder)) =
+            (claim_holder(kept_claim), claim_holder(lost_claim))
+        else {
+            return;
+        };
+        if kept_holder == lost_holder {
+            return;
+        }
+        let ours = |holder: &str| holder.split('/').next() == Some(self.peer_id.as_str());
+        let (kept_ours, lost_ours) = (ours(kept_holder), ours(lost_holder));
+        let lost_epoch = claim_epoch(lost_claim);
+        let Some(slot) = self.spaces.get_mut(space) else {
+            return;
+        };
+        if lost_ours && !kept_ours {
+            // The claim made here that this peer first lost on the entry, whether or not one of
+            // its holders completed under it: what a relayed DIGEST draws (owner decision 1).
+            slot.settle.note_displaced_here(entry_id, lost);
+        }
+        if kept_ours {
+            slot.settle.note_displaced_claim(entry_id, lost);
+            let unproven = slot.settle.unproven(entry_id) > 0;
+            if !lost_ours && let Some(lost_peer) = lost_holder.split('/').next() {
+                // The targeted rounds toward the displaced holder (owner decision 4), due at
+                // once for a new line.
+                let due = slot
+                    .settle
+                    .note_displaced_holder(entry_id, lost_peer, Instant::now());
+                self.lower_displaced_pull_due(due);
+            }
+            if unproven {
+                self.judge_displaced(space, entry_id);
+            }
+        } else if lost_ours
+            && slot.settle.completed_here(entry_id) == Some(lost_epoch)
+            && slot.settle.start_reoffer(entry_id, lost, Instant::now())
+        {
+            self.offer_displaced(space, entry_id);
+        }
+    }
+
+    /// After a received state of `space` folded with `outcome`: a completion dropped while one
+    /// of this peer's holders holds the entry's claim is kept, as it may be a displaced holder's
+    /// whose claim comes in another frame (Java `rememberUnproven`), and judged against the
+    /// displaced claims kept; a state that still shows the entry open makes this peer's own
+    /// displaced claim due again once its backoff has passed (Java `staleOffered`).
+    pub(super) fn after_remote_state(&mut self, space: &str, dto: &Map, outcome: FoldOutcome) {
+        let Some(entry_id) = records::state_entry_id(dto) else {
+            return;
+        };
+        if !is_completed(dto) {
+            let due = self
+                .spaces
+                .get_mut(space)
+                .and_then(|slot| slot.settle.reoffer_mut(entry_id))
+                .is_some_and(|line| Instant::now() >= line.next_at);
+            if due {
+                self.offer_displaced(space, entry_id);
+            }
+            return;
+        }
+        if !matches!(outcome, FoldOutcome::Refused(_) | FoldOutcome::Unchanged) {
+            return;
+        }
+        let Some(slot) = self.spaces.get_mut(space) else {
+            return;
+        };
+        let Some(held_holder) = slot
+            .store
+            .claim_of(entry_id)
+            .and_then(claim_holder)
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        if held_holder.split('/').next() != Some(self.peer_id.as_str())
+            || dto.get("signer").and_then(Value::as_str) == Some(held_holder.as_str())
+        {
+            // Not this peer's claim, or the held claim's own completion coming back.
+            return;
+        }
+        if slot.settle.note_unproven(entry_id, dto) {
+            self.judge_displaced(space, entry_id);
+        }
+    }
+
+    /// Judges each completion dropped here for `entry_id` against each claim this peer's claim
+    /// displaced for it (Java `judgeDisplaced`): the pair authenticates a displaced holder's
+    /// completion as the delta that first carried both would have, whichever frames brought
+    /// them; [`Actor::note_outbid_completion`] makes every check it makes for that delta.
+    fn judge_displaced(&mut self, space: &str, entry_id: &str) {
+        let Some((claims, states)) = self
+            .spaces
+            .get(space)
+            .and_then(|slot| slot.settle.pairs(entry_id))
+        else {
+            return;
+        };
+        for state in &states {
+            let signer = state.get("signer").and_then(Value::as_str);
+            for claim in &claims {
+                let holder = claim
+                    .get("claim")
+                    .and_then(Value::as_map)
+                    .and_then(claim_holder);
+                if signer.is_none() || signer == holder {
+                    self.note_outbid_completion(space, entry_id, claim, state);
+                }
+            }
+        }
+    }
+
+    /// Offers again this peer's displaced claim of `entry_id` when it is due, as the claim delta
+    /// it first travelled in (under the same item id), and moves its next offer back: at once,
+    /// then no sooner than 1 s, 2 s, 4 s, and so on after the previous offer, at most
+    /// [`REOFFER_MAX`] offers in all (SPEC v0.1.36 §7.4; the lenient retries of §9.4). The line
+    /// goes once its offers are spent, its claim lapsed, its stamp is half the drift ceiling old
+    /// (past which a replica holding the better claim would refuse it as a far-past contest), or
+    /// the entry left the store. Nothing runs while no frame shows the entry open.
+    pub(super) fn offer_displaced(&mut self, space: &str, entry_id: &str) {
+        let wall = self.now();
+        let now = Instant::now();
+        let Some(slot) = self.spaces.get_mut(space) else {
+            return;
+        };
+        let gone = slot.store.state(entry_id).is_none();
+        let Some(line) = slot.settle.reoffer_mut(entry_id) else {
+            return;
+        };
+        let claim = line.proof.get("claim").and_then(Value::as_map);
+        let stamp = claim
+            .and_then(|claim| claim.get("stamp"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let physical = stamp
+            .as_deref()
+            .and_then(Stamp::parse)
+            .map(|stamp| stamp.physical);
+        let spent = line.offers >= REOFFER_MAX
+            || gone
+            || !claim.is_some_and(|claim| claim_live(claim, wall))
+            || physical.is_none_or(|physical| {
+                wall.saturating_sub(physical) > agentspaces_wire::limits::MAX_DRIFT_MILLIS / 2
+            });
+        if spent {
+            slot.settle.end_reoffer(entry_id);
+            return;
+        }
+        if now < line.next_at {
+            return;
+        }
+        let backoff = REOFFER_BACKOFF.saturating_mul(1u32 << line.offers.min(30));
+        line.next_at = now.checked_add(backoff).unwrap_or(now);
+        line.offers = line.offers.saturating_add(1);
+        let proof = line.proof.clone();
+        let Some(stamp) = stamp else {
+            return;
+        };
+        let body = bodies::rumor_body(
+            &stream_of(space),
+            &format!("c:{entry_id}:{stamp}"),
+            RUMOR_HOPS,
+            &records::claim_delta(entry_id, &proof),
+        );
+        bump(&mut self.counters.displaced_reoffers);
+        self.send_or_hold(body);
+    }
+
+    /// Forgets the displaced claims made here in `space` no longer worth sending (Java
+    /// `pruneDisplacedHere`): the entry left the store, the claim lapsed, or its stamp nears the
+    /// drift ceiling, as a re-offer judges. Answers whether a displaced claim is still held
+    /// there (Java `holdsDisplaced`), so a relayed DIGEST naming the space draws an answer.
+    pub(super) fn holds_displaced(&mut self, space: &str) -> bool {
+        let wall = self.now();
+        let Some(slot) = self.spaces.get_mut(space) else {
+            return false;
+        };
+        let store = &slot.store;
+        slot.settle.prune_displaced_here(|entry_id, lost| {
+            let claim = lost.get("claim").and_then(Value::as_map);
+            let physical = claim
+                .and_then(|claim| claim.get("stamp"))
+                .and_then(Value::as_str)
+                .and_then(Stamp::parse)
+                .map(|stamp| stamp.physical);
+            store.state(entry_id).is_some()
+                && claim.is_some_and(|claim| claim_live(claim, wall))
+                && physical.is_some_and(|physical| {
+                    wall.saturating_sub(physical) <= agentspaces_wire::limits::MAX_DRIFT_MILLIS / 2
+                })
+        });
+        slot.settle
+            .displaced_lines()
+            .iter()
+            .any(|(entry_id, _)| slot.store.state(entry_id).is_some())
+    }
+
+    /// Brings the targeted rounds' deadline forward to `due` ([`Actor::run_displaced_pulls`]).
+    pub(super) fn lower_displaced_pull_due(&mut self, due: Instant) {
+        self.displaced_pull_due = Some(self.displaced_pull_due.map_or(due, |at| at.min(due)));
+    }
+
+    /// The targeted anti-entropy rounds toward displaced holders that are due (Java
+    /// `pullDisplacedHolders`, owner decision 4 of 2026-11-23). While one of this peer's holders
+    /// holds an entry's winning claim and the entry is still present here, each holder that
+    /// claim displaced is sent a round of this peer's digests ([`Actor::round_with`]): at once,
+    /// then after 1, 2, 4, 8 and 16 s, at most [`DISPLACED_PULL_MAX`] rounds, on the monotonic
+    /// clock. A displaced holder's completion may have only one source, the holder, and a round
+    /// repairs its opener, so this peer learns of it within one round rather than waiting for
+    /// its periodic round's random partner to be that holder. A line ends once the take is no
+    /// longer open here: the claim is no longer this peer's or lapsed, the entry is no longer
+    /// present (completed here or elsewhere, or withdrawn), or the displaced completion is
+    /// already noted. No wire change: a round is the usual `DIGEST`.
+    pub(super) fn run_displaced_pulls(&mut self) {
+        let wall = self.now();
+        let now = Instant::now();
+        let mut partners: Vec<String> = Vec::new();
+        let mut next: Option<Instant> = None;
+        let me = self.peer_id.clone();
+        for name in self.spaces.names() {
+            let Some(slot) = self.spaces.get_mut(&name) else {
+                continue;
+            };
+            for entry_id in slot.settle.displaced_pull_entries() {
+                let held = slot.store.claim_of(&entry_id);
+                let open = held.is_some_and(|claim| {
+                    claim_holder(claim).and_then(|holder| holder.split('/').next())
+                        == Some(me.as_str())
+                        && claim_live(claim, wall)
+                        && slot.settle.outbid(&entry_id) != Some(claim_epoch(claim))
+                }) && slot.store.state(&entry_id).is_some_and(fold::is_present);
+                let Some(pull) = slot.settle.displaced_pull_mut(&entry_id) else {
+                    continue;
+                };
+                if !open || pull.rounds >= DISPLACED_PULL_MAX {
+                    slot.settle.end_displaced_pull(&entry_id);
+                    continue;
+                }
+                if now >= pull.next_at {
+                    for holder in &pull.holders {
+                        if !partners.contains(holder) {
+                            partners.push(holder.clone());
+                        }
+                    }
+                    let backoff = REOFFER_BACKOFF.saturating_mul(1u32 << pull.rounds.min(30));
+                    pull.next_at = now.checked_add(backoff).unwrap_or(now);
+                    pull.rounds = pull.rounds.saturating_add(1);
+                    if pull.rounds >= DISPLACED_PULL_MAX {
+                        slot.settle.end_displaced_pull(&entry_id);
+                        continue;
+                    }
+                }
+                next = Some(next.map_or(pull.next_at, |at: Instant| at.min(pull.next_at)));
+            }
+        }
+        self.displaced_pull_due = next;
+        for partner in partners {
+            bump(&mut self.counters.displaced_pull_rounds);
+            tracing::debug!(
+                peer = %self.peer_id,
+                partner = %partner,
+                "agentspaces: a targeted anti-entropy round toward a holder this peer's claim displaced"
+            );
+            self.round_with(&partner);
         }
     }
 
@@ -1361,12 +1737,85 @@ impl Actor {
         if self.watchers.is_empty() {
             self.last_sweep = Instant::now();
         }
+        let lapses = self.watch_lapse_wall(queue.expires_at());
         self.watchers.push(Watcher {
             space: space.to_owned(),
             template,
             queue,
         });
+        // The new watch's lapse, and its space's lapses if it is the first to watch it.
+        self.lower_sweep(lapses);
+        let now = self.now();
+        let due = self.space_sweep_due(space, now);
+        if let Some(due) = due {
+            self.lower_sweep(due);
+        }
         Ok(())
+    }
+
+    /// When the watch sweep runs next while anything watches: the earliest lapse it tells
+    /// ([`Actor::sweep_due`], wall time re-anchored on every call), at most
+    /// [`SWEEP_BACKSTOP`] after the last sweep, and within [`DEFERRED_RETRY`] while transitions
+    /// wait for their block. `None` while nothing watches.
+    pub(super) fn sweep_at(&self) -> Option<Instant> {
+        if !self.watching() {
+            return None;
+        }
+        let now = Instant::now();
+        let due = self
+            .sweep_due
+            .map(|at| super::serve::wall_due(now, self.now(), at));
+        let backstop = self.last_sweep.checked_add(SWEEP_BACKSTOP);
+        let deferred = if self.deferred.is_empty() {
+            None
+        } else {
+            self.last_sweep.checked_add(DEFERRED_RETRY)
+        };
+        [due, backstop, deferred].into_iter().flatten().min()
+    }
+
+    /// Runs the watch sweep no later than `at_ms` (epoch milliseconds).
+    fn lower_sweep(&mut self, at_ms: i64) {
+        self.sweep_due = Some(self.sweep_due.map_or(at_ms, |due| due.min(at_ms)));
+    }
+
+    /// The earliest lapse the sweep tells in `space`, if anything watches it.
+    fn space_sweep_due(&self, space: &str, now: i64) -> Option<i64> {
+        if !self.watchers.iter().any(|watcher| watcher.space == space) {
+            return None;
+        }
+        let slot = self.spaces.get(space)?;
+        slot.store
+            .states()
+            .filter_map(|(entry_id, state)| {
+                entry_sweep_due(
+                    state,
+                    slot.store.claim_of(entry_id),
+                    slot.fired.get(entry_id),
+                    now,
+                )
+            })
+            .min()
+    }
+
+    /// Lowers the sweep to what `entry_id` of `space` next has to tell, if anything watches it:
+    /// called after a state or claim of it applied.
+    fn note_sweep_entry(&mut self, space: &str, entry_id: &str) {
+        if !self.watchers.iter().any(|watcher| watcher.space == space) {
+            return;
+        }
+        let now = self.now();
+        let due = self.spaces.get(space).and_then(|slot| {
+            entry_sweep_due(
+                slot.store.state(entry_id)?,
+                slot.store.claim_of(entry_id),
+                slot.fired.get(entry_id),
+                now,
+            )
+        });
+        if let Some(due) = due {
+            self.lower_sweep(due);
+        }
     }
 
     /// Whether anything watches (the sweep runs only then).
@@ -1408,6 +1857,7 @@ impl Actor {
                 self.deliver(space, EventKind::Completed, entry_id);
             }
         }
+        self.note_sweep_entry(space, entry_id);
     }
 
     /// Whether an entry's value is available here without fetching anything: an inline or null
@@ -1431,6 +1881,7 @@ impl Actor {
     /// once per epoch and holder, while the claim is live and the entry present.
     pub(super) fn after_claim(&mut self, space: &str, entry_id: &str) {
         self.fire_taken(space, entry_id);
+        self.note_sweep_entry(space, entry_id);
     }
 
     /// Tells `Taken` for the claim in force on `entry_id`, unless already told for its epoch
@@ -1467,11 +1918,12 @@ impl Actor {
     pub(super) fn on_sweep(&mut self) {
         self.last_sweep = Instant::now();
         let now = self.now();
+        let local = self.clock.local_ms();
         self.watchers.retain(|watcher| {
             if watcher.queue.closed().is_some() {
                 return false;
             }
-            if watcher.queue.lapsed(now) {
+            if watcher.queue.lapsed(local) {
                 watcher.queue.close(CloseReason::Lapsed);
                 return false;
             }
@@ -1519,6 +1971,41 @@ impl Actor {
             self.deliver(&space, kind, &entry_id);
         }
         self.retry_deferred();
+        // The next due: the earliest lapse still to tell, or a watch's own.
+        let now = self.now();
+        let spaces: BTreeSet<String> = self
+            .watchers
+            .iter()
+            .map(|watcher| watcher.space.clone())
+            .collect();
+        let entries = spaces
+            .iter()
+            .filter_map(|space| self.space_sweep_due(space, now));
+        let watches = self
+            .watchers
+            .iter()
+            .map(|watcher| self.watch_lapse_wall(watcher.queue.expires_at()));
+        self.sweep_due = entries.chain(watches).min();
+    }
+
+    /// A watch's lapse, kept on the clock's local base (a subscription's lease is a local period,
+    /// SPEC v0.1.36 §9.5), as the wall instant the sweep's due is kept in at this reading. A wall
+    /// step asks the sweep again at once ([`Actor::on_wall_step`]), which re-reads it.
+    fn watch_lapse_wall(&self, local: i64) -> i64 {
+        if local == i64::MAX {
+            return i64::MAX;
+        }
+        self.now()
+            .saturating_add(local.saturating_sub(self.clock.local_ms()))
+    }
+
+    /// A wall step (SPEC v0.1.36 §9.5): the sweep runs at once while anything watches, so the
+    /// lapses it keeps in wall time are read again.
+    pub(super) fn sweep_after_wall_step(&mut self) {
+        if self.watching() {
+            let now = self.now();
+            self.lower_sweep(now);
+        }
     }
 
     /// Offers one transition to the watches of `space` whose templates match; one whose payload
@@ -1550,6 +2037,7 @@ impl Actor {
             Viewed::Unreadable => return,
         };
         let event = SpaceEvent { kind, entry: view };
+        let local = self.clock.local_ms();
         self.watchers.retain(|watcher| {
             if watcher.queue.closed().is_some() {
                 return false;
@@ -1557,7 +2045,7 @@ impl Actor {
             if watcher.space != space {
                 return true;
             }
-            if watcher.queue.lapsed(now) {
+            if watcher.queue.lapsed(local) {
                 watcher.queue.close(CloseReason::Lapsed);
                 return false;
             }
@@ -1764,5 +2252,1185 @@ mod tests {
         let completed = bare_view("e", &done, Some(&claim), 50).map(|view| view.holder);
         assert_eq!(completed, Some(Some("p/b".to_owned())));
         assert_eq!(claim_epoch(&claim), 2);
+    }
+}
+
+/// Rule two of the settle guarantee with its evidence in different frames, and the displaced
+/// holder's re-offer (SPEC v0.1.36 §7.4, *Pairing the evidence*), between two actors with no link:
+/// each frame one sends waits in its outbox, and the test hands it to the other as the frames
+/// the race would have carried.
+#[cfg(test)]
+mod settle_pairing_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use agentspaces_wire::audit::{self as wire_audit, DigestBody};
+    use agentspaces_wire::bodies::{self, Rumor};
+    use agentspaces_wire::cbor::{Map, Value};
+    use agentspaces_wire::records;
+
+    use super::super::serve::RELAYED_ANSWER_BURST;
+    use super::super::tests::test_actor;
+    use super::super::{Actor, Via};
+    use super::claim_epoch;
+    use crate::clock::ManualClock;
+
+    const SPACE: &str = "tasks";
+    const T0: i64 = 1_900_000_000_000;
+
+    /// An actor on a manual wall clock reading `at`, its space opened.
+    fn actor(at: i64) -> (Actor, ManualClock) {
+        let (mut actor, ..) = test_actor();
+        let clock = ManualClock::new(at);
+        actor.clock = Arc::new(clock.clone());
+        actor.space_open(SPACE).expect("open");
+        actor.outbox.clear();
+        (actor, clock)
+    }
+
+    /// The rumors `actor` sent since the last call.
+    fn sent(actor: &mut Actor) -> Vec<Rumor> {
+        actor
+            .outbox
+            .drain(..)
+            .filter_map(|body| bodies::parse_rumor(&body))
+            .collect()
+    }
+
+    fn deliver(actor: &mut Actor, rumor: &Rumor) {
+        let _ = actor.on_rumor(rumor.clone(), Via::Dialed);
+    }
+
+    /// `rumor`'s delta with its claim removed: the completion alone, as a replica that merged
+    /// the better claim offers it.
+    fn state_alone(rumor: &Rumor) -> Rumor {
+        let delta = records::decode_delta(&rumor.payload).expect("a delta");
+        let state = delta.state.expect("a state");
+        Rumor {
+            payload: records::delta(Some(&state), None),
+            ..rumor.clone()
+        }
+    }
+
+    /// The race: `w` writes the entry and claims it first (the earlier stamp, so its claim wins
+    /// the lattice); `l` never hears of that claim, claims later, judges itself the winner, and
+    /// completes. Answers the entry id, `w`'s epoch, and the rumors: `w`'s write, `w`'s claim,
+    /// `l`'s claim, and `l`'s completion (with its claim).
+    struct Race {
+        entry: String,
+        w_epoch: i64,
+        l_epoch: i64,
+        write: Rumor,
+        w_claim: Rumor,
+        l_claim: Rumor,
+        l_completion: Rumor,
+    }
+
+    fn run_race(w: &mut Actor, l: &mut Actor, l_completes: bool) -> Race {
+        let entry = w
+            .write_entry(
+                SPACE,
+                "T#v1",
+                &Value::from("work"),
+                120_000,
+                &Map::new(),
+                None,
+            )
+            .expect("write");
+        let write = sent(w).remove(0);
+        deliver(l, &write);
+        let w_ticket = w
+            .space_claim(SPACE, &entry, None, 60_000)
+            .expect("claim")
+            .expect("free");
+        let w_claim = sent(w).remove(0);
+        let l_ticket = l
+            .space_claim(SPACE, &entry, None, 60_000)
+            .expect("claim")
+            .expect("free here: l never heard of w's claim");
+        let l_claim = sent(l).remove(0);
+        assert!(
+            l.space_settle(SPACE, &entry, &l_ticket.holder, l_ticket.epoch, None)
+                .is_some(),
+            "l judges its take alone and wins"
+        );
+        let mut l_completion = l_claim.clone();
+        if l_completes {
+            l.space_complete(SPACE, &entry, &l_ticket.holder, l_ticket.epoch, None, None)
+                .expect("l completes");
+            l_completion = sent(l).remove(0);
+        }
+        Race {
+            entry,
+            w_epoch: w_ticket.epoch,
+            l_epoch: l_ticket.epoch,
+            write,
+            w_claim,
+            l_claim,
+            l_completion,
+        }
+    }
+
+    fn outbid(actor: &Actor, entry: &str) -> Option<i64> {
+        actor
+            .spaces
+            .get(SPACE)
+            .and_then(|slot| slot.settle.outbid(entry))
+    }
+
+    #[tokio::test]
+    async fn a_displaced_claim_heard_first_pairs_with_its_completion_arriving_alone() {
+        let (mut w, _) = actor(T0);
+        let (mut l, _) = actor(T0 + 10);
+        let race = run_race(&mut w, &mut l, true);
+
+        deliver(&mut w, &race.l_claim);
+        let slot = w.spaces.get(SPACE).expect("space");
+        assert_eq!(
+            slot.settle.displaced_claims(&race.entry),
+            1,
+            "kept as evidence"
+        );
+        assert_eq!(outbid(&w, &race.entry), None, "no completion yet");
+
+        deliver(&mut w, &state_alone(&race.l_completion));
+        assert_eq!(
+            outbid(&w, &race.entry),
+            Some(race.w_epoch),
+            "the pair from two frames authenticates l's completion"
+        );
+        let holder = w.actor_id(None);
+        assert!(
+            w.space_settle(SPACE, &race.entry, &holder, race.w_epoch, None)
+                .is_none(),
+            "w's take acknowledges l's completion instead of doing the work"
+        );
+        assert_eq!(w.counters.outbid_acknowledged, 1);
+    }
+
+    #[tokio::test]
+    async fn a_completion_heard_first_pairs_with_its_claim_arriving_later() {
+        let (mut w, _) = actor(T0);
+        let (mut l, _) = actor(T0 + 10);
+        let race = run_race(&mut w, &mut l, true);
+
+        deliver(&mut w, &state_alone(&race.l_completion));
+        let slot = w.spaces.get(SPACE).expect("space");
+        assert_eq!(slot.settle.unproven(&race.entry), 1, "kept, unproven");
+        assert_eq!(outbid(&w, &race.entry), None);
+
+        deliver(&mut w, &race.l_claim);
+        assert_eq!(outbid(&w, &race.entry), Some(race.w_epoch));
+    }
+
+    /// The control: before the pairing, only the one frame carrying both halves taught the
+    /// winner (the delta with its claim still works); a claim with no completion pairs nothing.
+    #[tokio::test]
+    async fn the_same_frame_still_pairs_and_a_claim_alone_pairs_nothing() {
+        let (mut w, _) = actor(T0);
+        let (mut l, _) = actor(T0 + 10);
+        let race = run_race(&mut w, &mut l, true);
+        deliver(&mut w, &race.l_completion);
+        assert_eq!(outbid(&w, &race.entry), Some(race.w_epoch));
+
+        let (mut w, _) = actor(T0);
+        let (mut l, _) = actor(T0 + 10);
+        let race = run_race(&mut w, &mut l, false);
+        deliver(&mut w, &race.l_claim);
+        assert_eq!(outbid(&w, &race.entry), None, "nothing completed");
+    }
+
+    /// The memory is bounded: at most four completions per entry, the oldest going.
+    #[tokio::test]
+    async fn at_most_four_unproven_completions_are_kept_per_entry() {
+        let (mut w, _) = actor(T0);
+        let (mut l, _) = actor(T0 + 10);
+        let race = run_race(&mut w, &mut l, true);
+        let alone = state_alone(&race.l_completion);
+        let mut delta = records::decode_delta(&alone.payload)
+            .and_then(|delta| delta.state)
+            .expect("state");
+        for n in 0..6u8 {
+            delta.insert("stateSig", Value::Bytes(vec![n; 64]));
+            let rumor = Rumor {
+                payload: records::delta(Some(&delta), None),
+                ..alone.clone()
+            };
+            deliver(&mut w, &rumor);
+        }
+        let slot = w.spaces.get(SPACE).expect("space");
+        assert_eq!(slot.settle.unproven(&race.entry), 4);
+    }
+
+    /// The displaced holder: it completed, then adopted the better claim. It offers its claim at
+    /// once, then again only when a frame shows the entry open and the backoff (1 s, 2 s, 4 s,
+    /// ...) has passed, at most six times in all.
+    #[tokio::test(start_paused = true)]
+    async fn the_displaced_holder_reoffers_its_claim_with_a_doubling_backoff_six_times_at_most() {
+        let (mut w, _) = actor(T0);
+        let (mut l, l_clock) = actor(T0 + 10);
+        let race = run_race(&mut w, &mut l, true);
+
+        deliver(&mut l, &race.w_claim);
+        let offered = sent(&mut l);
+        assert_eq!(
+            offered.len(),
+            1,
+            "offered at once on adopting the better claim"
+        );
+        assert_eq!(
+            offered[0].item_id, race.l_claim.item_id,
+            "under its first item id"
+        );
+        assert_eq!(
+            offered[0].payload, race.l_claim.payload,
+            "the claim delta it first sent"
+        );
+        assert_eq!(l.counters.displaced_reoffers, 1);
+
+        // A frame showing the entry open before the backoff: nothing.
+        deliver(&mut l, &race.write);
+        assert!(sent(&mut l).is_empty(), "not before 1 s");
+        let mut offers = 1;
+        for backoff in [1u64, 2, 4, 8, 16, 32] {
+            tokio::time::advance(Duration::from_millis(backoff * 1000 - 1)).await;
+            deliver(&mut l, &race.write);
+            assert!(sent(&mut l).is_empty(), "not before {backoff} s");
+            tokio::time::advance(Duration::from_millis(1)).await;
+            l_clock.advance(1);
+            deliver(&mut l, &race.write);
+            let again = sent(&mut l).len();
+            if offers < 6 {
+                assert_eq!(again, 1, "offer {} after {backoff} s", offers + 1);
+                offers += 1;
+            } else {
+                assert_eq!(again, 0, "six offers at most");
+            }
+        }
+        assert_eq!(l.counters.displaced_reoffers, 6);
+        assert!(
+            !l.spaces
+                .get(SPACE)
+                .expect("space")
+                .settle
+                .reoffering(&race.entry)
+        );
+        // A completion frame (the entry not open) never asks for an offer.
+        deliver(&mut l, &race.l_completion);
+        assert!(sent(&mut l).is_empty());
+    }
+
+    /// The backoff between offers is a local period on the monotonic clock (owner decision of
+    /// 2026-11-23): a wall step forward does not bring the next offer early, and a step back does
+    /// not hold it back.
+    #[tokio::test(start_paused = true)]
+    async fn the_reoffer_backoff_ignores_a_wall_step() {
+        let (mut w, _) = actor(T0);
+        let (mut l, l_clock) = actor(T0 + 10);
+        let race = run_race(&mut w, &mut l, true);
+        deliver(&mut l, &race.w_claim);
+        assert_eq!(sent(&mut l).len(), 1, "offered at once");
+
+        // The wall clock jumps 30 s ahead (the claim, leased 60 s, is still live); the monotonic
+        // clock has not moved, so the 1 s backoff has not passed.
+        l_clock.advance(30_000);
+        deliver(&mut l, &race.write);
+        assert!(
+            sent(&mut l).is_empty(),
+            "a forward step brings nothing early"
+        );
+
+        // The wall clock steps back 20 s, and 1 s passes on the monotonic clock: the backoff has
+        // passed, whatever the wall clock reads.
+        l_clock.advance(-20_000);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        deliver(&mut l, &race.write);
+        assert_eq!(sent(&mut l).len(), 1, "a step back holds nothing back");
+
+        // The next backoff (2 s) runs from that offer on the monotonic clock alone.
+        l_clock.advance(10_000);
+        tokio::time::advance(Duration::from_millis(1_999)).await;
+        deliver(&mut l, &race.write);
+        assert!(sent(&mut l).is_empty(), "not before 2 s");
+        tokio::time::advance(Duration::from_millis(1)).await;
+        deliver(&mut l, &race.write);
+        assert_eq!(sent(&mut l).len(), 1);
+        assert_eq!(l.counters.displaced_reoffers, 3);
+    }
+
+    /// A lapsed claim is not offered again: the line ends.
+    #[tokio::test(start_paused = true)]
+    async fn a_lapsed_displaced_claim_is_not_offered_again() {
+        let (mut w, _) = actor(T0);
+        let (mut l, l_clock) = actor(T0 + 10);
+        let race = run_race(&mut w, &mut l, true);
+        deliver(&mut l, &race.w_claim);
+        assert_eq!(sent(&mut l).len(), 1);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        l_clock.advance(61_000);
+        deliver(&mut l, &race.write);
+        assert!(sent(&mut l).is_empty(), "the claim lapsed");
+        assert!(
+            !l.spaces
+                .get(SPACE)
+                .expect("space")
+                .settle
+                .reoffering(&race.entry)
+        );
+    }
+
+    /// The kinds and addressees of the frames the far end of `theirs` received since the last
+    /// call, with their bodies (taken without moving paused time).
+    async fn frames_on(
+        theirs: &mut crate::transport::Channel,
+    ) -> Vec<(String, Option<String>, Vec<u8>)> {
+        let mut frames = Vec::new();
+        let mut idle = 0;
+        while idle < 16 {
+            let frame = tokio::select! {
+                biased;
+                frame = theirs.receiver.recv() => frame,
+                () = std::future::ready(()) => None,
+            };
+            let Some(frame) = frame else {
+                idle += 1;
+                tokio::task::yield_now().await;
+                continue;
+            };
+            idle = 0;
+            let Some(env) = agentspaces_wire::envelope::decode_frame(&frame) else {
+                continue;
+            };
+            let kind = env.get("kind").and_then(Value::as_str).unwrap_or_default();
+            let to = env.get("to").and_then(Value::as_str).map(str::to_owned);
+            let body = env
+                .get("body")
+                .and_then(Value::as_bytes)
+                .unwrap_or_default();
+            frames.push((kind.to_owned(), to, body.to_vec()));
+        }
+        frames
+    }
+
+    /// Owner decision 4 of 2026-11-23: the winner holding a displaced claim opens a round toward
+    /// the displaced holder at once, so it learns that holder's completion (whose rumor to it was
+    /// lost) within one round, even with its periodic rounds disarmed. Before the change it
+    /// waited for a periodic round whose random partner was the displaced holder.
+    #[tokio::test(start_paused = true)]
+    async fn the_winner_pulls_a_displaced_holder_within_one_targeted_round() {
+        let (mut w, _) = actor(T0);
+        let (mut l, _) = actor(T0 + 10);
+        let race = run_race(&mut w, &mut l, true);
+        // w's link to a seed, whose far end the test holds; its periodic rounds never run.
+        let (mine, mut theirs) = crate::transport::memory::pair("mem", "seed", "peer", None, None);
+        w.install_link(
+            mine,
+            agentspaces_wire::seed::Seed::new("127.0.0.1", 7000, "tcp"),
+        );
+        w.on_link_ready();
+        w.disarm_dial_rounds();
+        let _ = frames_on(&mut theirs).await;
+
+        // w hears l's claim alone: l's completion rumor never reached it.
+        deliver(&mut w, &race.l_claim);
+        assert_eq!(outbid(&w, &race.entry), None, "no completion yet");
+        assert!(
+            w.displaced_pull_due
+                .is_some_and(|due| due <= tokio::time::Instant::now()),
+            "a targeted round is due at once"
+        );
+        w.run_displaced_pulls();
+        let digests: Vec<_> = frames_on(&mut theirs)
+            .await
+            .into_iter()
+            .filter(|(kind, ..)| kind == agentspaces_wire::bodies::KIND_DIGEST)
+            .collect();
+        assert_eq!(digests.len(), 1, "one round: {digests:?}");
+        assert_eq!(
+            digests[0].1.as_deref(),
+            Some(l.peer_id.as_str()),
+            "addressed to the displaced holder"
+        );
+        assert_eq!(w.counters.displaced_pull_rounds, 1);
+        assert!(w.awaits(&l.peer_id), "its answer is expected");
+        assert_eq!(w.dial_rounds.rounds(), 0, "no periodic round ran");
+
+        // l answers the round with what w's digest lacks: its completion.
+        let stream = super::stream_of(SPACE);
+        let digest = w.stream_digest(&stream).expect("w's digest");
+        let delta = l
+            .whole_delta(&w.peer_id, &stream, &digest)
+            .expect("l holds what w lacks");
+        let mut deltas = Map::new();
+        deltas.insert(stream.as_str(), Value::Bytes(delta));
+        assert!(w.on_pull_resp(deltas).is_ok(), "applied");
+        assert_eq!(
+            outbid(&w, &race.entry),
+            Some(race.w_epoch),
+            "the displaced completion is learned from the round's answer"
+        );
+        // The line ends with the take no longer open to that holder's completion.
+        w.run_displaced_pulls();
+        assert_eq!(w.counters.displaced_pull_rounds, 1, "no further round");
+        assert!(
+            w.spaces
+                .get(SPACE)
+                .and_then(|slot| slot.settle.displaced_pull(&race.entry))
+                .is_none()
+        );
+        assert_eq!(w.displaced_pull_due, None);
+    }
+
+    /// The rounds' cadence, on the monotonic clock: at once, then 1, 2, 4, 8 and 16 s after the
+    /// one before, six in all, then the line goes.
+    #[tokio::test(start_paused = true)]
+    async fn the_targeted_rounds_run_at_once_then_1_2_4_8_16_s_six_in_all() {
+        let (mut w, _) = actor(T0);
+        let (mut l, _) = actor(T0 + 10);
+        let race = run_race(&mut w, &mut l, false);
+        let start = tokio::time::Instant::now();
+        deliver(&mut w, &race.l_claim);
+        let mut at = Vec::new();
+        while let Some(due) = w.displaced_pull_due {
+            tokio::time::advance(due.saturating_duration_since(tokio::time::Instant::now())).await;
+            let before = w.counters.displaced_pull_rounds;
+            w.run_displaced_pulls();
+            if w.counters.displaced_pull_rounds > before {
+                at.push((tokio::time::Instant::now() - start).as_secs());
+            }
+            assert!(at.len() <= 6, "six rounds at most: {at:?}");
+        }
+        assert_eq!(at, [0, 1, 3, 7, 15, 31]);
+        assert!(
+            w.spaces
+                .get(SPACE)
+                .and_then(|slot| slot.settle.displaced_pull(&race.entry))
+                .is_none(),
+            "the spent line goes"
+        );
+    }
+
+    /// The rounds stop once the take is no longer open: the claim lapsed (wall time), or the
+    /// entry completed here; and the loser (whose claim was displaced) runs none.
+    #[tokio::test(start_paused = true)]
+    async fn the_targeted_rounds_end_when_the_take_is_no_longer_open() {
+        let (mut w, w_clock) = actor(T0);
+        let (mut l, _) = actor(T0 + 10);
+        let race = run_race(&mut w, &mut l, false);
+        deliver(&mut w, &race.l_claim);
+        w.run_displaced_pulls();
+        assert_eq!(w.counters.displaced_pull_rounds, 1);
+        w_clock.advance(61_000); // w's 60 s claim lapsed
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        w.run_displaced_pulls();
+        assert_eq!(
+            w.counters.displaced_pull_rounds, 1,
+            "a lapsed claim: no round"
+        );
+        assert_eq!(w.displaced_pull_due, None);
+
+        let (mut w, _) = actor(T0);
+        let (mut l, _) = actor(T0 + 10);
+        let race = run_race(&mut w, &mut l, false);
+        deliver(&mut w, &race.l_claim);
+        let holder = w.actor_id(None);
+        w.space_complete(SPACE, &race.entry, &holder, race.w_epoch, None, None)
+            .expect("w completes");
+        w.run_displaced_pulls();
+        assert_eq!(
+            w.counters.displaced_pull_rounds, 0,
+            "completed here: no round"
+        );
+
+        // The displaced side opens none: its claim is not the kept one.
+        deliver(&mut l, &race.w_claim);
+        assert_eq!(l.displaced_pull_due, None);
+    }
+
+    /// The loop runs the targeted rounds as due work: a displaced claim heard on a turn opens
+    /// the first round on the next, and the next round waits on the loop's deadline (1 s).
+    #[tokio::test(start_paused = true)]
+    async fn the_loop_runs_the_targeted_rounds_when_due() {
+        let (mut w, _) = actor(T0);
+        let (mut l, _) = actor(T0 + 10);
+        let race = run_race(&mut w, &mut l, false);
+        let (jobs_tx, jobs) = tokio::sync::mpsc::channel::<super::super::Job>(8);
+        let (_inbound_tx, inbound) = tokio::sync::mpsc::channel(8);
+        let loop_task = tokio::spawn(w.run(jobs, inbound));
+        let rounds = || async {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let job: super::super::Job = Box::new(move |actor: &mut Actor| {
+                let _ = tx.send(actor.counters.displaced_pull_rounds);
+            });
+            jobs_tx.send(job).await.expect("the loop runs");
+            rx.await.expect("answered")
+        };
+        let claim = race.l_claim.clone();
+        let job: super::super::Job = Box::new(move |actor: &mut Actor| {
+            let _ = actor.on_rumor(claim, Via::Dialed);
+        });
+        jobs_tx.send(job).await.expect("the loop runs");
+        tokio::task::yield_now().await;
+        assert_eq!(rounds().await, 1, "the first round at once");
+        tokio::time::advance(Duration::from_millis(999)).await;
+        assert_eq!(rounds().await, 1, "not before 1 s");
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(rounds().await, 2, "the second round 1 s later");
+        drop(jobs_tx);
+        let _ = loop_task.await;
+    }
+
+    /// The raw frames the far end of `theirs` received since the last call (taken without
+    /// moving paused time).
+    async fn raw_on(theirs: &mut crate::transport::Channel) -> Vec<Vec<u8>> {
+        let mut frames = Vec::new();
+        let mut idle = 0;
+        while idle < 16 {
+            let frame = tokio::select! {
+                biased;
+                frame = theirs.receiver.recv() => frame,
+                () = std::future::ready(()) => None,
+            };
+            match frame {
+                Some(frame) => {
+                    idle = 0;
+                    frames.push(frame);
+                }
+                None => {
+                    idle += 1;
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+        frames
+    }
+
+    /// A raw frame's kind, addressee and body.
+    fn opened(frame: &[u8]) -> (String, Option<String>, Vec<u8>) {
+        let env = agentspaces_wire::envelope::decode_frame(frame).expect("a frame");
+        (
+            env.get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            env.get("to").and_then(Value::as_str).map(str::to_owned),
+            env.get("body")
+                .and_then(Value::as_bytes)
+                .unwrap_or_default()
+                .to_vec(),
+        )
+    }
+
+    /// The test's seed: it relays `inner` to `to` as a one-hop RELAY_FRAME, signed by itself.
+    fn relayed_by(
+        seed: &agentspaces_wire::identity::Identity,
+        group: &str,
+        to: &str,
+        inner: &[u8],
+        stamp_ms: i64,
+        logical: u32,
+    ) -> Vec<u8> {
+        let body = bodies::relay_frame_body(to, inner, None, None);
+        let stamp = format!("{stamp_ms}:{logical}:{}", seed.peer_id());
+        let env = agentspaces_wire::envelope::envelope(
+            group,
+            bodies::KIND_RELAY_FRAME,
+            seed.peer_id(),
+            &stamp,
+            &body,
+            Some(to),
+        );
+        agentspaces_wire::envelope::encode_frame(&env, seed)
+    }
+
+    /// An actor on a link to the test's seed, with the link's far end and the actor's inbound
+    /// queue; its periodic rounds never run.
+    fn on_seed(
+        mut actor: Actor,
+    ) -> (
+        Actor,
+        crate::transport::Channel,
+        tokio::sync::mpsc::Receiver<super::super::Inbound>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        actor.inbound_tx = tx;
+        let (mine, theirs) = crate::transport::memory::pair("mem", "seed", "peer", None, None);
+        actor.install_link(
+            mine,
+            agentspaces_wire::seed::Seed::new("127.0.0.1", 7000, "tcp"),
+        );
+        actor.on_link_ready();
+        actor.disarm_dial_rounds();
+        (actor, theirs, rx)
+    }
+
+    /// Delivers `frame` on `theirs` and has `actor` handle it.
+    async fn arrive(
+        actor: &mut Actor,
+        theirs: &mut crate::transport::Channel,
+        inbound: &mut tokio::sync::mpsc::Receiver<super::super::Inbound>,
+        frame: Vec<u8>,
+    ) {
+        theirs.sender.send(frame).await.expect("the link is up");
+        let message = inbound.recv().await.expect("the reader forwards it");
+        actor.on_inbound(message);
+    }
+
+    /// Owner decision 1 of 2026-11-23: a dial-only displaced holder answers a winner's targeted
+    /// round that its seed relays, with only the entries it holds a displaced claim of (here
+    /// with its completion), under its answer pace; the winner learns the completion from it. Both
+    /// peers are dial-only, on links to one seed the test plays.
+    #[tokio::test(start_paused = true)]
+    async fn a_dial_only_holder_answers_a_relayed_round_with_only_its_displaced_entries() {
+        let (mut w, _) = actor(T0);
+        let (mut l, _) = actor(T0 + 10);
+        let race = run_race(&mut w, &mut l, true);
+        // w's better claim reaches l, displacing l's (as the core, l answers a relayed round
+        // only for a displaced claim made here, not for a completion it has not yet seen lose).
+        deliver(&mut l, &race.w_claim);
+        let _ = sent(&mut l);
+        // l also holds an entry of its own it never took, and one of w's it never touched.
+        let own = l
+            .write_entry(
+                SPACE,
+                "T#v1",
+                &Value::from("mine"),
+                120_000,
+                &Map::new(),
+                None,
+            )
+            .expect("write");
+        let _ = sent(&mut l);
+        let other = w
+            .write_entry(
+                SPACE,
+                "T#v1",
+                &Value::from("theirs"),
+                120_000,
+                &Map::new(),
+                None,
+            )
+            .expect("write");
+        for rumor in sent(&mut w) {
+            deliver(&mut l, &rumor);
+        }
+        let seed = agentspaces_wire::identity::Identity::generate().expect("identity");
+        let group = w.group.clone();
+        let (mut w, mut w_far, mut w_in) = on_seed(w);
+        let (mut l, mut l_far, mut l_in) = on_seed(l);
+        let mut logical = 0u32;
+        let mut stamp = |actor: &Actor| {
+            logical += 1;
+            (actor.now().saturating_add(1), logical)
+        };
+        // Each peer has heard its seed (an addressed PING), so it relays through it.
+        for (actor, far, inbound) in [
+            (&mut w, &mut w_far, &mut w_in),
+            (&mut l, &mut l_far, &mut l_in),
+        ] {
+            let (ms, n) = stamp(actor);
+            let env = agentspaces_wire::envelope::envelope(
+                &group,
+                bodies::KIND_PING,
+                seed.peer_id(),
+                &format!("{ms}:{n}:{}", seed.peer_id()),
+                &bodies::ping_body(1),
+                Some(&actor.peer_id.clone()),
+            );
+            arrive(
+                actor,
+                far,
+                inbound,
+                agentspaces_wire::envelope::encode_frame(&env, &seed),
+            )
+            .await;
+            assert_eq!(actor.seed_peer().as_deref(), Some(seed.peer_id()));
+        }
+        let _ = raw_on(&mut w_far).await;
+        let _ = raw_on(&mut l_far).await;
+
+        // w hears l's claim alone and opens its targeted round toward l, through the seed.
+        deliver(&mut w, &race.l_claim);
+        w.run_displaced_pulls();
+        let round: Vec<Vec<u8>> = raw_on(&mut w_far)
+            .await
+            .into_iter()
+            .filter(|frame| opened(frame).0 == bodies::KIND_RELAY_FRAME)
+            .collect();
+        assert_eq!(round.len(), 1, "one round, relayed through the seed");
+        let inner = bodies::parse_relay_frame(&opened(&round[0]).2)
+            .expect("a relay")
+            .frame;
+        assert_eq!(opened(&inner).0, bodies::KIND_DIGEST);
+
+        // The seed relays it to l; l answers through the seed.
+        let (ms, n) = stamp(&l);
+        let me = l.peer_id.clone();
+        arrive(
+            &mut l,
+            &mut l_far,
+            &mut l_in,
+            relayed_by(&seed, &group, &me, &inner, ms, n),
+        )
+        .await;
+        assert_eq!(l.counters.displaced_digest_answers, 1);
+        let answers: Vec<Vec<u8>> = raw_on(&mut l_far)
+            .await
+            .into_iter()
+            .filter_map(|frame| {
+                let (kind, _, body) = opened(&frame);
+                (kind == bodies::KIND_RELAY_FRAME).then(|| bodies::parse_relay_frame(&body))?
+            })
+            .filter(|relay| relay.target == w.peer_id)
+            .map(|relay| relay.frame)
+            .collect();
+        assert_eq!(answers.len(), 1, "one PULL_RESP, to w");
+        let (kind, to, body) = opened(&answers[0]);
+        assert_eq!(kind, bodies::KIND_PULL_RESP);
+        assert_eq!(to.as_deref(), Some(w.peer_id.as_str()));
+        let deltas = bodies::parse_pull_resp(&body).expect("a PULL_RESP");
+        assert_eq!(deltas.len(), 1, "one stream: {deltas:?}");
+        let sync = deltas
+            .get(super::stream_of(SPACE).as_str())
+            .and_then(Value::as_bytes)
+            .and_then(records::decode_sync_delta)
+            .expect("the space's delta");
+        let mut entries: Vec<&str> = sync
+            .states
+            .iter()
+            .filter_map(records::state_entry_id)
+            .chain(sync.claims.iter().map(|(entry, _)| entry.as_str()))
+            .collect();
+        entries.dedup();
+        assert_eq!(entries, [race.entry.as_str()], "only the displaced entry");
+        assert!(!entries.contains(&own.as_str()) && !entries.contains(&other.as_str()));
+
+        // The seed relays the answer to w, which learns l's completion.
+        let (ms, n) = stamp(&w);
+        let to_w = w.peer_id.clone();
+        arrive(
+            &mut w,
+            &mut w_far,
+            &mut w_in,
+            relayed_by(&seed, &group, &to_w, &answers[0], ms, n),
+        )
+        .await;
+        assert_eq!(
+            outbid(&w, &race.entry),
+            Some(race.w_epoch),
+            "the displaced completion came from the relayed round's answer"
+        );
+
+        // Under the asker's own answer pace (the cross-client check of 2026-11-23): w keeps
+        // asking until its bucket is spent (its first round took one token); its next round is
+        // paced and draws nothing.
+        for _ in 1..RELAYED_ANSWER_BURST {
+            let (ms, n) = stamp(&l);
+            arrive(
+                &mut l,
+                &mut l_far,
+                &mut l_in,
+                relayed_by(&seed, &group, &me, &inner_again(&mut w, &me), ms, n),
+            )
+            .await;
+        }
+        let _ = raw_on(&mut l_far).await;
+        assert_eq!(l.counters.relayed_answers_paced, 0);
+        let (ms, n) = stamp(&l);
+        arrive(
+            &mut l,
+            &mut l_far,
+            &mut l_in,
+            relayed_by(&seed, &group, &me, &inner_again(&mut w, &me), ms, n),
+        )
+        .await;
+        assert_eq!(l.counters.relayed_answers_paced, 1);
+        assert_eq!(
+            l.counters.displaced_digest_answers,
+            u64::from(RELAYED_ANSWER_BURST),
+            "each round in the bucket drew the displaced claim again"
+        );
+        assert!(
+            !raw_on(&mut l_far)
+                .await
+                .iter()
+                .any(|frame| opened(frame).0 == bodies::KIND_RELAY_FRAME),
+            "nothing answered"
+        );
+        // The relayed flood spent w's bucket alone: the seed's own round, read off the dialed
+        // link, is still answered (a relayed DIGEST storm cannot starve the seed's repair) ...
+        let paced = l.hub.counters.pulls_paced;
+        let mut seed_digests = Map::new();
+        seed_digests.insert(super::stream_of(SPACE), Value::Bytes(Vec::new()));
+        let (ms, n) = stamp(&l);
+        let env = agentspaces_wire::envelope::envelope(
+            &group,
+            bodies::KIND_DIGEST,
+            seed.peer_id(),
+            &format!("{ms}:{n}:{}", seed.peer_id()),
+            &bodies::digest_body(&seed_digests),
+            Some(&me),
+        );
+        arrive(
+            &mut l,
+            &mut l_far,
+            &mut l_in,
+            agentspaces_wire::envelope::encode_frame(&env, &seed),
+        )
+        .await;
+        assert_eq!(
+            l.hub.counters.pulls_paced, paced,
+            "the seed's round is not paced"
+        );
+        assert!(
+            raw_on(&mut l_far)
+                .await
+                .iter()
+                .any(|frame| opened(frame).0 == bodies::KIND_PULL_RESP),
+            "the seed's own round answered"
+        );
+        // ... and another asker still has a bucket of its own.
+        assert!(l.pace_relayed_answer("another-winner"));
+    }
+
+    /// The PULL_RESP bodies and DIGEST bodies `far` saw relayed to `target`, by kind.
+    async fn relayed_to(
+        far: &mut crate::transport::Channel,
+        target: &str,
+    ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let mut pulls = Vec::new();
+        let mut digests = Vec::new();
+        for frame in raw_on(far).await {
+            let (kind, _, body) = opened(&frame);
+            if kind != bodies::KIND_RELAY_FRAME {
+                continue;
+            }
+            let Some(relay) = bodies::parse_relay_frame(&body) else {
+                continue;
+            };
+            if relay.target != target {
+                continue;
+            }
+            let (inner, _, inner_body) = opened(&relay.frame);
+            if inner == bodies::KIND_PULL_RESP {
+                pulls.push(inner_body);
+            } else if inner == bodies::KIND_DIGEST {
+                digests.push(inner_body);
+            }
+        }
+        (pulls, digests)
+    }
+
+    /// Owner decision 1 of 2026-11-23, aligned with the core (`GossipBus.onDigestDisplacedOnly`,
+    /// `ReplicatedSpace.displacedFor`): a relayed `DIGEST` draws only the entries whose claim
+    /// made here a better claim of another peer displaced, with or without a completion under
+    /// it; another completion of this peer's own work is not among them. It reads `hashes`
+    /// (answered with `want` for the spaces that hold such a claim and differ) and `digests`
+    /// (a PULL_RESP of those entries alone); `ids` and `tree` draw nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_relayed_round_draws_only_the_displaced_claims_made_here_as_the_core_does() {
+        let (mut w, _) = actor(T0);
+        let (mut l, _) = actor(T0 + 10);
+        // The race with no completion by l: l's claim is displaced once w's reaches it.
+        let race = run_race(&mut w, &mut l, false);
+        deliver(&mut l, &race.w_claim);
+        let _ = sent(&mut l);
+        // l takes and completes an entry of its own, uncontested: nothing displaced it.
+        let own = l
+            .write_entry(
+                SPACE,
+                "T#v1",
+                &Value::from("mine"),
+                120_000,
+                &Map::new(),
+                None,
+            )
+            .expect("write");
+        let ticket = l
+            .space_claim(SPACE, &own, None, 60_000)
+            .expect("claim")
+            .expect("free");
+        assert!(
+            l.space_settle(SPACE, &own, &ticket.holder, ticket.epoch, None)
+                .is_some()
+        );
+        l.space_complete(SPACE, &own, &ticket.holder, ticket.epoch, None, None)
+            .expect("l completes its own");
+        let _ = sent(&mut l);
+
+        let seed = agentspaces_wire::identity::Identity::generate().expect("identity");
+        let group = l.group.clone();
+        let (mut l, mut l_far, mut l_in) = on_seed(l);
+        let mut logical = 0u32;
+        let mut stamp = |actor: &Actor| {
+            logical += 1;
+            (actor.now().saturating_add(1), logical)
+        };
+        let (ms, n) = stamp(&l);
+        let me = l.peer_id.clone();
+        let ping = agentspaces_wire::envelope::envelope(
+            &group,
+            bodies::KIND_PING,
+            seed.peer_id(),
+            &format!("{ms}:{n}:{}", seed.peer_id()),
+            &bodies::ping_body(1),
+            Some(&me),
+        );
+        arrive(
+            &mut l,
+            &mut l_far,
+            &mut l_in,
+            agentspaces_wire::envelope::encode_frame(&ping, &seed),
+        )
+        .await;
+        assert_eq!(l.seed_peer().as_deref(), Some(seed.peer_id()));
+        let _ = raw_on(&mut l_far).await;
+        let stream = super::stream_of(SPACE);
+        let w_id = w.peer_id.clone();
+
+        // An opening of hashes: answered with want for the space, as the core answers it.
+        let opening = DigestBody {
+            hashes: Some(vec![(stream.clone(), vec![0u8; 32])]),
+            ..DigestBody::default()
+        };
+        let inner = w.signed_frame(bodies::KIND_DIGEST, &opening.encode(), Some(&me));
+        let (ms, n) = stamp(&l);
+        arrive(
+            &mut l,
+            &mut l_far,
+            &mut l_in,
+            relayed_by(&seed, &group, &me, &inner, ms, n),
+        )
+        .await;
+        let (pulls, digests) = relayed_to(&mut l_far, &w_id).await;
+        assert!(pulls.is_empty(), "an opening draws no PULL_RESP");
+        assert_eq!(digests.len(), 1, "one DIGEST asking for the text form");
+        let asked = wire_audit::parse_digest(&digests[0]).expect("a DIGEST");
+        assert_eq!(asked.want, Some(vec![stream.clone()]));
+        assert_eq!(l.counters.displaced_digest_answers, 1);
+
+        // The text digests: the displaced claim made here, with no completion under it, and
+        // nothing of the entry l completed with its own work.
+        let (ms, n) = stamp(&l);
+        arrive(
+            &mut l,
+            &mut l_far,
+            &mut l_in,
+            relayed_by(&seed, &group, &me, &inner_again(&mut w, &me), ms, n),
+        )
+        .await;
+        let (pulls, _) = relayed_to(&mut l_far, &w_id).await;
+        assert_eq!(pulls.len(), 1, "one PULL_RESP, to w");
+        let deltas = bodies::parse_pull_resp(&pulls[0]).expect("a PULL_RESP");
+        let sync = deltas
+            .get(stream.as_str())
+            .and_then(Value::as_bytes)
+            .and_then(records::decode_sync_delta)
+            .expect("the space's delta");
+        let claims: Vec<(&str, i64)> = sync
+            .claims
+            .iter()
+            .map(|(entry, signed)| {
+                let claim = signed
+                    .get("claim")
+                    .and_then(Value::as_map)
+                    .expect("a claim");
+                (entry.as_str(), claim_epoch(claim))
+            })
+            .collect();
+        assert_eq!(
+            claims,
+            [(race.entry.as_str(), race.l_epoch)],
+            "l's displaced claim alone"
+        );
+        assert!(
+            sync.states
+                .iter()
+                .filter_map(records::state_entry_id)
+                .all(|entry| entry == race.entry),
+            "no state of the entry l completed uncontested"
+        );
+        assert_eq!(l.counters.displaced_digest_answers, 2);
+
+        // ids and tree alone draw nothing.
+        let fetch = DigestBody {
+            ids: Some(vec![(
+                stream.clone(),
+                vec![own.clone(), race.entry.clone()],
+            )]),
+            ..DigestBody::default()
+        };
+        let inner = w.signed_frame(bodies::KIND_DIGEST, &fetch.encode(), Some(&me));
+        let (ms, n) = stamp(&l);
+        arrive(
+            &mut l,
+            &mut l_far,
+            &mut l_in,
+            relayed_by(&seed, &group, &me, &inner, ms, n),
+        )
+        .await;
+        let (pulls, digests) = relayed_to(&mut l_far, &w_id).await;
+        assert!(pulls.is_empty() && digests.is_empty(), "ids draw nothing");
+        assert_eq!(l.counters.displaced_digest_answers, 2);
+    }
+
+    /// A fresh DIGEST of `w`'s whole digests, addressed to `to` (another round's frame).
+    fn inner_again(w: &mut Actor, to: &str) -> Vec<u8> {
+        let mut digests = Map::new();
+        for (stream, digest) in w.full_digests() {
+            digests.insert(stream, Value::Bytes(digest));
+        }
+        w.signed_frame(
+            bodies::KIND_DIGEST,
+            &bodies::digest_body(&digests),
+            Some(to),
+        )
+    }
+
+    /// The winner side end to end: the loser's re-offer is the claim half the winner needs.
+    #[tokio::test(start_paused = true)]
+    async fn the_reoffer_completes_the_winners_pair() {
+        let (mut w, _) = actor(T0);
+        let (mut l, _) = actor(T0 + 10);
+        let race = run_race(&mut w, &mut l, true);
+        // The winner heard the completion alone (the frame carrying both was lost).
+        deliver(&mut w, &state_alone(&race.l_completion));
+        assert_eq!(outbid(&w, &race.entry), None);
+        // The loser adopts the winner's claim and offers its own again.
+        deliver(&mut l, &race.w_claim);
+        for rumor in sent(&mut l) {
+            deliver(&mut w, &rumor);
+        }
+        assert_eq!(outbid(&w, &race.entry), Some(race.w_epoch));
+    }
+
+    /// Owner decision 2 of 2026-11-23: a take has lapsed when its claim is no longer ours
+    /// or its wall-time lease has expired. The loser's take, still inside its lease on wall time,
+    /// lapsed the moment the winner's claim displaced its own; the winner's lapses only at its
+    /// lease's end; a take of an entry another holder completed has lapsed too.
+    #[tokio::test]
+    async fn a_take_has_lapsed_once_its_claim_is_no_longer_ours_or_its_lease_ran_out() {
+        let (mut w, w_clock) = actor(T0);
+        let (mut l, _) = actor(T0 + 10);
+        let race = run_race(&mut w, &mut l, false);
+        let (w_holder, l_holder) = (w.actor_id(None), l.actor_id(None));
+        assert!(
+            !l.space_take_lapsed(SPACE, &race.entry, &l_holder, race.l_epoch),
+            "l holds its take"
+        );
+        // l hears w's better claim: its own is displaced, well inside its 60 s lease.
+        deliver(&mut l, &race.w_claim);
+        assert!(
+            l.space_take_lapsed(SPACE, &race.entry, &l_holder, race.l_epoch),
+            "the claim is no longer l's: lapsed, though its lease runs on"
+        );
+        // w's take holds until its lease runs out on wall time.
+        deliver(&mut w, &race.l_claim);
+        assert!(!w.space_take_lapsed(SPACE, &race.entry, &w_holder, race.w_epoch));
+        assert!(
+            w.space_take_lapsed(SPACE, &race.entry, &w_holder, race.w_epoch + 1),
+            "another epoch is not this take"
+        );
+        w_clock.advance(60_001);
+        assert!(
+            w.space_take_lapsed(SPACE, &race.entry, &w_holder, race.w_epoch),
+            "the lease ran out"
+        );
+        // An entry completed by its winner: the displaced holder's take has lapsed.
+        let (mut w2, _) = actor(T0);
+        let (mut l2, _) = actor(T0 + 10);
+        let race2 = run_race(&mut w2, &mut l2, false);
+        let holder = w2.actor_id(None);
+        w2.space_complete(SPACE, &race2.entry, &holder, race2.w_epoch, None, None)
+            .expect("w2 completes");
+        for rumor in sent(&mut w2) {
+            deliver(&mut l2, &rumor);
+        }
+        let l2_holder = l2.actor_id(None);
+        assert!(l2.space_take_lapsed(SPACE, &race2.entry, &l2_holder, race2.l_epoch));
+    }
+}
+
+/// The watch sweep as due work (SPEC v0.1.36 §9.5): it runs when the earliest lapse it tells
+/// falls due, on a paused monotonic clock and a manual wall clock.
+#[cfg(test)]
+mod sweep_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use agentspaces_wire::cbor::{Map, Value};
+    use tokio::time::Instant;
+
+    use super::super::tests::test_actor;
+    use super::SWEEP_BACKSTOP;
+    use crate::clock::ManualClock;
+    use crate::space::Template;
+    use crate::space::watch::WatchQueue;
+
+    const SPACE: &str = "tasks";
+    const T0: i64 = 1_900_000_000_000;
+
+    #[tokio::test(start_paused = true)]
+    async fn the_sweep_runs_at_the_earliest_lapse_not_four_times_a_second() {
+        let (mut actor, ..) = test_actor();
+        let clock = ManualClock::new(T0);
+        actor.clock = Arc::new(clock.clone());
+        assert_eq!(actor.sweep_at(), None, "nothing watches: no sweep");
+        let queue = WatchQueue::new(64, T0 + 3_600_000);
+        actor
+            .space_watch(SPACE, Template::new("T#v1"), Arc::clone(&queue))
+            .expect("watch");
+        let start = Instant::now();
+        let entry = actor
+            .write_entry(SPACE, "T#v1", &Value::from("x"), 5_000, &Map::new(), None)
+            .expect("write");
+        assert_eq!(
+            actor.sweep_at(),
+            Some(start + Duration::from_secs(5)),
+            "due at the write lease's lapse"
+        );
+        // A wall-clock step forward re-anchors the deadline on the next turn.
+        clock.advance(2_000);
+        assert_eq!(actor.sweep_at(), Some(start + Duration::from_secs(3)));
+        tokio::time::advance(Duration::from_secs(3)).await;
+        clock.advance(3_000);
+        actor.on_sweep();
+        let told = actor
+            .spaces
+            .get(SPACE)
+            .and_then(|slot| slot.fired.get(&entry))
+            .is_some_and(|fired| fired.expired);
+        assert!(told, "Expired told at the lapse");
+        assert_eq!(
+            actor.sweep_at(),
+            Some(Instant::now() + SWEEP_BACKSTOP),
+            "nothing left but the watch's own lapse an hour out: the backstop"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_claim_lapsing_before_the_write_is_the_due() {
+        let (mut actor, ..) = test_actor();
+        let clock = ManualClock::new(T0);
+        actor.clock = Arc::new(clock.clone());
+        let queue = WatchQueue::new(64, T0 + 3_600_000);
+        actor
+            .space_watch(SPACE, Template::new("T#v1"), Arc::clone(&queue))
+            .expect("watch");
+        let start = Instant::now();
+        let entry = actor
+            .write_entry(SPACE, "T#v1", &Value::from("x"), 600_000, &Map::new(), None)
+            .expect("write");
+        let ticket = actor
+            .space_claim(SPACE, &entry, None, 4_000)
+            .expect("claim")
+            .expect("free");
+        assert!(ticket.epoch >= 1);
+        assert_eq!(
+            actor.sweep_at(),
+            Some(start + Duration::from_secs(4)),
+            "the claim lapses first"
+        );
     }
 }

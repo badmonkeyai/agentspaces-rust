@@ -24,7 +24,7 @@
 //! [`ListenConfig::probe_streams`](crate::peer::ListenConfig::probe_streams) of them, else one
 //! `root` over them. Both follow the prober's kind (annex I.6): toward a member whose current card
 //! carries `wire.ae=2` a space's hash is its trie stream hash, toward any other its text digest's
-//! SHA-256. A dial-only peer, which answers no `DIGEST`, attaches none, and every other `ACK`
+//! SHA-256. A dial-only peer, which answers its seed's `DIGEST`s but starts no rounds, attaches none, and every other `ACK`
 //! carries none either, since the fields are optional.
 //!
 //! # What this peer reads

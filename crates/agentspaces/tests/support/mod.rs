@@ -27,7 +27,9 @@
 //! party's advertisement), and records the verified frames it receives.
 //!
 //! A [`LossyDialer`] wraps another dialer and, while told to, drops the rumors of one stream that
-//! the far end sends: the dialing peer misses them, and only anti-entropy brings them back.
+//! the far end sends: the dialing peer misses them, and only anti-entropy brings them back. Made
+//! with [`LossyDialer::outbound`], it drops those the dialing peer sends instead: its own write
+//! never reaches its seed, and only the seed's rounds bring it there.
 //!
 //! A [`HoldingDialer`] wraps another dialer and, while told to, holds back everything but the
 //! liveness frames the dialing peer sends, then delivers what it held in order once released: the
@@ -906,23 +908,34 @@ impl Drop for RawPeer {
 // ------------------------------------------------------------------------------- a lossy link
 
 /// A dialer over `inner` whose links drop, while [`LossyDialer::set_dropping`] is on, every
-/// `RUMOR` on `stream` the far end sends; everything else passes both ways in order.
+/// `RUMOR` on `stream` the far end sends (or, made with [`LossyDialer::outbound`], the dialing
+/// peer sends); everything else passes both ways in order.
 #[derive(Debug, Clone)]
 pub struct LossyDialer {
     inner: Arc<dyn Dialer>,
     stream: String,
+    outbound: bool,
     dropping: Arc<AtomicBool>,
     dropped: Arc<AtomicUsize>,
 }
 
 impl LossyDialer {
-    /// A dialer over `inner` that can drop the rumors of `stream`.
+    /// A dialer over `inner` that can drop the rumors of `stream` the far end sends.
     pub fn new(inner: Arc<dyn Dialer>, stream: &str) -> Self {
         Self {
             inner,
             stream: stream.to_owned(),
+            outbound: false,
             dropping: Arc::new(AtomicBool::new(false)),
             dropped: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// A dialer over `inner` that can drop the rumors of `stream` the dialing peer sends.
+    pub fn outbound(inner: Arc<dyn Dialer>, stream: &str) -> Self {
+        Self {
+            outbound: true,
+            ..Self::new(inner, stream)
         }
     }
 
@@ -986,8 +999,13 @@ impl Dialer for LossyDialer {
                 ..
             } = middle;
             let (up_far, up_middle) = (far_closer.clone(), middle_closer.clone());
+            let lossy = self.clone();
             tokio::spawn(async move {
                 while let Some(frame) = middle_rx.recv().await {
+                    if lossy.outbound && lossy.drops(&frame, None) {
+                        lossy.dropped.fetch_add(1, Ordering::SeqCst);
+                        continue;
+                    }
                     if far_tx.send(frame).await.is_err() {
                         break;
                     }
@@ -998,7 +1016,7 @@ impl Dialer for LossyDialer {
             let lossy = self.clone();
             tokio::spawn(async move {
                 while let Some(frame) = far_rx.recv().await {
-                    if lossy.drops(&frame, attested.as_deref()) {
+                    if !lossy.outbound && lossy.drops(&frame, attested.as_deref()) {
                         lossy.dropped.fetch_add(1, Ordering::SeqCst);
                         continue;
                     }
@@ -1019,7 +1037,9 @@ impl Dialer for LossyDialer {
 /// A dialer over `inner` whose links can hold back, in either direction, every frame but `PING`,
 /// `PING_REQ`, and `ACK`, and deliver the held frames in their order once released: what the
 /// dialing peer sends while [`HoldingDialer::hold`] is on, and what the far end sends while
-/// [`HoldingDialer::hold_inbound`] is on.
+/// [`HoldingDialer::hold_inbound`] is on. It can also drop, for good, the space states the far end
+/// sends ([`HoldingDialer::drop_inbound_states`]): a completion lost in transit, so the evidence
+/// of a race reaches the peer in other frames than the one that first carried it.
 #[derive(Debug, Clone)]
 pub struct HoldingDialer {
     inner: Arc<dyn Dialer>,
@@ -1034,6 +1054,10 @@ struct Gate {
     holding: AtomicBool,
     held: AtomicUsize,
     released: tokio::sync::Notify,
+    /// Whether space states are dropped: a RUMOR whose space delta carries a state, and every
+    /// PULL_RESP.
+    dropping_states: AtomicBool,
+    dropped: AtomicUsize,
 }
 
 impl Gate {
@@ -1054,6 +1078,29 @@ impl Gate {
             kind.as_deref(),
             Some(bodies::KIND_PING | bodies::KIND_PING_REQ | bodies::KIND_ACK)
         )
+    }
+
+    /// Whether `frame` is dropped now: a space state while [`Gate::dropping_states`] is on.
+    fn drops(&self, frame: &[u8], attested: Option<&str>) -> bool {
+        if !self.dropping_states.load(Ordering::SeqCst) {
+            return false;
+        }
+        let Some((env, _)) = envelope::decode_frame_detailed(frame, attested, None) else {
+            return false;
+        };
+        let body = env
+            .get("body")
+            .and_then(Value::as_bytes)
+            .unwrap_or_default();
+        match env.get("kind").and_then(Value::as_str) {
+            Some(bodies::KIND_PULL_RESP) => true,
+            Some(bodies::KIND_RUMOR) => bodies::parse_rumor(body).is_some_and(|rumor| {
+                rumor.stream_id.starts_with(bodies::STREAM_SPACE_PREFIX)
+                    && agentspaces::wire::records::decode_delta(&rumor.payload)
+                        .is_some_and(|delta| delta.state.is_some())
+            }),
+            _ => false,
+        }
     }
 
     /// Carries `rx` to `tx`, holding what this gate holds, until either side closes.
@@ -1081,6 +1128,10 @@ impl Gate {
                 () = &mut released => continue,
             };
             let Some(frame) = frame else { break };
+            if self.drops(&frame, attested.as_deref()) {
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+                continue;
+            }
             if self.holds(&frame, attested.as_deref()) {
                 self.held.fetch_add(1, Ordering::SeqCst);
                 waiting.push_back(frame);
@@ -1137,6 +1188,19 @@ impl HoldingDialer {
     /// Stops holding what the far end sends, and delivers what was held, in order.
     pub fn release_inbound(&self) {
         self.inbound.release();
+    }
+
+    /// Starts (`true`) or stops dropping the space states the far end sends: every RUMOR whose
+    /// space delta carries a state, and every PULL_RESP; a claim alone still passes.
+    pub fn drop_inbound_states(&self, dropping: bool) {
+        self.inbound
+            .dropping_states
+            .store(dropping, Ordering::SeqCst);
+    }
+
+    /// The frames from the far end dropped so far.
+    pub fn dropped_inbound(&self) -> usize {
+        self.inbound.dropped.load(Ordering::SeqCst)
     }
 
     /// The frames the dialing peer sent that were held back so far (delivered or not).

@@ -402,6 +402,9 @@ public final class Seed {
         NodeStore nodes = withContent ? NodeStore.inMemory() : null;
         Content content = null;
         Pdt pdt = null;
+        // The PDT's loop participant (EL-T-08): it runs when its refs fall due or the ref space
+        // changes, in place of the deprecated 250 ms onTick hook; closed with the node.
+        ai.badmonkey.agentspaces.api.spi.DueWork.Registration pdtLoop = null;
         if (withContent) {
             BlockExchange contentBlocks = new BlockExchange(runtime, CborCodec.defaultCodec());
             ReplicatedSpace contentSpace = ReplicatedSpace.builder(runtime, "content", identity, "content")
@@ -415,7 +418,7 @@ public final class Seed {
             capabilities.register(content);
             capabilities.refreshTick();
             pdt.attach(content).start();
-            runtime.onTick(pdt::tick);
+            pdtLoop = pdt.joinLoop(runtime);
         }
         node.startTicking(Duration.ofMillis(250));
         if (dial == null) {
@@ -915,6 +918,9 @@ public final class Seed {
                         }
                     }
                     case "quit" -> {
+                        if (pdtLoop != null) {
+                            pdtLoop.close();
+                        }
                         agents.close();
                         space.close();
                         node.close();
@@ -928,6 +934,9 @@ public final class Seed {
                 System.out.println("{\"error\":" + q(String.valueOf(e)) + "}");
             }
             System.out.flush();
+        }
+        if (pdtLoop != null) {
+            pdtLoop.close();
         }
         agents.close();
         space.close();

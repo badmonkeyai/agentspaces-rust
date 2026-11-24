@@ -187,11 +187,12 @@ pub const VARIABLES: [&str; 7] = [
     ENV_CONFIG,
 ];
 
-/// How long the peer waits between attempts to redial a lost seed: 5 s, as the Python peer's
-/// `reconnect_interval_s`.
+/// The first step of the redial table for a lost seed (5 s; the table is 1, 2, 4, 6 times it,
+/// then wraps), as the Python peer's `reconnect_interval_s`.
 pub const DEFAULT_RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
-/// How long the peer keeps redialing a lost seed before it gives up: 10 minutes, as the Python
-/// peer's `reconnect_window_s`.
+/// How long a lost seed may go unanswered before the peer says so (`PeerEvent::Unreachable`):
+/// 10 minutes, as the Python peer's `reconnect_window_s`. The peer redials on after it, until it
+/// is closed (owner decision 3 of 2026-11-23).
 pub const DEFAULT_RECONNECT_WINDOW: Duration = Duration::from_secs(600);
 /// How often the peer re-publishes its leased self-advertisement: 30 s, as the Python and Ruby
 /// peers (`peer-ad-interval-millis: 30000`).
@@ -220,10 +221,12 @@ pub struct PeerSettings {
     /// The keystore directory ([`crate::keystore::load_or_create`]); `None` runs with a fresh
     /// identity that is gone when the process ends.
     pub keystore: Option<PathBuf>,
-    /// The pause between redials of a lost seed (default [`DEFAULT_RECONNECT_INTERVAL`], 5 s).
+    /// The unit of the redial table for a lost seed (default [`DEFAULT_RECONNECT_INTERVAL`], 5 s:
+    /// rounds of redials wait 5, 10, 20, 30 s, then 5 s again, with a ±10 % spread).
     pub reconnect_interval: Duration,
-    /// How long redials go on before the peer gives up (default [`DEFAULT_RECONNECT_WINDOW`],
-    /// 10 min); zero never redials.
+    /// How long a lost link may go without a working one before the peer says so (default
+    /// [`DEFAULT_RECONNECT_WINDOW`], 10 min); the peer redials on until it is closed, and a zero
+    /// window says so after every round.
     pub reconnect_window: Duration,
     /// How often the self-advertisement is re-published (default
     /// [`DEFAULT_PEER_AD_INTERVAL`], 30 s); in a group past the seed's probe cycle the peer
@@ -235,8 +238,8 @@ pub struct PeerSettings {
 
 impl PeerSettings {
     /// Settings to join `group` through `seeds` with every default: the [`Profile::Mtls`]
-    /// profile, no keystore, redial every 5 s for 10 min, self-advertisement every 30 s, and no
-    /// spaces.
+    /// profile, no keystore, redial on the 5, 10, 20, 30 s table for 10 min, self-advertisement
+    /// every 30 s, and no spaces.
     pub fn new(group: GroupSpec, seeds: Vec<Seed>) -> Self {
         Self {
             group,

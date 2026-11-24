@@ -471,6 +471,11 @@ async fn hostile_inputs_stay_bounded_and_counted() {
             config.listen.admission_burst = 64;
             config.listen.admissions_per_second = 16;
             config.listen.max_replicated_spaces = 4;
+            // The hub's periodic rounds reach every member it holds a link to, dial-only ones
+            // included (2026-11-23), and a round opens a window in which the partner's PULL_RESP
+            // is an answer. A period of an hour keeps the hub from asking anyone here, so the
+            // flooder's PULL_RESP below is one nobody asked for.
+            config.listen.anti_entropy_period = Some(Duration::from_secs(3600));
         },
     )
     .await;
@@ -617,8 +622,8 @@ async fn hostile_inputs_stay_bounded_and_counted() {
         "the link bound held: {c:?}"
     );
 
-    // A PULL_RESP nobody asked for: the flooder's targeted round is long gone from the bounded
-    // list of members this hub expects answers from.
+    // A PULL_RESP nobody asked for: this hub has opened no round with the flooder, so it is in
+    // no window of the members this hub expects answers from.
     assert!(
         flooder
             .send(

@@ -1118,7 +1118,7 @@ fn validate_refuses_settings_built_in_code() {
         }
     );
 
-    // A zero window is allowed: the peer never redials.
+    // A zero window is allowed: the peer says it is unreachable after every round, and redials on.
     let mut settings = valid;
     settings.reconnect_window = Duration::ZERO;
     settings.validate().expect("zero window");
